@@ -37,7 +37,7 @@ async def fetch_entry(entry_key):
 def compute_maps(submissions, todays_map):
     accepted = [s for s in submissions if isinstance(s, dict) and s.get("Status") == "Accepted"]
     if not accepted:
-        return None, None
+        return result, None
 
     current_id = todays_map.get("Id") if todays_map else accepted[0]["Id"]
     current_map = {"Id": current_id}
@@ -66,7 +66,11 @@ async def maps(ctx):
         return
     
     # see what submissions actually look like TEMPORARY
-    await ctx.send(f"Submissions type: {type(submissions)}")
+    result = ""
+    for s in submissions:
+        result += chr(s)
+    
+    await ctx.send(f"Submissions type: {result}")
     await ctx.send(f"Submissions sample: {submissions[:5] if isinstance(submissions, list) else submissions}")
 
     current_map, next_map = compute_maps(submissions, todays_map)
