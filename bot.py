@@ -87,13 +87,13 @@ def get_medal_emoji(pos):
         return ""
 
 async def get_lb_entry(leaderboard, pos):
-    url = f"https://users.roblox.com/v1/users/{leaderboard[pos].UserId}"
+    url = f"https://users.roblox.com/v1/users/{leaderboard[pos].get("UserId")}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
                 return None
             data = await resp.json()
-            return f"{get_medal_emoji(pos)}・{country_code_to_emoji(leaderboard[pos].Country)} {data.name}・{format_time(leaderboard[pos].Value)}"
+            return f"{get_medal_emoji(pos)}・{country_code_to_emoji(leaderboard[pos].get("Country"))} {data.name}・{format_time(leaderboard[pos].get("Value"))}"
 
 @bot.event
 async def on_ready():
