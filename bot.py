@@ -123,7 +123,7 @@ async def maps(ctx):
         lb_desc = ""
         lb_embed = discord.Embed(
             title = f"Leaderboard - {get_todays_date()}",
-            description = f"{get_lb_entry(leaderboard, 0)}\n{get_lb_entry(leaderboard, 1)}\n{get_lb_entry(leaderboard, 2)}\n{get_lb_entry(leaderboard, 3)}",
+            description = f"{await get_lb_entry(leaderboard, 0)}\n{await get_lb_entry(leaderboard, 1)}\n{await get_lb_entry(leaderboard, 2)}\n{await get_lb_entry(leaderboard, 3)}",
             color = discord.Color.purple()
         )
     
