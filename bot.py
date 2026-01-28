@@ -70,7 +70,7 @@ async def maps(ctx):
     for s in submissions:
         result += chr(s)
     
-    await ctx.send(result[:4000])
+    await ctx.send(result[:500])
     await ctx.send(f"Submissions sample: {submissions[:5] if isinstance(submissions, list) else submissions}")
 
     current_map, next_map = compute_maps(submissions, todays_map)
