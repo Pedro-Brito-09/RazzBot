@@ -86,7 +86,7 @@ def get_medal_emoji(pos):
     else:
         return ""
 
-def get_lb_entry(leaderboard, pos):
+async def get_lb_entry(leaderboard, pos):
     url = f"https://users.roblox.com/v1/users/{leaderboard[pos].UserId}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
