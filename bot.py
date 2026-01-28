@@ -49,7 +49,7 @@ def compute_maps(submissions, todays_map):
     if not accepted:
         return None, None
 
-    current_id = todays_map.get("Id") if todays_map else accepted[0]["Id"]
+    current_id = todays_map.get("Id") if todays_map else accepted[-1]["Id"]
     current_map = {"Id": current_id}
 
     ids = [s["Id"] for s in accepted]
