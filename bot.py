@@ -45,14 +45,22 @@ async def fetch_entry(entry_key):
             return value
 
 def compute_maps(submissions, todays_map):
-    accepted = [s for s in submissions if isinstance(s, dict) and s.get("Status") == "Accepted"]
+    # Sort submissions by Timestamp (oldest → newest)
+    submissions_sorted = sorted(
+        submissions, key=lambda s: s.get("Timestamp", 0)
+    )
+
+    # Filter only accepted submissions
+    accepted = [s for s in submissions_sorted if isinstance(s, dict) and s.get("Status") == "Accepted"]
+
     if not accepted:
         return None, None
 
-    current_id = todays_map.get("Id") if todays_map else accepted[-1]["Id"]
+    current_id = todays_map.get("Id") if todays_map else accepted[0]["Id"]
     current_map = {"Id": current_id}
 
     ids = [s["Id"] for s in accepted]
+
     if current_id in ids:
         current_index = ids.index(current_id)
         next_index = (current_index + 1) % len(ids)
