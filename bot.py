@@ -49,7 +49,7 @@ def compute_maps(submissions, todays_map):
     current_map = {"Id": current_id}
     ids = [s["Id"] for s in accepted]
     if current_id in ids:
-        current_index = ids.index(current_id)
+        current_index = todays_map.get("Index")
         next_index = (current_index + 1) % len(ids)
         next_map = {"Id": ids[next_index]}
     else:
@@ -71,7 +71,7 @@ async def maps(ctx):
     if not current_map or not next_map:
         await ctx.send("No accepted maps found.")
         return
-    leaderboard = await fetch_entry(f"DailyCup_{current_map['Id']}", datastore="Leaderboards")
+    leaderboard = await fetch_entry(f"DailyCup_{todays_map.get("Index")}", datastore="Leaderboards")
     next_map_info = await fetch_entry("Ids", datastore="Community Maps")
     msg = (
         f"Current map ID: {current_map['Id']}\n"
@@ -80,7 +80,7 @@ async def maps(ctx):
     if leaderboard:
         msg += f"Leaderboard sample: {leaderboard[:5]}\n"
     if next_map_info:
-        msg += f"Next map info: {list(m for m in next_map_info if m.get("MapId") == next_map["id"])[0]}\n"
+        msg += f"Next map info: {list(m for m in next_map_info if m.get("MapId") == next_map["Id"])[0]}\n"
     await ctx.send(msg)
 
 @bot.command()
