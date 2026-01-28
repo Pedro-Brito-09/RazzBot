@@ -30,43 +30,37 @@ async def fetch_entry(entry_key):
                 return None
             return json.loads(value)
 
-def compute_maps(submissions, todays_map):
+def get_next_map(submissions, todays_map):
     accepted = [s for s in submissions if s.get("Status") == "Accepted"]
     accepted.sort(key=lambda x: x["Timestamp"])
     if not accepted:
         return None, None
-
-    current_id = todays_map.get("Id") if todays_map else accepted[0]["Id"]
+    current_id = todays_map.get("Id")
     current_map = {"Id": current_id}
-
     ids = [s["Id"] for s in accepted]
     if current_id in ids:
-        current_index = ids.index(current_id)
-        next_index = (current_index + 1) % len(ids)
-        next_map = {"Id": ids[next_index]}
+        idx = ids.index(current_id)
+        next_id = ids[(idx + 1) % len(ids)]
     else:
-        next_map = {"Id": ids[0]}
-
+        next_id = ids[0]
+    next_map = {"Id": next_id}
     return current_map, next_map
 
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user}')
+    print(f"Logged in as {bot.user}")
 
 @bot.command()
 async def maps(ctx):
     submissions = await fetch_entry("Submissions")
     todays_map = await fetch_entry("TodaysMap") or {}
-
-    if submissions is None:
-        await ctx.send("Failed to fetch submissions from Roblox cloud. sorry brochacho")
+    if submissions is None or not todays_map:
+        await ctx.send("Failed to fetch TodaysMap or Submissions from Roblox cloud.")
         return
-
-    current_map, next_map = compute_maps(submissions, todays_map)
+    current_map, next_map = get_next_map(submissions, todays_map)
     if not current_map or not next_map:
-        await ctx.send("No accepted maps found. sorry dude")
+        await ctx.send("No accepted maps found.")
         return
-
     await ctx.send(
         f"Current map ID: {current_map['Id']}\n"
         f"Next map ID: {next_map['Id']}"
