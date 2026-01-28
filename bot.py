@@ -57,10 +57,10 @@ async def on_ready():
 async def maps(ctx):
     submissions = await fetch_entry("Submissions")
     todays_map = await fetch_entry("TodaysMap") or {}
-        if submissions is None:
-            await ctx.send("Failed to fetch submissions from roblox cloud. sorry brochacho")
-        return
 
+    if submissions is None:
+        await ctx.send("Failed to fetch submissions from Roblox cloud. sorry brochacho")
+        return
 
     current_map, next_map = compute_maps(submissions, todays_map)
     if not current_map or not next_map:
