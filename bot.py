@@ -80,7 +80,7 @@ async def maps(ctx):
     if leaderboard:
         msg += f"Leaderboard sample: {leaderboard[:5]}\n"
     if next_map_info:
-        msg += f"Next map info: {(m for m in next_map_info.get("MapId") == next_map["id"])}\n"
+        msg += f"Next map info: {(m for m in next_map_info if m.get("MapId") == next_map["id"])}\n"
     await ctx.send(msg)
 
 @bot.command()
