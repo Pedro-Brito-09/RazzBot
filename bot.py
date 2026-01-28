@@ -27,12 +27,14 @@ async def fetch_entry(entry_key):
             if not value:
                 return None
             if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
-                decoded = base64.b64decode(value["zbase64"])
+                decoded_bytes = base64.b64decode(value["zbase64"])
                 try:
-                    return json.loads(decoded)
-                except:
-                    return decoded
+                    decoded_str = decoded_bytes.decode("utf-8")
+                    return json.loads(decoded_str)
+                except Exception:
+                    return decoded_bytes
             return value
+
 
 def compute_maps(submissions, todays_map):
     accepted = [s for s in submissions if isinstance(s, dict) and s.get("Status") == "Accepted"]
