@@ -7,8 +7,6 @@ import base64
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
-UNIVERSE_ID = "8993151589"
-SCOPE = "global"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -16,9 +14,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 async def fetch_entry(entry_key):
     url = (
-        f"https://apis.roblox.com/datastores/v1/universes/{UNIVERSE_ID}"
-        f"/standard-datastores/Daily%20Cup%20Submissions/entries/entry"
-        f"?scope={SCOPE}&entryKey={entry_key}"
+            f"https://apis.roblox.com/cloud/v2/universes/8993151589/" 
+            f"data-stores/Daily%20Cup%20Submissions/entries/{entry_key}"
     )
     headers = {"x-api-key": API_KEY, "Accept": "application/json"}
     async with aiohttp.ClientSession() as session:
