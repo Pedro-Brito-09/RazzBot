@@ -76,13 +76,13 @@ def country_code_to_emoji(code: str) -> str:
 
 def get_medal_emoji(pos):
     if pos == 0:
-        return ":DiamondMedal:1466201150314385471:"
+        return "<:DiamondMedal:1466201150314385471>"
     elif pos == 1:
-        return ":GoldMedal:1466201173877981449:"
+        return "<:GoldMedal:1466201173877981449>"
     elif pos == 2:
-        return ":SilverMedal:1466201197840044065:"
+        return "<:SilverMedal:1466201197840044065>"
     elif pos == 3:
-        return ":BronzeMedal:1466201227997089873:"
+        return "<:BronzeMedal:1466201227997089873>"
     else:
         return ""
 
