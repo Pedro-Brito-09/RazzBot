@@ -93,7 +93,7 @@ async def get_lb_entry(leaderboard, pos):
             if resp.status != 200:
                 return None
             data = await resp.json()
-            return f"{get_medal_emoji(pos)}・{country_code_to_emoji(leaderboard[pos].get("Country"))} {data.name}・{format_time(leaderboard[pos].get("Value"))}"
+            return f"{get_medal_emoji(pos)}・{country_code_to_emoji(leaderboard[pos].get("Country"))} {data.get("name")}・{format_time(leaderboard[pos].get("Value"))}"
 
 @bot.event
 async def on_ready():
