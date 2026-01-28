@@ -3,6 +3,7 @@ from discord.ext import commands
 import os
 import aiohttp
 import json
+import base64
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
@@ -28,22 +29,27 @@ async def fetch_entry(entry_key):
             value = data.get("value")
             if not value:
                 return None
-            return json.loads(value)
+            if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
+                decoded = base64.b64decode(value["zbase64"])
+                try:
+                    return json.loads(decoded)
+                except:
+                    return decoded
+            return value
 
-def get_next_map(submissions, todays_map):
+def compute_maps(submissions, todays_map):
     accepted = [s for s in submissions if s.get("Status") == "Accepted"]
-    accepted.sort(key=lambda x: x["Timestamp"])
     if not accepted:
         return None, None
-    current_id = todays_map.get("Id")
+    current_id = todays_map.get("Id") if todays_map else accepted[0]["Id"]
     current_map = {"Id": current_id}
     ids = [s["Id"] for s in accepted]
     if current_id in ids:
-        idx = ids.index(current_id)
-        next_id = ids[(idx + 1) % len(ids)]
+        current_index = ids.index(current_id)
+        next_index = (current_index + 1) % len(ids)
+        next_map = {"Id": ids[next_index]}
     else:
-        next_id = ids[0]
-    next_map = {"Id": next_id}
+        next_map = {"Id": ids[0]}
     return current_map, next_map
 
 @bot.event
@@ -54,10 +60,10 @@ async def on_ready():
 async def maps(ctx):
     submissions = await fetch_entry("Submissions")
     todays_map = await fetch_entry("TodaysMap") or {}
-    if submissions is None or not todays_map:
-        await ctx.send("Failed to fetch TodaysMap or Submissions from Roblox cloud.")
+    if not submissions:
+        await ctx.send("Failed to fetch submissions from Roblox cloud.")
         return
-    current_map, next_map = get_next_map(submissions, todays_map)
+    current_map, next_map = compute_maps(submissions, todays_map)
     if not current_map or not next_map:
         await ctx.send("No accepted maps found.")
         return
