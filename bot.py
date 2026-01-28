@@ -5,6 +5,7 @@ import aiohttp
 import json
 import base64
 import zstandard as zstd
+from datetime import datetime, timedelta, timezone
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
@@ -56,6 +57,44 @@ def compute_maps(submissions, todays_map):
         next_map = {"Id": ids[0]}
     return current_map, next_map
 
+def get_todays_date():
+    now = datetime.now(timezone.utc)
+    shifted = now - timedelta(hours=9)
+
+    return shifted.strftime("%d/%m/%Y")
+
+def format_time(time_value):
+    minutes = (time_value / 60) % 60
+    seconds = time_value % 60
+    milliseconds = (seconds * 1000) % 1000
+
+    return f"{int(minutes):02d}:{int(seconds):02d}.{int(milliseconds):03d}"
+
+def country_code_to_emoji(code: str) -> str:
+    code = code.upper()
+    return ''.join(chr(127397 + ord(c)) for c in code)
+
+def get_medal_emoji(pos):
+    if pos == 0:
+        return ":DiamondMedal:1466201150314385471:"
+    elif pos == 1:
+        return ":GoldMedal:1466201173877981449:"
+    elif pos == 2:
+        return ":SilverMedal:1466201197840044065:"
+    elif pos == 3:
+        return ":BronzeMedal:1466201227997089873:"
+    else:
+        return ""
+
+def get_lb_entry(leaderboard, pos):
+    url = f"https://users.roblox.com/v1/users/{leaderboard[pos].UserId}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            return f"{get_medal_emoji(pos)}・{country_code_to_emoji(leaderboard[pos].Country)} {data.name}・{format_time(leaderboard[pos].Value)}"
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -79,26 +118,16 @@ async def maps(ctx):
         f"Current map ID: {current_map['Id']}\n"
         f"Next map ID: {next_map['Id']}\n"
     )
+
     if leaderboard:
-        msg += f"Leaderboard sample: {leaderboard[:5]}\n"
-    if all_maps_info:
-        msg += f"Next map info: {map_info}\n"
-
-    embed = discord.Embed(
-        title = "New Daily Cup!
-        description = "Do you have what it takes to get a diamond medal?"
-        color = discord.Color.purple()
-    )
-
-    embed.set_author(
-        name = map_info.get("Creator")
-    )
-
-    embed.add_field(
-        name = map_info.get("Name")
-    )
+        lb_desc = ""
+        lb_embed = discord.Embed(
+            title = f"Leaderboard - {get_todays_date()}"
+            description = f"{get_lb_entry(leaderboard, 0)}\n{get_lb_entry(leaderboard, 1)}\n{get_lb_entry(leaderboard, 2)}\n{get_lb_entry(leaderboard, 3)}"
+            color = discord.Color.purple()
+        )
     
-    await ctx.send(embed=embed)
+        await ctx.send(embed = lb_embed)
 
 @bot.command()
 async def ping(ctx):
