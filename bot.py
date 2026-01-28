@@ -35,11 +35,13 @@ async def fetch_entry(entry_key):
             return value
 
 def compute_maps(submissions, todays_map):
-    accepted = [s for s in submissions if s.get("Status") == "Accepted"]
+    accepted = [s for s in submissions if isinstance(s, dict) and s.get("Status") == "Accepted"]
     if not accepted:
         return None, None
+
     current_id = todays_map.get("Id") if todays_map else accepted[0]["Id"]
     current_map = {"Id": current_id}
+
     ids = [s["Id"] for s in accepted]
     if current_id in ids:
         current_index = ids.index(current_id)
@@ -47,7 +49,9 @@ def compute_maps(submissions, todays_map):
         next_map = {"Id": ids[next_index]}
     else:
         next_map = {"Id": ids[0]}
+
     return current_map, next_map
+
 
 @bot.event
 async def on_ready():
