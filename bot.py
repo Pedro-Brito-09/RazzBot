@@ -98,7 +98,7 @@ async def maps(ctx):
         name = map_info.get("Name")
     )
     
-    await ctx.send(msg)
+    await ctx.send(embed=embed)
 
 @bot.command()
 async def ping(ctx):
