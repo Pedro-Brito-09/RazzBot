@@ -73,6 +73,8 @@ async def maps(ctx):
         return
     leaderboard = await fetch_entry(f"DailyCup_{todays_map.get("Index")}", datastore="Leaderboards")
     all_maps_info = await fetch_entry("Ids", datastore="Community Maps")
+    map_info = list(m for m in all_maps_info if m.get("Id") == next_map.get("Id"))[0]
+    
     msg = (
         f"Current map ID: {current_map['Id']}\n"
         f"Next map ID: {next_map['Id']}\n"
@@ -80,7 +82,22 @@ async def maps(ctx):
     if leaderboard:
         msg += f"Leaderboard sample: {leaderboard[:5]}\n"
     if all_maps_info:
-        msg += f"Next map info: {list(m for m in all_maps_info if m.get("Id") == next_map.get("Id"))[0]}\n"
+        msg += f"Next map info: {map_info}\n"
+
+    embed = discord.Embed(
+        title = "New Daily Cup!
+        description = "Do you have what it takes to get a diamond medal?"
+        color = discord.Color.purple()
+    )
+
+    embed.set_author(
+        name = map_info.get("Creator")
+    )
+
+    embed.add_field(
+        name = map_info.get("Name")
+    )
+    
     await ctx.send(msg)
 
 @bot.command()
