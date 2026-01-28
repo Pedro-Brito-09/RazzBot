@@ -64,14 +64,21 @@ async def maps(ctx):
     if not submissions:
         await ctx.send("Failed to fetch submissions from Roblox cloud.")
         return
+    
+    # see what submissions actually look like TEMPORARY
+    await ctx.send(f"Submissions type: {type(submissions)}")
+    await ctx.send(f"Submissions sample: {submissions[:5] if isinstance(submissions, list) else submissions}")
+
     current_map, next_map = compute_maps(submissions, todays_map)
     if not current_map or not next_map:
         await ctx.send("No accepted maps found.")
         return
+
     await ctx.send(
         f"Current map ID: {current_map['Id']}\n"
         f"Next map ID: {next_map['Id']}"
     )
+
 
 @bot.command()
 async def ping(ctx):
