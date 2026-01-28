@@ -4,7 +4,7 @@ import os
 import aiohttp
 import json
 import base64
-import zlib  
+import zstandard as zstd
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
@@ -22,19 +22,26 @@ async def fetch_entry(entry_key):
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
+                print(f"Failed fetching {entry_key}: {resp.status}")
+                text = await resp.text()
+                print(f"Response: {text[:500]}")
                 return None
+
             data = await resp.json()
             value = data.get("value")
             if not value:
                 return None
+
             if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
+                compressed = base64.b64decode(value["zbase64"])
                 try:
-                    compressed = base64.b64decode(value["zbase64"])
-                    decompressed = zlib.decompress(compressed)
+                    dctx = zstd.ZstdDecompressor()
+                    decompressed = dctx.decompress(compressed)
                     return json.loads(decompressed.decode("utf-8"))
                 except Exception as e:
                     print(f"Error decoding entry '{entry_key}': {e}")
                     return None
+
             return value
 
 def compute_maps(submissions, todays_map):
@@ -63,7 +70,6 @@ async def on_ready():
 async def maps(ctx):
     submissions = await fetch_entry("Submissions")
     todays_map = await fetch_entry("TodaysMap") or {}
-
     if not submissions:
         await ctx.send("Failed to fetch submissions from Roblox cloud.")
         return
