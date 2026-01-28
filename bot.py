@@ -28,10 +28,9 @@ async def fetch_entry(entry_key):
                 return None
             if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
                 decoded_bytes = base64.b64decode(value["zbase64"])
-                try:
-                    decoded_str = decoded_bytes.decode("utf-8")
-                    return json.loads(decoded_str)
-                except Exception:
+                    try:
+                        return json.loads(decoded_bytes.decode("utf-8"))
+                    except Exception:
                     return decoded_bytes
             return value
 
