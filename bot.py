@@ -480,7 +480,7 @@ class ProfileView(discord.ui.LayoutView):
             (get_medal_emoji(i), len(dig(data, "Medals", tier, default=[]) or []))
             for i, tier in enumerate(("Diamond", "Gold", "Silver", "Bronze"))
         ]
-        medals = "  ".join(f"{emoji} **{count}**" for emoji, count in medal_counts)
+        medals = "  ·  ".join(f"{emoji} **{count}**" for emoji, count in medal_counts)
         container.add_item(discord.ui.TextDisplay(f"{currency}\n\n{medals}"))
 
         container.add_item(discord.ui.Separator(
@@ -494,7 +494,7 @@ class ProfileView(discord.ui.LayoutView):
         # even when the rest of the profile loaded.
         win_streak = f"⚡  win streak **{format_number(stats.get('WinStreak') or 0)}**"
         if wins is not None:
-            wins_line = f"🏆  **{format_number(wins)}** wins  ·  {win_streak}"
+            wins_line = f"👑  **{format_number(wins)}** wins  ·  {win_streak}"
         else:
             wins_line = win_streak
 
@@ -507,9 +507,6 @@ class ProfileView(discord.ui.LayoutView):
             f"🏔️  furthest round **{format_number(stats.get('FurthestRound') or 0)}**",
             f"🔥  **{streak}** day login streak  ·  best **{best_streak}**",
         ]
-        rank = dig(data, "Partypass", "rank")
-        if rank is not None:
-            lines.append(f"🎟️  Party Pass rank **{rank}**")
         container.add_item(discord.ui.TextDisplay("\n".join(lines)))
 
         container.add_item(discord.ui.Separator(
