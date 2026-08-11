@@ -53,10 +53,14 @@ BADGE_ICON_SIZE = "150x150"
 # Discord decides gallery layout from the item count and features the first
 # image when there are many, so badges go out three at a time -- one even
 # row per gallery. The cap Discord enforces is 10.
-BADGES_PER_GALLERY = 3
-# A message caps at 40 components, and every gallery plus its images counts
-# toward that, so the grid is bounded and the rest is summarised.
-MAX_BADGE_GALLERIES = 8
+BADGES_PER_GALLERY = 6
+# Short galleries get padded with this so every row keeps the same layout;
+# Discord sizes images by how many are in the gallery. Swap it for any
+# transparent PNG Discord's proxy can reach.
+EMPTY_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
+# A message caps at 40 components and every gallery plus each of its images
+# counts, so at six per gallery five is the most that fits.
+MAX_BADGE_GALLERIES = 5
 
 # TODO placeholder: swap for the real deeplink once the format is known.
 PLAY_URL_TEMPLATE = "https://www.roblox.com/games/0?mapId={id}"
@@ -699,6 +703,9 @@ async def build_badges_view(user_id, username):
             if icon:
                 gallery.add_item(media=icon, description=badge_name(badge))
         if gallery.items:
+            # Pad to a full row so the client lays every gallery out alike.
+            while len(gallery.items) < BADGES_PER_GALLERY:
+                gallery.add_item(media=EMPTY_IMAGE_URL, description="")
             container.add_item(gallery)
             galleries += 1
 
