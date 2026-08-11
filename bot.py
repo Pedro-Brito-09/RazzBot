@@ -37,6 +37,14 @@ MAPS_CACHE_TTL = 600
 # Only the fields the embed needs are retained, to keep the index small.
 MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
               "Playstyle", "Privacy", "Featured")
+
+# TODO placeholder: swap for the real deeplink once the format is known.
+PLAY_URL_TEMPLATE = "https://www.roblox.com/games/0?mapId={id}"
+# TODO unconfirmed: the key format for a community map's leaderboard. The
+# daily cup uses "DailyCup_{index}" in the same datastore.
+MAP_LEADERBOARD_KEY = "Map_{id}"
+# How long the Leaderboard button stays clickable.
+MAP_VIEW_TIMEOUT = 900
 # Long names get truncated so the table keeps its columns.
 MAX_NAME_WIDTH = 18
 
@@ -359,6 +367,61 @@ async def build_map_embed(entry, *, color=MAP_COLOR):
     embed.set_footer(text=footer)
     return embed
 
+class MapView(discord.ui.View):
+    """Play (link) and Leaderboard (fetches on click) under a map embed."""
+
+    def __init__(self, entry, *, timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(timeout=timeout)
+        self.entry = entry
+        self.message = None
+
+        map_id = entry.get("Id")
+        self.add_item(discord.ui.Button(
+            label="Play",
+            style=discord.ButtonStyle.link,
+            url=PLAY_URL_TEMPLATE.format(id=map_id),
+        ))
+
+        leaderboard_button = discord.ui.Button(
+            label="Leaderboard",
+            style=discord.ButtonStyle.secondary,
+            emoji="🏆",
+        )
+        leaderboard_button.callback = self.show_leaderboard
+        self.add_item(leaderboard_button)
+
+    async def show_leaderboard(self, interaction):
+        await interaction.response.defer(thinking=True)
+
+        map_id = self.entry.get("Id")
+        key = MAP_LEADERBOARD_KEY.format(id=map_id)
+        leaderboard = await fetch_entry(key, datastore="Leaderboards")
+
+        embed = None
+        if isinstance(leaderboard, list):
+            embed = await build_leaderboard_embed(
+                leaderboard,
+                title=f"🏆 {self.entry.get('Name') or 'Unnamed Map'}",
+                subtitle=f"Map #{map_id}",
+            )
+        if embed is None:
+            await interaction.followup.send(
+                f"No leaderboard found for `{key}`.", ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(embed=embed)
+
+    async def on_timeout(self):
+        for item in self.children:
+            if item.style is not discord.ButtonStyle.link:
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
 async def build_leaderboard_embed(
     leaderboard,
     *,
@@ -513,7 +576,8 @@ async def map_command(ctx, map_id: int):
         await ctx.send(f"No community map with ID `{map_id}`.")
         return
 
-    await ctx.send(embed=await build_map_embed(entry))
+    view = MapView(entry)
+    view.message = await ctx.send(embed=await build_map_embed(entry), view=view)
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
