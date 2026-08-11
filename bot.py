@@ -44,6 +44,14 @@ MAPS_CACHE_TTL = 600
 MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
               "Playstyle", "Privacy", "Featured")
 
+UNIVERSE_ID = 8993151589
+# The universe badge list is stable; ownership is checked one badge per
+# request against inventory.roblox.com, the only endpoint that answers
+# without authentication.
+BADGES_CACHE_TTL = 3600
+OWNED_BADGES_CACHE_TTL = 300
+BADGE_CONCURRENCY = 8
+
 # TODO placeholder: swap for the real deeplink once the format is known.
 PLAY_URL_TEMPLATE = "https://www.roblox.com/games/0?mapId={id}"
 # A community map's leaderboard is keyed by the map ID on its own.
@@ -133,7 +141,7 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
     # Datastore names contain spaces ("Daily Cup Submissions"), so encode
     # both segments rather than relying on the client to fix up the URL.
     url = (
-        f"https://apis.roblox.com/cloud/v2/universes/8993151589/"
+        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
         f"data-stores/{quote(datastore, safe='')}/entries/{quote(str(entry_key), safe='')}"
     )
     headers = {"x-api-key": API_KEY, "Accept": "application/json"}
@@ -149,6 +157,59 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
         return decode_buffer(value["zbase64"])
     return value
 
+_badges_cache = {"at": 0.0, "list": None}
+_owned_badges_cache = {}
+
+async def fetch_universe_badges():
+    """Every badge the game defines, cached. Public, no auth needed."""
+    now = time.monotonic()
+    if _badges_cache["list"] is not None and now - _badges_cache["at"] < BADGES_CACHE_TTL:
+        return _badges_cache["list"]
+
+    badges, cursor = [], None
+    while True:
+        url = (f"https://badges.roblox.com/v1/universes/{UNIVERSE_ID}/badges"
+               f"?limit=100&sortOrder=Asc")
+        if cursor:
+            url += f"&cursor={quote(cursor)}"
+        data = await request_json(url, label="fetch_universe_badges")
+        if not data:
+            break
+        badges.extend(data.get("data") or [])
+        cursor = data.get("nextPageCursor")
+        if not cursor:
+            break
+
+    if not badges:
+        return _badges_cache["list"]
+    _badges_cache["list"] = badges
+    _badges_cache["at"] = now
+    return badges
+
+async def _badge_is_owned(user_id, badge_id, semaphore):
+    async with semaphore:
+        url = (f"https://inventory.roblox.com/v1/users/{user_id}"
+               f"/items/Badge/{badge_id}/is-owned")
+        # The body is a bare `true` or `false`, which is still valid JSON.
+        owned = await request_json(url, label=f"badge_is_owned({badge_id})")
+        return badge_id, owned is True
+
+async def fetch_owned_badge_ids(user_id, badge_ids):
+    """Which of badge_ids the player owns. One request per badge, so the
+    result is cached briefly per player."""
+    now = time.monotonic()
+    cached = _owned_badges_cache.get(user_id)
+    if cached and now - cached[0] < OWNED_BADGES_CACHE_TTL:
+        return cached[1]
+
+    semaphore = asyncio.Semaphore(BADGE_CONCURRENCY)
+    results = await asyncio.gather(*(
+        _badge_is_owned(user_id, badge_id, semaphore) for badge_id in badge_ids
+    ))
+    owned = {badge_id for badge_id, has in results if has}
+    _owned_badges_cache[user_id] = (now, owned)
+    return owned
+
 async def fetch_ordered_entry(entry_key, datastore="Data", scope="Wins"):
     """Read one entry from an ordered datastore, which has its own endpoint.
 
@@ -156,7 +217,7 @@ async def fetch_ordered_entry(entry_key, datastore="Data", scope="Wins"):
     in JSON, so the value is coerced.
     """
     url = (
-        f"https://apis.roblox.com/cloud/v2/universes/8993151589/"
+        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
         f"ordered-data-stores/{quote(datastore, safe='')}/"
         f"scopes/{quote(scope, safe='')}/"
         f"entries/{quote(str(entry_key), safe='')}"
@@ -481,6 +542,14 @@ class ProfileView(discord.ui.LayoutView):
         )
         maps_button.callback = self.show_created_maps
         row.add_item(maps_button)
+
+        badges_button = discord.ui.Button(
+            label="Badges",
+            style=discord.ButtonStyle.secondary,
+            emoji="🎖️",
+        )
+        badges_button.callback = self.show_badges
+        row.add_item(badges_button)
         container.add_item(row)
 
         container.add_item(discord.ui.Separator())
@@ -538,6 +607,18 @@ class ProfileView(discord.ui.LayoutView):
 
         self.add_item(container)
 
+    async def show_badges(self, interaction):
+        await interaction.response.defer(thinking=True)
+
+        view = await build_badges_view(self.user_id, self.username)
+        if view is None:
+            await interaction.followup.send(
+                "Couldn't fetch the game's badge list.", ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(view=view)
+
     async def show_created_maps(self, interaction):
         await interaction.response.defer(thinking=True)
 
@@ -560,6 +641,30 @@ class ProfileView(discord.ui.LayoutView):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
+
+async def build_badges_view(user_id, username):
+    """Every game badge, marked owned or not for this player."""
+    badges = await fetch_universe_badges()
+    if not badges:
+        return None
+
+    owned = await fetch_owned_badge_ids(user_id, [b["id"] for b in badges])
+
+    lines = []
+    for badge in badges:
+        has = badge["id"] in owned
+        name = badge.get("displayName") or badge.get("name") or "Unnamed"
+        lines.append(f"{'✅' if has else '⬜'} {f'**{name}**' if has else name}")
+
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## 🎖️ Badges — {username}\n-# {len(owned)} of {len(badges)} earned"
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+    view.add_item(container)
+    return view
 
 async def build_created_maps_view(user_id, username, limit=10):
     """List the community maps a player has created, most played first."""
