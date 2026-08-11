@@ -472,6 +472,17 @@ class ProfileView(discord.ui.LayoutView):
         else:
             container.add_item(discord.ui.TextDisplay(heading))
 
+        # Buttons sit directly under the equipped tag/skin line.
+        row = discord.ui.ActionRow()
+        maps_button = discord.ui.Button(
+            label="Created maps",
+            style=discord.ButtonStyle.secondary,
+            emoji="🗺️",
+        )
+        maps_button.callback = self.show_created_maps
+        row.add_item(maps_button)
+        container.add_item(row)
+
         container.add_item(discord.ui.Separator())
 
         stars = format_number(data.get("Stars") or 0)
@@ -511,20 +522,6 @@ class ProfileView(discord.ui.LayoutView):
             f"🔥  **{streak}** day login streak  ·  best **{best_streak}**",
         ]
         container.add_item(discord.ui.TextDisplay("\n".join(lines)))
-
-        container.add_item(discord.ui.Separator(
-            visible=False, spacing=discord.SeparatorSpacing.small
-        ))
-
-        row = discord.ui.ActionRow()
-        maps_button = discord.ui.Button(
-            label="Created maps",
-            style=discord.ButtonStyle.secondary,
-            emoji="🗺️",
-        )
-        maps_button.callback = self.show_created_maps
-        row.add_item(maps_button)
-        container.add_item(row)
 
         container.add_item(discord.ui.Separator(
             visible=False, spacing=discord.SeparatorSpacing.small
