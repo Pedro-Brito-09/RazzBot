@@ -45,10 +45,8 @@ MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
               "Playstyle", "Privacy", "Featured")
 
 UNIVERSE_ID = 8993151589
-# The universe badge list is stable; ownership is checked one badge per
-# request against inventory.roblox.com, the only endpoint that answers
-# without authentication.
-BADGES_CACHE_TTL = 3600
+# Ownership is checked one badge per request against inventory.roblox.com,
+# the only endpoint that answers without authentication.
 OWNED_BADGES_CACHE_TTL = 300
 BADGE_CONCURRENCY = 8
 
@@ -157,15 +155,10 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
         return decode_buffer(value["zbase64"])
     return value
 
-_badges_cache = {"at": 0.0, "list": None}
 _owned_badges_cache = {}
 
 async def fetch_universe_badges():
-    """Every badge the game defines, cached. Public, no auth needed."""
-    now = time.monotonic()
-    if _badges_cache["list"] is not None and now - _badges_cache["at"] < BADGES_CACHE_TTL:
-        return _badges_cache["list"]
-
+    """Every badge the game defines. Public, no auth needed."""
     badges, cursor = [], None
     while True:
         url = (f"https://badges.roblox.com/v1/universes/{UNIVERSE_ID}/badges"
@@ -180,10 +173,6 @@ async def fetch_universe_badges():
         if not cursor:
             break
 
-    if not badges:
-        return _badges_cache["list"]
-    _badges_cache["list"] = badges
-    _badges_cache["at"] = now
     return badges
 
 async def _badge_is_owned(user_id, badge_id, semaphore):
