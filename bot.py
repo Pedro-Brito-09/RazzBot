@@ -31,6 +31,9 @@ LEADERBOARD_COLOR = discord.Color.purple()
 MAP_COLOR = discord.Color.blurple()
 MAX_LEADERBOARD_ROWS = 10
 HEADSHOT_SIZE = "150x150"
+# Custom emoji cannot render inside a code block, so the table style needs
+# Unicode stand-ins for the medals.
+UNICODE_MEDALS = {0: "💎", 1: "🥇", 2: "🥈", 3: "🥉"}
 
 # The Community Maps "Ids" entry holds ~85k records, so it is fetched once and
 # indexed rather than downloaded and decompressed on every lookup.
@@ -260,7 +263,7 @@ async def collect_leaderboard_rows(leaderboard, limit):
         })
     return rows
 
-def render_leaderboard_table(rows, *, show_country=True):
+def render_leaderboard_table(rows, *, show_country=True, show_medals=False):
     """Monospace table. Columns align because a code block is fixed width.
 
     Custom emoji do not render inside code blocks, so ranks are numbers and
@@ -272,7 +275,10 @@ def render_leaderboard_table(rows, *, show_country=True):
     header = f"{'#':>2}  "
     if show_country:
         header += f"{'CC':<2}  "
-    header += f"{'PLAYER':<{name_w}}  {'TIME':>9}"
+    header += f"{'PLAYER':<{name_w}}  "
+    if show_medals:
+        header += "   "
+    header += f"{'TIME':>9}"
 
     lines = [header, "-" * len(header)]
     for r in rows:
@@ -282,7 +288,13 @@ def render_leaderboard_table(rows, *, show_country=True):
         line = f"{r['pos'] + 1:>2}  "
         if show_country:
             line += f"{r['country'] or '--':<2}  "
-        line += f"{name:<{name_w}}  {r['time']:>9}"
+        line += f"{name:<{name_w}}  "
+        if show_medals:
+            # An emoji renders about two cells wide but counts as one
+            # character, so pad it to three cells with a single space.
+            medal = UNICODE_MEDALS.get(r["pos"], "")
+            line += f"{medal} " if medal else "   "
+        line += f"{r['time']:>9}"
         lines.append(line)
 
     return "```\n" + "\n".join(lines) + "\n```"
@@ -394,28 +406,62 @@ async def build_map_embed(entry, *, color=MAP_COLOR):
     embed.set_footer(text=footer)
     return embed
 
-class MapView(discord.ui.View):
-    """Play (link) and Leaderboard (fetches on click) under a map embed."""
+class MapView(discord.ui.LayoutView):
+    """Components V2 map card: details, creator headshot, and two buttons."""
 
-    def __init__(self, entry, *, timeout=MAP_VIEW_TIMEOUT):
+    def __init__(self, entry, *, headshot=None, creator_text="Unknown",
+                 timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
         self.entry = entry
         self.message = None
 
         map_id = entry.get("Id")
-        self.add_item(discord.ui.Button(
+        name = entry.get("Name") or "Unnamed Map"
+        if entry.get("Featured"):
+            name = f"{name} 🌟"
+
+        plays = entry.get("Plays") or 0
+        favorites = entry.get("Favorites") or 0
+        playstyle = (entry.get("Playstyle") or "Unknown").upper()
+
+        body = (
+            f"## {name}\n"
+            f"By **{creator_text}**\n\n"
+            f"**{playstyle}**  ·  {plays:,} plays  ·  ⭐ {favorites:,}"
+        )
+
+        container = discord.ui.Container(accent_colour=MAP_COLOR)
+        # The headshot rides along as a section accessory when we have one.
+        if headshot:
+            container.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(body),
+                accessory=discord.ui.Thumbnail(media=headshot),
+            ))
+        else:
+            container.add_item(discord.ui.TextDisplay(body))
+
+        footer = f"ID {map_id}"
+        privacy = entry.get("Privacy")
+        if privacy:
+            footer += f"  ·  {privacy}"
+        container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(
             label="Play",
             style=discord.ButtonStyle.link,
             url=PLAY_URL_TEMPLATE.format(id=map_id),
         ))
-
         leaderboard_button = discord.ui.Button(
             label="Leaderboard",
             style=discord.ButtonStyle.secondary,
             emoji="🏆",
         )
         leaderboard_button.callback = self.show_leaderboard
-        self.add_item(leaderboard_button)
+        row.add_item(leaderboard_button)
+        container.add_item(row)
+
+        self.add_item(container)
 
     async def show_leaderboard(self, interaction):
         await interaction.response.defer(thinking=True)
@@ -424,20 +470,20 @@ class MapView(discord.ui.View):
         key = MAP_LEADERBOARD_KEY.format(id=map_id)
         leaderboard = await fetch_entry(key, datastore="Leaderboards")
 
-        embed = None
+        layout = None
         if isinstance(leaderboard, list):
-            embed = await build_leaderboard_embed(
+            layout = await build_leaderboard_layout(
                 leaderboard,
                 title=f"🏆 {self.entry.get('Name') or 'Unnamed Map'}",
                 subtitle=f"Map #{map_id}",
             )
-        if embed is None:
+        if layout is None:
             await interaction.followup.send(
                 f"No leaderboard found for `{key}`.", ephemeral=True
             )
             return
 
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(view=layout)
 
     async def on_timeout(self):
         for item in self.children:
@@ -457,14 +503,14 @@ async def build_leaderboard_layout(
     limit=MAX_LEADERBOARD_ROWS,
     show_medals=False,
     show_country=True,
-    compact=True,
     color=LEADERBOARD_COLOR,
 ):
-    """Components V2 version: one section per player, each with a headshot.
+    """Components V2 version of the leaderboard.
 
-    compact puts each row on a single line with the time as subtext, which
-    keeps sections short. Discord fixes the thumbnail size itself -- there is
-    no size parameter -- but shorter sections may render a smaller one.
+    V2 has no column primitive -- the component set is section, text display,
+    thumbnail, gallery, file, separator and container -- so the columns come
+    from a monospace code block, the one thing Discord aligns. Custom emoji
+    cannot render there, hence the Unicode medals.
 
     Returns a LayoutView, or None when there is nothing to render. A V2
     message cannot also carry content or embeds, so this is sent on its own.
@@ -476,8 +522,6 @@ async def build_leaderboard_layout(
     if not rows:
         return None
 
-    headshots = await fetch_headshots([r["user_id"] for r in rows])
-
     view = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container(accent_colour=color)
 
@@ -485,40 +529,16 @@ async def build_leaderboard_layout(
     if subtitle:
         heading += f"\n-# {subtitle}"
     container.add_item(discord.ui.TextDisplay(heading))
-    container.add_item(discord.ui.Separator())
-
-    for r in rows:
-        parts = [format_position(r["pos"])]
-        if show_country:
-            flag = country_code_to_emoji(r["country"])
-            if flag:
-                parts.append(flag)
-        parts.append(f"**{r['name']}**")
-
-        medal = r["medal"] if show_medals else ""
-        time_text = f"{medal} `{r['time']}`" if medal else f"`{r['time']}`"
-        if compact:
-            text = f"-# {' '.join(parts)}  ·  {time_text}"
-        else:
-            text = f"{' '.join(parts)}\n{time_text}"
-
-        # A Section requires an accessory, so rows without a headshot fall
-        # back to plain text rather than an empty thumbnail slot.
-        headshot = headshots.get(r["user_id"])
-        if headshot:
-            container.add_item(discord.ui.Section(
-                discord.ui.TextDisplay(text),
-                accessory=discord.ui.Thumbnail(media=headshot),
-            ))
-        else:
-            container.add_item(discord.ui.TextDisplay(text))
+    container.add_item(discord.ui.TextDisplay(
+        render_leaderboard_table(rows, show_country=show_country,
+                                 show_medals=show_medals)
+    ))
 
     total = len(leaderboard)
     if total > len(rows):
         footer = f"Top {len(rows)} of {total}"
     else:
         footer = f"{total} {'entry' if total == 1 else 'entries'}"
-    container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
 
     view.add_item(container)
@@ -698,8 +718,21 @@ async def map_command(ctx, map_id: int):
         await ctx.send(f"No community map with ID `{map_id}`.")
         return
 
-    view = MapView(entry)
-    view.message = await ctx.send(embed=await build_map_embed(entry), view=view)
+    creator_id = entry.get("Creator")
+    creator = await fetch_username(creator_id) if creator_id else None
+    if creator:
+        creator_text = f"@{creator}"
+    elif creator_id:
+        creator_text = f"User {creator_id}"
+    else:
+        creator_text = "Unknown"
+
+    headshot = None
+    if creator_id:
+        headshot = (await fetch_headshots([creator_id])).get(creator_id)
+
+    view = MapView(entry, headshot=headshot, creator_text=creator_text)
+    view.message = await ctx.send(view=view)
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
