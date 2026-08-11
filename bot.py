@@ -619,7 +619,7 @@ class ProfileView(discord.ui.LayoutView):
         view = await build_created_maps_view(self.user_id, self.username)
         if view is None:
             await interaction.followup.send(
-                "No public maps found...", ephemeral=True
+                f"**{self.username}** has no public maps...", ephemeral=True
             )
             return
 
@@ -993,6 +993,40 @@ async def cup(ctx):
         return
 
     await ctx.send(embed=lb_embed)
+
+@bot.hybrid_command(name="maps", description="Show a player's public community maps")
+@app_commands.describe(username="Roblox username")
+async def maps_command(ctx, username: str):
+    await ctx.defer()
+
+    user_id, canonical = await fetch_user_id(username)
+    if not user_id:
+        await ctx.send(f"No Roblox user named `{username}`.")
+        return
+
+    view = await build_created_maps_view(user_id, canonical)
+    if view is None:
+        await ctx.send(f"**{canonical}** has no public maps...")
+        return
+
+    await ctx.send(view=view)
+
+@bot.hybrid_command(name="badges", description="Show which game badges a player has earned")
+@app_commands.describe(username="Roblox username")
+async def badges_command(ctx, username: str):
+    await ctx.defer()
+
+    user_id, canonical = await fetch_user_id(username)
+    if not user_id:
+        await ctx.send(f"No Roblox user named `{username}`.")
+        return
+
+    view = await build_badges_view(user_id, canonical)
+    if view is None:
+        await ctx.send("Couldn't fetch the game's badge list.")
+        return
+
+    await ctx.send(view=view)
 
 @bot.hybrid_command(name="map", description="Show info about a community map by its ID")
 @app_commands.describe(map_id="The community map ID")
