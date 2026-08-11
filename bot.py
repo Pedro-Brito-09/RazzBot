@@ -385,7 +385,7 @@ async def on_command_error(ctx, error):
         await ctx.send(message)
 
 @bot.hybrid_command(description="Show the current and next daily cup map, plus today's leaderboard")
-async def maps(ctx):
+async def cup(ctx):
     # The Roblox lookups take longer than the 3s interaction deadline.
     await ctx.defer()
 
