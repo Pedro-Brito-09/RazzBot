@@ -50,7 +50,13 @@ async def get_session():
         _session = aiohttp.ClientSession(
             timeout=REQUEST_TIMEOUT,
             connector=connector,
-            headers={"User-Agent": USER_AGENT},
+            headers={
+                "User-Agent": USER_AGENT,
+                # aiohttp advertises every codec it can find installed, and
+                # having `zstandard` present makes it request zstd responses.
+                # Pin this to what curl asks for, which is known to work.
+                "Accept-Encoding": "gzip, deflate",
+            },
         )
     return _session
 
