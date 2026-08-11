@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands
 import os
 import aiohttp
@@ -9,6 +10,7 @@ import traceback
 import asyncio
 import io
 import socket
+import time
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 
@@ -26,7 +28,15 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10, s
 MAX_ATTEMPTS = 3
 
 LEADERBOARD_COLOR = discord.Color.purple()
+MAP_COLOR = discord.Color.blurple()
 MAX_LEADERBOARD_ROWS = 10
+
+# The Community Maps "Ids" entry holds ~85k records, so it is fetched once and
+# indexed rather than downloaded and decompressed on every lookup.
+MAPS_CACHE_TTL = 600
+# Only the fields the embed needs are retained, to keep the index small.
+MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
+              "Playstyle", "Privacy", "Featured")
 # Long names get truncated so the table keeps its columns.
 MAX_NAME_WIDTH = 18
 
@@ -288,6 +298,67 @@ def render_leaderboard_list(rows, *, show_country=True, show_medals=True):
         lines.append(f"{' '.join(parts)} - {tail}")
     return "\n".join(lines)
 
+_maps_cache = {"at": 0.0, "by_id": None}
+
+async def get_community_maps():
+    """Community maps indexed by Id, cached for MAPS_CACHE_TTL seconds.
+
+    On a failed refresh the previous index is kept and returned, so a blip
+    upstream doesn't take the command down.
+    """
+    now = time.monotonic()
+    cached = _maps_cache["by_id"]
+    if cached and now - _maps_cache["at"] < MAPS_CACHE_TTL:
+        return cached
+
+    entries = await fetch_entry("Ids", datastore="Community Maps")
+    if not entries:
+        return cached
+
+    by_id = {}
+    for e in entries:
+        if isinstance(e, dict) and e.get("Id") is not None:
+            by_id[e["Id"]] = {k: e.get(k) for k in MAP_FIELDS}
+
+    _maps_cache["by_id"] = by_id
+    _maps_cache["at"] = now
+    print(f"community maps indexed: {len(by_id)} entries")
+    return by_id
+
+async def build_map_embed(entry, *, color=MAP_COLOR):
+    name = entry.get("Name") or "Unnamed Map"
+    if entry.get("Featured"):
+        name = f"{name} ⚡"
+
+    creator_id = entry.get("Creator")
+    creator = await fetch_username(creator_id) if creator_id else None
+    if creator:
+        creator_text = f"@{creator}"
+    elif creator_id:
+        creator_text = f"User {creator_id}"
+    else:
+        creator_text = "Unknown"
+
+    plays = entry.get("Plays") or 0
+    favorites = entry.get("Favorites") or 0
+    playstyle = (entry.get("Playstyle") or "Unknown").upper()
+
+    embed = discord.Embed(
+        title=name,
+        description=(
+            f"By **{creator_text}**\n\n"
+            f"**{playstyle}**  ·  {plays:,} plays  ·  ⭐ {favorites:,}"
+        ),
+        color=color,
+    )
+
+    footer = f"ID {entry.get('Id')}"
+    privacy = entry.get("Privacy")
+    if privacy:
+        footer += f"  ·  {privacy}"
+    embed.set_footer(text=footer)
+    return embed
+
 async def build_leaderboard_embed(
     leaderboard,
     *,
@@ -426,6 +497,23 @@ async def cup(ctx):
         return
 
     await ctx.send(embed=lb_embed)
+
+@bot.hybrid_command(name="map", description="Show info about a community map by its ID")
+@app_commands.describe(map_id="The community map ID")
+async def map_command(ctx, map_id: int):
+    await ctx.defer()
+
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        await ctx.send("Failed to fetch the community map list.")
+        return
+
+    entry = maps_by_id.get(map_id)
+    if entry is None:
+        await ctx.send(f"No community map with ID `{map_id}`.")
+        return
+
+    await ctx.send(embed=await build_map_embed(entry))
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
