@@ -32,6 +32,11 @@ LEADERBOARD_COLOR = discord.Color(0xFFCC4D)
 MAP_COLOR = discord.Color.blurple()
 PROFILE_COLOR = discord.Color(0x9B59B6)
 MAX_LEADERBOARD_ROWS = 10
+GLOBAL_LEADERBOARDS = {
+    "wins": ("Wins", "Wins"),
+    "medals": ("Medals", "Medals"),
+    "creators": ("Creator Points", "Creator Points"),
+}
 HEADSHOT_SIZE = "150x150"
 # Custom emoji cannot render inside a code block, so the table style needs
 # Unicode stand-ins for the medals.
@@ -50,17 +55,19 @@ UNIVERSE_ID = 8993151589
 OWNED_BADGES_CACHE_TTL = 300
 BADGE_CONCURRENCY = 8
 BADGE_ICON_SIZE = "150x150"
-# Discord decides gallery layout from the item count and features the first
-# image when there are many, so badges go out three at a time -- one even
-# row per gallery. The cap Discord enforces is 10.
-BADGES_PER_GALLERY = 6
+# Discord decides gallery layout from the item count. Nine images make a
+# balanced grid; a final group of six or fewer uses six slots instead so it
+# keeps the same proportions without spending three unnecessary components.
+BADGES_PER_LARGE_GALLERY = 9
+BADGES_PER_SMALL_GALLERY = 6
 # Short galleries get padded with this so every row keeps the same layout;
 # Discord sizes images by how many are in the gallery. Swap it for any
 # transparent PNG Discord's proxy can reach.
 EMPTY_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
 # A message caps at 40 components and every gallery plus each of its images
-# counts, so at six per gallery five is the most that fits.
-MAX_BADGE_GALLERIES = 5
+# counts. Three nine-image galleries leave room for the surrounding content
+# and the summary shown when more badges were earned.
+MAX_BADGE_GALLERIES = 3
 
 # TODO placeholder: swap for the real deeplink once the format is known.
 PLAY_URL_TEMPLATE = "https://www.roblox.com/games/0?mapId={id}"
@@ -73,13 +80,20 @@ MAX_NAME_WIDTH = 18
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
-# Optional: syncing to one guild makes slash commands appear instantly.
-# A global sync (no GUILD_ID) can take up to an hour to propagate.
+# Optional: also sync a guild-only test copy so changes appear instantly there.
+# Global commands are always synced because user installs only support them.
 GUILD_ID = os.getenv("GUILD_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+    allowed_contexts=app_commands.AppCommandContext(
+        guild=True, dm_channel=True, private_channel=True
+    ),
+)
 
 _synced = False
 _session = None
@@ -260,6 +274,53 @@ async def fetch_ordered_entry(entry_key, datastore="Data", scope="Wins"):
             return None
     return value if isinstance(value, (int, float)) else None
 
+async def fetch_ordered_leaderboard(datastore="Data", scope="Wins", limit=10):
+    """Return the highest-valued entries from an ordered datastore."""
+    url = (
+        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
+        f"ordered-data-stores/{quote(datastore, safe='')}/"
+        f"scopes/{quote(scope, safe='')}/entries"
+        f"?maxPageSize={limit}&orderBy={quote('value desc', safe='')}"
+    )
+    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    data = await request_json(
+        url, headers=headers,
+        label=f"fetch_ordered_leaderboard({datastore}/{scope})",
+    )
+    if not data:
+        return None
+
+    entries = data.get("orderedDataStoreEntries")
+    if not isinstance(entries, list):
+        return None
+
+    leaderboard = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        entry_id = entry.get("id")
+        try:
+            user_id = int(entry_id)
+        except (TypeError, ValueError):
+            user_id = None
+
+        value = entry.get("value")
+        if isinstance(value, str):
+            try:
+                value = int(value)
+            except ValueError:
+                continue
+        if not isinstance(value, (int, float)):
+            continue
+
+        leaderboard.append({
+            "UserId": user_id,
+            "Name": str(entry_id) if user_id is None and entry_id is not None else None,
+            "Value": value,
+        })
+    return leaderboard
+
 def compute_maps(submissions, todays_map):
     accepted = [
         s for s in submissions
@@ -396,7 +457,9 @@ async def fetch_headshots(user_ids):
             headshots[item.get("targetId")] = item["imageUrl"]
     return headshots
 
-async def collect_leaderboard_rows(leaderboard, limit):
+async def collect_leaderboard_rows(
+    leaderboard, limit, *, value_formatter=format_time
+):
     """Resolve a leaderboard into plain row dicts, ready for either renderer."""
     rows = []
     for pos in range(min(len(leaderboard), limit)):
@@ -405,7 +468,9 @@ async def collect_leaderboard_rows(leaderboard, limit):
             continue
 
         user_id = entry.get("UserId")
-        name = await fetch_username(user_id) if user_id is not None else None
+        name = entry.get("Name")
+        if not name and user_id is not None:
+            name = await fetch_username(user_id)
         if not name:
             # A failed username lookup shouldn't drop the whole row.
             name = f"User {user_id}" if user_id is not None else "Unknown"
@@ -419,12 +484,14 @@ async def collect_leaderboard_rows(leaderboard, limit):
             "user_id": user_id,
             "name": name,
             "country": country,
-            "time": format_time(value) if isinstance(value, (int, float)) else "--:--.---",
+            "value": value_formatter(value) if isinstance(value, (int, float)) else "--",
             "medal": resolve_medal(entry, pos),
         })
     return rows
 
-def render_leaderboard_table(rows, *, show_country=True, show_medals=False):
+def render_leaderboard_table(
+    rows, *, show_country=True, show_medals=False, value_name="Time"
+):
     """Monospace table. Columns align because a code block is fixed width.
 
     Custom emoji do not render inside code blocks, so ranks are numbers and
@@ -439,7 +506,8 @@ def render_leaderboard_table(rows, *, show_country=True, show_medals=False):
     header += f"{'PLAYER':<{name_w}}  "
     if show_medals:
         header += "   "
-    header += f"{'TIME':>9}"
+    value_width = max(len(value_name), max(len(r["value"]) for r in rows))
+    header += f"{value_name.upper():>{value_width}}"
 
     lines = [header, "-" * len(header)]
     for r in rows:
@@ -455,12 +523,14 @@ def render_leaderboard_table(rows, *, show_country=True, show_medals=False):
             # character, so pad it to three cells with a single space.
             medal = UNICODE_MEDALS.get(r["pos"], "")
             line += f"{medal} " if medal else "   "
-        line += f"{r['time']:>9}"
+        line += f"{r['value']:>{value_width}}"
         lines.append(line)
 
     return "```\n" + "\n".join(lines) + "\n```"
 
-def render_leaderboard_fields(rows, *, show_country=True, show_medals=True):
+def render_leaderboard_fields(
+    rows, *, show_country=True, show_medals=True, value_name="Time"
+):
     """Columns as side by side inline fields.
 
     Each field is its own column, so rows line up without a code block --
@@ -477,14 +547,16 @@ def render_leaderboard_fields(rows, *, show_country=True, show_medals=True):
         players.append(" ".join(parts))
 
         medal = r["medal"] if show_medals else ""
-        times.append(f"{medal} `{r['time']}`" if medal else f"`{r['time']}`")
+        times.append(f"{medal} `{r['value']}`" if medal else f"`{r['value']}`")
 
     return [
         ("Player", "\n".join(players), True),
-        ("Time", "\n".join(times), True),
+        (value_name, "\n".join(times), True),
     ]
 
-def render_leaderboard_list(rows, *, show_country=True, show_medals=True):
+def render_leaderboard_list(
+    rows, *, show_country=True, show_medals=True, value_name="Time"
+):
     """Proportional rows that keep the custom medal emoji and flag emoji."""
     lines = []
     for r in rows:
@@ -496,7 +568,7 @@ def render_leaderboard_list(rows, *, show_country=True, show_medals=True):
         parts.append(f"**{r['name']}**")
 
         medal = r["medal"] if show_medals else ""
-        tail = f"{medal} `{r['time']}`" if medal else f"`{r['time']}`"
+        tail = f"{medal} `{r['value']}`" if medal else f"`{r['value']}`"
         lines.append(f"{' '.join(parts)} - {tail}")
     return "\n".join(lines)
 
@@ -700,18 +772,29 @@ async def build_badges_view(user_id, username):
     def badge_name(badge):
         return badge.get("displayName") or badge.get("name") or "Unnamed"
 
-    shown = owned[:MAX_BADGE_GALLERIES * BADGES_PER_GALLERY]
+    shown = owned[:MAX_BADGE_GALLERIES * BADGES_PER_LARGE_GALLERY]
     icons = await fetch_badge_icons([b["id"] for b in shown])
     galleries = 0
-    for start in range(0, len(shown), BADGES_PER_GALLERY):
+    start = 0
+    while start < len(shown):
+        remaining = len(shown) - start
+        gallery_size = (
+            BADGES_PER_SMALL_GALLERY
+            if remaining <= BADGES_PER_SMALL_GALLERY
+            else BADGES_PER_LARGE_GALLERY
+        )
+        batch = shown[start:start + gallery_size]
+        start += len(batch)
+
         gallery = discord.ui.MediaGallery()
-        for badge in shown[start:start + BADGES_PER_GALLERY]:
+        for badge in batch:
             icon = icons.get(badge["id"])
             if icon:
                 gallery.add_item(media=icon, description=badge_name(badge))
         if gallery.items:
-            # Pad to a full row so the client lays every gallery out alike.
-            while len(gallery.items) < BADGES_PER_GALLERY:
+            # Pad to the selected grid size so partial galleries keep their
+            # proportions even when a badge icon could not be resolved.
+            while len(gallery.items) < gallery_size:
                 gallery.add_item(media=EMPTY_IMAGE_URL, description="")
             container.add_item(gallery)
             galleries += 1
@@ -875,15 +958,9 @@ class MapView(discord.ui.LayoutView):
 
         map_id = self.entry.get("Id")
         key = MAP_LEADERBOARD_KEY.format(id=map_id)
-        leaderboard = await fetch_entry(key, datastore="Leaderboards")
-
-        embed = None
-        if isinstance(leaderboard, list):
-            embed = await build_leaderboard_embed(
-                leaderboard,
-                title=f"🏆 {self.entry.get('Name') or 'Unnamed Map'}",
-                subtitle=f"Map #{map_id}",
-            )
+        embed = await build_map_leaderboard_embed(
+            map_id, self.entry.get("Name") or "Unnamed Map"
+        )
         if embed is None:
             await interaction.followup.send(
                 f"No leaderboard found for `{key}`.", ephemeral=True
@@ -927,6 +1004,8 @@ async def build_leaderboard_embed(
     show_medals=False,
     show_country=True,
     show_headshot=False,
+    value_name="Time",
+    value_formatter=format_time,
     color=LEADERBOARD_COLOR,
 ):
     """Render any leaderboard-shaped list into an embed.
@@ -943,7 +1022,9 @@ async def build_leaderboard_embed(
     if not leaderboard:
         return None
 
-    rows = await collect_leaderboard_rows(leaderboard, limit)
+    rows = await collect_leaderboard_rows(
+        leaderboard, limit, value_formatter=value_formatter
+    )
     if not rows:
         return None
 
@@ -951,13 +1032,18 @@ async def build_leaderboard_embed(
     fields = None
     if style == "fields":
         fields = render_leaderboard_fields(
-            rows, show_country=show_country, show_medals=show_medals
+            rows, show_country=show_country, show_medals=show_medals,
+            value_name=value_name,
         )
     elif style == "table":
-        description = render_leaderboard_table(rows, show_country=show_country)
+        description = render_leaderboard_table(
+            rows, show_country=show_country, show_medals=show_medals,
+            value_name=value_name,
+        )
     else:
         description = render_leaderboard_list(
-            rows, show_country=show_country, show_medals=show_medals
+            rows, show_country=show_country, show_medals=show_medals,
+            value_name=value_name,
         )
 
     embed = discord.Embed(
@@ -985,6 +1071,19 @@ async def build_leaderboard_embed(
         embed.set_footer(text=f"{total} {'entry' if total == 1 else 'entries'}")
     return embed
 
+async def build_map_leaderboard_embed(map_id, map_name):
+    """Build the same map leaderboard used by the map card button and command."""
+    key = MAP_LEADERBOARD_KEY.format(id=map_id)
+    leaderboard = await fetch_entry(key, datastore="Leaderboards")
+    if not isinstance(leaderboard, list):
+        return None
+
+    return await build_leaderboard_embed(
+        leaderboard,
+        title=f"🏆 {map_name or 'Unnamed Map'}",
+        subtitle=f"Map #{map_id}",
+    )
+
 @bot.event
 async def on_ready():
     global _synced
@@ -994,19 +1093,33 @@ async def on_ready():
     if _synced:
         return
     try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
-        else:
-            synced = await bot.tree.sync()
-            print(f"Synced {len(synced)} slash command(s) globally "
-                  f"(may take up to an hour to show up)")
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s) globally "
+              f"(may take up to an hour to show up)")
         _synced = True
     except Exception:
-        print("Slash command sync failed:")
+        print("Global slash command sync failed:")
         traceback.print_exc()
+        return
+
+    if GUILD_ID:
+        # Guild commands cannot carry user-install or context metadata. Remove
+        # the tree defaults only while publishing this optional test copy.
+        global_contexts = bot.tree.allowed_contexts
+        global_installs = bot.tree.allowed_installs
+        bot.tree.allowed_contexts = app_commands.AppCommandContext()
+        bot.tree.allowed_installs = app_commands.AppInstallationType()
+        try:
+            guild = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(guild_synced)} test command(s) to guild {GUILD_ID}")
+        except Exception:
+            print(f"Test guild {GUILD_ID} command sync failed:")
+            traceback.print_exc()
+        finally:
+            bot.tree.allowed_contexts = global_contexts
+            bot.tree.allowed_installs = global_installs
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -1129,6 +1242,65 @@ async def badges_command(ctx, username: str):
         return
 
     await ctx.send(view=view)
+
+@bot.hybrid_command(
+    name="leaderboard",
+    description="Show a map, wins, medals, or creators leaderboard",
+)
+@app_commands.describe(target="Community map ID, wins, medals, or creators")
+async def leaderboard_command(ctx, target: str):
+    await ctx.defer()
+
+    selected = target.strip().lower()
+    global_leaderboard = GLOBAL_LEADERBOARDS.get(selected)
+    if global_leaderboard is not None:
+        scope, value_name = global_leaderboard
+        leaderboard = await fetch_ordered_leaderboard(
+            datastore="Data", scope=scope, limit=MAX_LEADERBOARD_ROWS
+        )
+        embed = None
+        if leaderboard:
+            embed = await build_leaderboard_embed(
+                leaderboard,
+                title=f"🏆 {value_name} Leaderboard",
+                subtitle=f"Data · {scope}",
+                show_medals=True,
+                show_country=False,
+                value_name=value_name,
+                value_formatter=format_number,
+            )
+        if embed is None:
+            await ctx.send(f"No entries found for the **{value_name}** leaderboard.")
+            return
+
+        await ctx.send(embed=embed)
+        return
+
+    try:
+        map_id = int(selected)
+    except ValueError:
+        await ctx.send("Choose a map ID, `wins`, `medals`, or `creators`.")
+        return
+
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        await ctx.send("Failed to fetch the community map list.")
+        return
+
+    entry = maps_by_id.get(map_id)
+    if entry is None:
+        await ctx.send(f"No community map with ID `{map_id}`.")
+        return
+
+    embed = await build_map_leaderboard_embed(
+        map_id, entry.get("Name") or "Unnamed Map"
+    )
+    if embed is None:
+        key = MAP_LEADERBOARD_KEY.format(id=map_id)
+        await ctx.send(f"No leaderboard found for `{key}`.")
+        return
+
+    await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="map", description="Show info about a community map by its ID")
 @app_commands.describe(map_id="The community map ID")

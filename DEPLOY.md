@@ -107,6 +107,9 @@ If dependencies changed, re-run the `pip install` line from step 4 before restar
 
 - **No inbound ports needed.** The bot is an outbound websocket client, so the Oracle
   security list / `iptables` rules can stay closed. Do not open anything.
+- **User installs:** In the Discord Developer Portal, open **Installation**, enable both
+  **User Install** and **Guild Install**, and add `applications.commands` to the User
+  Install scopes. The bot always syncs its user-installable commands globally.
 - **Privileged intent:** `bot.py` sets `intents.message_content = True`. Enable
   *Message Content Intent* under Bot → Privileged Gateway Intents in the Discord
   developer portal, or login fails with `PrivilegedIntentsRequired`.
