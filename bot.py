@@ -441,8 +441,11 @@ class ProfileView(discord.ui.LayoutView):
     """Components V2 profile card built from a Main_Data entry."""
 
     def __init__(self, entry, *, user_id, username, headshot=None, wins=None,
-                 timeout=None):
+                 timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
+        self.user_id = user_id
+        self.username = username
+        self.message = None
 
         data = entry.get("Data") if isinstance(entry, dict) else None
         data = data if isinstance(data, dict) else {}
@@ -513,6 +516,20 @@ class ProfileView(discord.ui.LayoutView):
             visible=False, spacing=discord.SeparatorSpacing.small
         ))
 
+        row = discord.ui.ActionRow()
+        maps_button = discord.ui.Button(
+            label="Created maps",
+            style=discord.ButtonStyle.secondary,
+            emoji="🗺️",
+        )
+        maps_button.callback = self.show_created_maps
+        row.add_item(maps_button)
+        container.add_item(row)
+
+        container.add_item(discord.ui.Separator(
+            visible=False, spacing=discord.SeparatorSpacing.small
+        ))
+
         footer = [f"ID {user_id}"]
         created = meta.get("ProfileCreateTime")
         if isinstance(created, (int, float)):
@@ -523,6 +540,67 @@ class ProfileView(discord.ui.LayoutView):
         container.add_item(discord.ui.TextDisplay("-# " + "  ·  ".join(footer)))
 
         self.add_item(container)
+
+    async def show_created_maps(self, interaction):
+        await interaction.response.defer(thinking=True)
+
+        view = await build_created_maps_view(self.user_id, self.username)
+        if view is None:
+            await interaction.followup.send(
+                f"**{self.username}** hasn't created any community maps.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(view=view)
+
+    async def on_timeout(self):
+        for item in self.walk_children():
+            if isinstance(item, discord.ui.Button) and item.style is not discord.ButtonStyle.link:
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+async def build_created_maps_view(user_id, username, limit=10):
+    """List the community maps a player has created, most played first."""
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        return None
+
+    owned = [m for m in maps_by_id.values() if m.get("Creator") == user_id]
+    if not owned:
+        return None
+    owned.sort(key=lambda m: m.get("Plays") or 0, reverse=True)
+
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container(accent_colour=MAP_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## 🗺️ Maps by {username}\n"
+        f"-# {len(owned)} map{'s' if len(owned) != 1 else ''} created"
+    ))
+    container.add_item(discord.ui.Separator())
+
+    lines = []
+    for m in owned[:limit]:
+        name = m.get("Name") or "Unnamed Map"
+        star = " 🌟" if m.get("Featured") else ""
+        lines.append(
+            f"`#{m.get('Id')}` **{name}**{star}\n"
+            f"-# ▶️ {format_number(m.get('Plays') or 0)} plays"
+            f"  ·  ⭐ {format_number(m.get('Favorites') or 0)}"
+        )
+    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+
+    if len(owned) > limit:
+        container.add_item(discord.ui.TextDisplay(
+            f"-# and {len(owned) - limit} more"
+        ))
+
+    view.add_item(container)
+    return view
 
 async def build_profile_view(user_id, username):
     """Assemble a profile card, or None when the player has no saved data."""
@@ -867,7 +945,7 @@ async def profile_command(ctx, username: str):
         await ctx.send(f"No game data saved for **{canonical}**.")
         return
 
-    await ctx.send(view=view)
+    view.message = await ctx.send(view=view)
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
