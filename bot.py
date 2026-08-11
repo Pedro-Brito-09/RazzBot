@@ -27,6 +27,8 @@ MAX_ATTEMPTS = 3
 
 LEADERBOARD_COLOR = discord.Color.purple()
 MAX_LEADERBOARD_ROWS = 10
+# Long names get truncated so the table keeps its columns.
+MAX_NAME_WIDTH = 18
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
@@ -189,26 +191,71 @@ def format_rank(pos, show_medals):
             return medal
     return f"`{pos + 1:>2}.`"
 
-async def format_lb_row(entry, pos, *, show_medals=True, show_country=True):
-    if not isinstance(entry, dict):
-        return None
+async def collect_leaderboard_rows(leaderboard, limit):
+    """Resolve a leaderboard into plain row dicts, ready for either renderer."""
+    rows = []
+    for pos in range(min(len(leaderboard), limit)):
+        entry = leaderboard[pos]
+        if not isinstance(entry, dict):
+            continue
 
-    user_id = entry.get("UserId")
-    name = await fetch_username(user_id) if user_id is not None else None
-    if not name:
-        # A failed username lookup shouldn't drop the whole row.
-        name = f"User {user_id}" if user_id is not None else "Unknown"
+        user_id = entry.get("UserId")
+        name = await fetch_username(user_id) if user_id is not None else None
+        if not name:
+            # A failed username lookup shouldn't drop the whole row.
+            name = f"User {user_id}" if user_id is not None else "Unknown"
 
-    parts = [format_rank(pos, show_medals)]
+        country = entry.get("Country")
+        country = country.strip().upper()[:2] if isinstance(country, str) else ""
+
+        value = entry.get("Value")
+        rows.append({
+            "pos": pos,
+            "name": name,
+            "country": country,
+            "time": format_time(value) if isinstance(value, (int, float)) else "--:--.---",
+        })
+    return rows
+
+def render_leaderboard_table(rows, *, show_country=True):
+    """Monospace table. Columns align because a code block is fixed width.
+
+    Custom emoji do not render inside code blocks, so ranks are numbers and
+    countries are their two letter codes.
+    """
+    name_w = min(max(len(r["name"]) for r in rows), MAX_NAME_WIDTH)
+    name_w = max(name_w, len("PLAYER"))
+
+    header = f"{'#':>2}  "
     if show_country:
-        flag = country_code_to_emoji(entry.get("Country"))
-        if flag:
-            parts.append(flag)
-    parts.append(f"**{name}**")
+        header += f"{'CC':<2}  "
+    header += f"{'PLAYER':<{name_w}}  {'TIME':>9}"
 
-    value = entry.get("Value")
-    time_text = format_time(value) if isinstance(value, (int, float)) else "--:--.---"
-    return f"{' '.join(parts)} — `{time_text}`"
+    lines = [header, "-" * len(header)]
+    for r in rows:
+        name = r["name"]
+        if len(name) > name_w:
+            name = name[:name_w - 1] + "."
+        line = f"{r['pos'] + 1:>2}  "
+        if show_country:
+            line += f"{r['country'] or '--':<2}  "
+        line += f"{name:<{name_w}}  {r['time']:>9}"
+        lines.append(line)
+
+    return "```\n" + "\n".join(lines) + "\n```"
+
+def render_leaderboard_list(rows, *, show_country=True, show_medals=True):
+    """Proportional rows that keep the custom medal emoji and flag emoji."""
+    lines = []
+    for r in rows:
+        parts = [format_rank(r["pos"], show_medals)]
+        if show_country:
+            flag = country_code_to_emoji(r["country"])
+            if flag:
+                parts.append(flag)
+        parts.append(f"**{r['name']}**")
+        lines.append(f"{' '.join(parts)} - `{r['time']}`")
+    return "\n".join(lines)
 
 async def build_leaderboard_embed(
     leaderboard,
@@ -216,6 +263,7 @@ async def build_leaderboard_embed(
     title,
     subtitle=None,
     limit=MAX_LEADERBOARD_ROWS,
+    style="table",
     show_medals=True,
     show_country=True,
     color=LEADERBOARD_COLOR,
@@ -224,26 +272,29 @@ async def build_leaderboard_embed(
 
     Entries are dicts with UserId / Value / Country. Returns None when there
     is nothing renderable, so the caller decides what to say about it.
+
+    style="table" gives aligned monospace columns; custom emoji cannot appear
+    there, so ranks are numbers and countries are two letter codes.
+    style="list" keeps the medal and flag emoji but cannot align.
+    show_medals only applies to the list style.
     """
     if not leaderboard:
         return None
 
-    rows = []
-    for pos in range(min(len(leaderboard), limit)):
-        row = await format_lb_row(
-            leaderboard[pos], pos,
-            show_medals=show_medals,
-            show_country=show_country,
-        )
-        if row:
-            rows.append(row)
-
+    rows = await collect_leaderboard_rows(leaderboard, limit)
     if not rows:
         return None
 
+    if style == "table":
+        description = render_leaderboard_table(rows, show_country=show_country)
+    else:
+        description = render_leaderboard_list(
+            rows, show_country=show_country, show_medals=show_medals
+        )
+
     embed = discord.Embed(
         title=title,
-        description="\n".join(rows),
+        description=description,
         color=color,
         timestamp=datetime.now(timezone.utc),
     )
