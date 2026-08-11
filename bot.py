@@ -449,6 +449,73 @@ class MapView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
+async def build_leaderboard_layout(
+    leaderboard,
+    *,
+    title,
+    subtitle=None,
+    limit=MAX_LEADERBOARD_ROWS,
+    show_medals=False,
+    show_country=True,
+    color=LEADERBOARD_COLOR,
+):
+    """Components V2 version: one section per player, each with a headshot.
+
+    Returns a LayoutView, or None when there is nothing to render. A V2
+    message cannot also carry content or embeds, so this is sent on its own.
+    """
+    if not leaderboard:
+        return None
+
+    rows = await collect_leaderboard_rows(leaderboard, limit)
+    if not rows:
+        return None
+
+    headshots = await fetch_headshots([r["user_id"] for r in rows])
+
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container(accent_colour=color)
+
+    heading = f"## {title}"
+    if subtitle:
+        heading += f"\n-# {subtitle}"
+    container.add_item(discord.ui.TextDisplay(heading))
+    container.add_item(discord.ui.Separator())
+
+    for r in rows:
+        parts = [format_position(r["pos"])]
+        if show_country:
+            flag = country_code_to_emoji(r["country"])
+            if flag:
+                parts.append(flag)
+        parts.append(f"**{r['name']}**")
+
+        medal = r["medal"] if show_medals else ""
+        time_text = f"{medal} `{r['time']}`" if medal else f"`{r['time']}`"
+        text = f"{' '.join(parts)}\n{time_text}"
+
+        # A Section requires an accessory, so rows without a headshot fall
+        # back to plain text rather than an empty thumbnail slot.
+        headshot = headshots.get(r["user_id"])
+        if headshot:
+            container.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(text),
+                accessory=discord.ui.Thumbnail(media=headshot),
+            ))
+        else:
+            container.add_item(discord.ui.TextDisplay(text))
+
+    total = len(leaderboard)
+    if total > len(rows):
+        footer = f"Top {len(rows)} of {total}"
+    else:
+        footer = f"{total} {'entry' if total == 1 else 'entries'}"
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+
+    view.add_item(container)
+    return view
+
 async def build_leaderboard_embed(
     leaderboard,
     *,
@@ -554,7 +621,8 @@ async def on_command_error(ctx, error):
         await ctx.send(message)
 
 @bot.hybrid_command(description="Show the current and next daily cup map, plus today's leaderboard")
-async def cup(ctx):
+@app_commands.describe(v2="Render the leaderboard with the new Components V2 layout")
+async def cup(ctx, v2: bool = False):
     # The Roblox lookups take longer than the 3s interaction deadline.
     await ctx.defer()
 
@@ -585,11 +653,21 @@ async def cup(ctx):
         await ctx.send(f"No leaderboard found for `DailyCup_{index}`.")
         return
 
+    title = f"🏆 Leaderboard — {get_todays_date()}"
+    subtitle = f"Daily Cup #{index}"
+
+    if v2:
+        layout = await build_leaderboard_layout(
+            leaderboard, title=title, subtitle=subtitle, show_medals=True,
+        )
+        if layout is None:
+            await ctx.send("The leaderboard came back empty.")
+            return
+        await ctx.send(view=layout)
+        return
+
     lb_embed = await build_leaderboard_embed(
-        leaderboard,
-        title=f"🏆 Leaderboard — {get_todays_date()}",
-        subtitle=f"Daily Cup #{index}",
-        show_medals=True,
+        leaderboard, title=title, subtitle=subtitle, show_medals=True,
     )
     if lb_embed is None:
         await ctx.send("The leaderboard came back empty.")
