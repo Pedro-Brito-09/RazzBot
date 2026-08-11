@@ -524,14 +524,29 @@ class ProfileView(discord.ui.LayoutView):
 
         self.add_item(container)
 
+async def build_profile_view(user_id, username):
+    """Assemble a profile card, or None when the player has no saved data."""
+    entry = await fetch_entry(str(user_id), datastore="Main_Data")
+    if not entry:
+        return None
+
+    headshot = (await fetch_headshots([user_id])).get(user_id)
+    wins = await fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins")
+    return ProfileView(
+        entry, user_id=user_id, username=username,
+        headshot=headshot, wins=wins,
+    )
+
 class MapView(discord.ui.LayoutView):
     """Components V2 map card: details, creator headshot, and two buttons."""
 
     def __init__(self, entry, *, headshot=None, creator_text="Unknown",
-                 timeout=MAP_VIEW_TIMEOUT):
+                 creator_id=None, creator_name=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
         self.entry = entry
         self.message = None
+        self.creator_id = creator_id
+        self.creator_name = creator_name
 
         map_id = entry.get("Id")
         name = entry.get("Name") or "Unnamed Map"
@@ -591,6 +606,18 @@ class MapView(discord.ui.LayoutView):
         )
         leaderboard_button.callback = self.show_leaderboard
         row.add_item(leaderboard_button)
+
+        # Text can't trigger a bot action, so the creator gets a button.
+        if creator_id:
+            label = creator_name or str(creator_id)
+            creator_button = discord.ui.Button(
+                label=label[:78],
+                style=discord.ButtonStyle.secondary,
+                emoji="👤",
+            )
+            creator_button.callback = self.show_creator_profile
+            row.add_item(creator_button)
+
         container.add_item(row)
 
         self.add_item(container)
@@ -618,6 +645,19 @@ class MapView(discord.ui.LayoutView):
         # A separate message, so an embed is fine even though the map card
         # it came from is Components V2.
         await interaction.followup.send(embed=embed)
+
+    async def show_creator_profile(self, interaction):
+        await interaction.response.defer(thinking=True)
+
+        name = self.creator_name or str(self.creator_id)
+        view = await build_profile_view(self.creator_id, name)
+        if view is None:
+            await interaction.followup.send(
+                f"No game data saved for **{name}**.", ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(view=view)
 
     async def on_timeout(self):
         for item in self.children:
@@ -805,7 +845,10 @@ async def map_command(ctx, map_id: int):
     if creator_id:
         headshot = (await fetch_headshots([creator_id])).get(creator_id)
 
-    view = MapView(entry, headshot=headshot, creator_text=creator_text)
+    view = MapView(
+        entry, headshot=headshot, creator_text=creator_text,
+        creator_id=creator_id, creator_name=creator,
+    )
     view.message = await ctx.send(view=view)
 
 @bot.hybrid_command(name="profile", description="Show a player's profile")
@@ -818,18 +861,12 @@ async def profile_command(ctx, username: str):
         await ctx.send(f"No Roblox user named `{username}`.")
         return
 
-    entry = await fetch_entry(str(user_id), datastore="Main_Data")
-    if not entry:
+    view = await build_profile_view(user_id, canonical)
+    if view is None:
         await ctx.send(f"No game data saved for **{canonical}**.")
         return
 
-    headshot = (await fetch_headshots([user_id])).get(user_id)
-    wins = await fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins")
-
-    await ctx.send(view=ProfileView(
-        entry, user_id=user_id, username=canonical,
-        headshot=headshot, wins=wins,
-    ))
+    await ctx.send(view=view)
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
