@@ -244,6 +244,28 @@ def render_leaderboard_table(rows, *, show_country=True):
 
     return "```\n" + "\n".join(lines) + "\n```"
 
+def render_leaderboard_fields(rows, *, show_country=True, show_medals=True):
+    """Columns as side by side inline fields.
+
+    Each field is its own column, so rows line up without a code block --
+    which means custom emoji still render.
+    """
+    players, times = [], []
+    for r in rows:
+        parts = [format_rank(r["pos"], show_medals)]
+        if show_country:
+            flag = country_code_to_emoji(r["country"])
+            if flag:
+                parts.append(flag)
+        parts.append(f"**{r['name']}**")
+        players.append(" ".join(parts))
+        times.append(f"`{r['time']}`")
+
+    return [
+        ("Player", "\n".join(players), True),
+        ("Time", "\n".join(times), True),
+    ]
+
 def render_leaderboard_list(rows, *, show_country=True, show_medals=True):
     """Proportional rows that keep the custom medal emoji and flag emoji."""
     lines = []
@@ -263,7 +285,7 @@ async def build_leaderboard_embed(
     title,
     subtitle=None,
     limit=MAX_LEADERBOARD_ROWS,
-    style="table",
+    style="fields",
     show_medals=True,
     show_country=True,
     color=LEADERBOARD_COLOR,
@@ -273,10 +295,11 @@ async def build_leaderboard_embed(
     Entries are dicts with UserId / Value / Country. Returns None when there
     is nothing renderable, so the caller decides what to say about it.
 
-    style="table" gives aligned monospace columns; custom emoji cannot appear
-    there, so ranks are numbers and countries are two letter codes.
-    style="list" keeps the medal and flag emoji but cannot align.
-    show_medals only applies to the list style.
+    style="fields" (default) puts each column in its own inline field, which
+    lines up and still renders custom emoji.
+    style="table" is a monospace code block: strictest alignment, but emoji
+    cannot render there, so ranks are numbers and countries are codes.
+    style="list" is one decorated line per row, no columns.
     """
     if not leaderboard:
         return None
@@ -285,7 +308,13 @@ async def build_leaderboard_embed(
     if not rows:
         return None
 
-    if style == "table":
+    description = None
+    fields = None
+    if style == "fields":
+        fields = render_leaderboard_fields(
+            rows, show_country=show_country, show_medals=show_medals
+        )
+    elif style == "table":
         description = render_leaderboard_table(rows, show_country=show_country)
     else:
         description = render_leaderboard_list(
@@ -298,6 +327,8 @@ async def build_leaderboard_embed(
         color=color,
         timestamp=datetime.now(timezone.utc),
     )
+    for field_name, field_value, field_inline in (fields or []):
+        embed.add_field(name=field_name, value=field_value, inline=field_inline)
     if subtitle:
         embed.set_author(name=subtitle)
 
@@ -378,7 +409,7 @@ async def maps(ctx):
 
     lb_embed = await build_leaderboard_embed(
         leaderboard,
-        title=f"Leaderboard — {get_todays_date()}",
+        title=f"🏆 Leaderboard — {get_todays_date()}",
         subtitle=f"Daily Cup #{index}",
     )
     if lb_embed is None:
