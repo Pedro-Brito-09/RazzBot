@@ -25,6 +25,9 @@ USER_AGENT = (
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10, sock_read=30)
 MAX_ATTEMPTS = 3
 
+LEADERBOARD_COLOR = discord.Color.purple()
+MAX_LEADERBOARD_ROWS = 10
+
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
 # Optional: syncing to one guild makes slash commands appear instantly.
@@ -178,26 +181,81 @@ async def fetch_username(user_id):
     data = await request_json(url, label=f"fetch_username({user_id})")
     return data.get("name") if data else None
 
-async def get_lb_entry(leaderboard, pos):
-    entry = leaderboard[pos]
+def format_rank(pos, show_medals):
+    """Medal for the top places, a padded number for everyone else."""
+    if show_medals:
+        medal = get_medal_emoji(pos)
+        if medal:
+            return medal
+    return f"`{pos + 1:>2}.`"
+
+async def format_lb_row(entry, pos, *, show_medals=True, show_country=True):
     if not isinstance(entry, dict):
         return None
 
     user_id = entry.get("UserId")
-    value = entry.get("Value")
-
     name = await fetch_username(user_id) if user_id is not None else None
     if not name:
         # A failed username lookup shouldn't drop the whole row.
         name = f"User {user_id}" if user_id is not None else "Unknown"
 
-    medal = get_medal_emoji(pos)
-    flag = country_code_to_emoji(entry.get("Country"))
-    time_text = format_time(value) if isinstance(value, (int, float)) else "--:--.---"
+    parts = [format_rank(pos, show_medals)]
+    if show_country:
+        flag = country_code_to_emoji(entry.get("Country"))
+        if flag:
+            parts.append(flag)
+    parts.append(f"**{name}**")
 
-    prefix = f"{medal}・" if medal else ""
-    flag_text = f"{flag} " if flag else ""
-    return f"{prefix}{flag_text}{name}・{time_text}"
+    value = entry.get("Value")
+    time_text = format_time(value) if isinstance(value, (int, float)) else "--:--.---"
+    return f"{' '.join(parts)} — `{time_text}`"
+
+async def build_leaderboard_embed(
+    leaderboard,
+    *,
+    title,
+    subtitle=None,
+    limit=MAX_LEADERBOARD_ROWS,
+    show_medals=True,
+    show_country=True,
+    color=LEADERBOARD_COLOR,
+):
+    """Render any leaderboard-shaped list into an embed.
+
+    Entries are dicts with UserId / Value / Country. Returns None when there
+    is nothing renderable, so the caller decides what to say about it.
+    """
+    if not leaderboard:
+        return None
+
+    rows = []
+    for pos in range(min(len(leaderboard), limit)):
+        row = await format_lb_row(
+            leaderboard[pos], pos,
+            show_medals=show_medals,
+            show_country=show_country,
+        )
+        if row:
+            rows.append(row)
+
+    if not rows:
+        return None
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(rows),
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if subtitle:
+        embed.set_author(name=subtitle)
+
+    total = len(leaderboard)
+    if total > len(rows):
+        embed.set_footer(text=f"Top {len(rows)} of {total}")
+    else:
+        embed.set_footer(text=f"{total} {'entry' if total == 1 else 'entries'}")
+    return embed
 
 @bot.event
 async def on_ready():
@@ -267,21 +325,15 @@ async def maps(ctx):
         await ctx.send(f"No leaderboard found for `DailyCup_{index}`.")
         return
 
-    entries = []
-    for pos in range(min(len(leaderboard), 4)):
-        line = await get_lb_entry(leaderboard, pos)
-        if line:
-            entries.append(line)
-
-    if not entries:
+    lb_embed = await build_leaderboard_embed(
+        leaderboard,
+        title=f"Leaderboard — {get_todays_date()}",
+        subtitle=f"Daily Cup #{index}",
+    )
+    if lb_embed is None:
         await ctx.send("The leaderboard came back empty.")
         return
 
-    lb_embed = discord.Embed(
-        title=f"Leaderboard - {get_todays_date()}",
-        description="\n".join(entries),
-        color=discord.Color.purple()
-    )
     await ctx.send(embed=lb_embed)
 
 @bot.hybrid_command(description="Check that the bot is alive")
