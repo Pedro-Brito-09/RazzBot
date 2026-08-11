@@ -423,28 +423,42 @@ class MapView(discord.ui.LayoutView):
         plays = entry.get("Plays") or 0
         favorites = entry.get("Favorites") or 0
         playstyle = (entry.get("Playstyle") or "Unknown").upper()
+        privacy = entry.get("Privacy")
 
-        body = (
-            f"## {name}\n"
-            f"By **{creator_text}**\n\n"
-            f"**{playstyle}**  ·  {plays:,} plays  ·  ⭐ {favorites:,}"
-        )
+        heading = f"## {name}\n-# by {creator_text}"
 
         container = discord.ui.Container(accent_colour=MAP_COLOR)
         # The headshot rides along as a section accessory when we have one.
         if headshot:
             container.add_item(discord.ui.Section(
-                discord.ui.TextDisplay(body),
+                discord.ui.TextDisplay(heading),
                 accessory=discord.ui.Thumbnail(media=headshot),
             ))
         else:
-            container.add_item(discord.ui.TextDisplay(body))
+            container.add_item(discord.ui.TextDisplay(heading))
+
+        container.add_item(discord.ui.Separator())
+
+        container.add_item(discord.ui.TextDisplay(
+            f"🎮  **{playstyle}**\n"
+            f"▶️  **{plays:,}** plays\n"
+            f"⭐  **{favorites:,}** favourites"
+        ))
+
+        # Invisible separator: breathing room without a second rule.
+        container.add_item(discord.ui.Separator(
+            visible=False, spacing=discord.SeparatorSpacing.small
+        ))
 
         footer = f"ID {map_id}"
-        privacy = entry.get("Privacy")
         if privacy:
-            footer += f"  ·  {privacy}"
+            badge = {"Public": "🌐", "Private": "🔒"}.get(privacy, "")
+            footer += f"  ·  {badge} {privacy}".rstrip()
         container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+
+        container.add_item(discord.ui.Separator(
+            visible=False, spacing=discord.SeparatorSpacing.small
+        ))
 
         row = discord.ui.ActionRow()
         row.add_item(discord.ui.Button(
