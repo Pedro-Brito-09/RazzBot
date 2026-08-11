@@ -149,6 +149,34 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
         return decode_buffer(value["zbase64"])
     return value
 
+async def fetch_ordered_entry(entry_key, datastore="Data", scope="Wins"):
+    """Read one entry from an ordered datastore, which has its own endpoint.
+
+    Returns the integer value, or None. int64 fields often arrive as strings
+    in JSON, so the value is coerced.
+    """
+    url = (
+        f"https://apis.roblox.com/cloud/v2/universes/8993151589/"
+        f"ordered-data-stores/{quote(datastore, safe='')}/"
+        f"scopes/{quote(scope, safe='')}/"
+        f"entries/{quote(str(entry_key), safe='')}"
+    )
+    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    data = await request_json(
+        url, headers=headers,
+        label=f"fetch_ordered_entry({datastore}/{scope}/{entry_key})",
+    )
+    if not data:
+        return None
+
+    value = data.get("value")
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, (int, float)) else None
+
 def compute_maps(submissions, todays_map):
     accepted = [
         s for s in submissions
@@ -412,7 +440,8 @@ async def get_community_maps():
 class ProfileView(discord.ui.LayoutView):
     """Components V2 profile card built from a Main_Data entry."""
 
-    def __init__(self, entry, *, user_id, username, headshot=None, timeout=None):
+    def __init__(self, entry, *, user_id, username, headshot=None, wins=None,
+                 timeout=None):
         super().__init__(timeout=timeout)
 
         data = entry.get("Data") if isinstance(entry, dict) else None
@@ -461,13 +490,22 @@ class ProfileView(discord.ui.LayoutView):
         stats = data.get("Stats") if isinstance(data.get("Stats"), dict) else {}
         streak = data.get("LoginStreak") or 0
         best_streak = stats.get("HighestLoginStreak") or 0
+        # Wins come from an ordered datastore, so they may be unavailable
+        # even when the rest of the profile loaded.
+        win_streak = f"⚡  win streak **{format_number(stats.get('WinStreak') or 0)}**"
+        if wins is not None:
+            wins_line = f"🏆  **{format_number(wins)}** wins  ·  {win_streak}"
+        else:
+            wins_line = win_streak
+
         lines = [
             f"🎮  **{format_number(stats.get('GamesPlayed') or 0)}** games played",
+            wins_line,
             f"🏁  **{format_number(stats.get('FlagsReached') or 0)}** flags reached",
             f"⚔️  **{format_number(stats.get('Kills') or 0)}** kills"
             f"  ·  ☠️  **{format_number(stats.get('Deaths') or 0)}** deaths",
             f"🏔️  furthest round **{format_number(stats.get('FurthestRound') or 0)}**",
-            f"🔥  **{streak}** day streak  ·  best **{best_streak}**",
+            f"🔥  **{streak}** day login streak  ·  best **{best_streak}**",
         ]
         rank = dig(data, "Partypass", "rank")
         if rank is not None:
@@ -789,8 +827,11 @@ async def profile_command(ctx, username: str):
         return
 
     headshot = (await fetch_headshots([user_id])).get(user_id)
+    wins = await fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins")
+
     await ctx.send(view=ProfileView(
-        entry, user_id=user_id, username=canonical, headshot=headshot,
+        entry, user_id=user_id, username=canonical,
+        headshot=headshot, wins=wins,
     ))
 
 @bot.hybrid_command(description="Check that the bot is alive")
