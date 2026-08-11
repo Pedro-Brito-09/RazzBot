@@ -49,6 +49,9 @@ UNIVERSE_ID = 8993151589
 # the only endpoint that answers without authentication.
 OWNED_BADGES_CACHE_TTL = 300
 BADGE_CONCURRENCY = 8
+BADGE_ICON_SIZE = "150x150"
+# Discord caps a media gallery at 10 images, so badges are chunked.
+MEDIA_GALLERY_MAX = 10
 
 # TODO placeholder: swap for the real deeplink once the format is known.
 PLAY_URL_TEMPLATE = "https://www.roblox.com/games/0?mapId={id}"
@@ -198,6 +201,27 @@ async def fetch_owned_badge_ids(user_id, badge_ids):
     owned = {badge_id for badge_id, has in results if has}
     _owned_badges_cache[user_id] = (now, owned)
     return owned
+
+async def fetch_badge_icons(badge_ids):
+    """Badge icon URLs keyed by badge ID. One batched request."""
+    ids = [str(b) for b in badge_ids if b is not None]
+    if not ids:
+        return {}
+
+    url = (
+        "https://thumbnails.roblox.com/v1/badges/icons"
+        f"?badgeIds={','.join(ids)}&size={BADGE_ICON_SIZE}"
+        "&format=Png&isCircular=false"
+    )
+    data = await request_json(url, label="fetch_badge_icons")
+    if not data:
+        return {}
+
+    icons = {}
+    for item in data.get("data", []):
+        if item.get("state") == "Completed" and item.get("imageUrl"):
+            icons[item.get("targetId")] = item["imageUrl"]
+    return icons
 
 async def fetch_ordered_entry(entry_key, datastore="Data", scope="Wins"):
     """Read one entry from an ordered datastore, which has its own endpoint.
@@ -641,21 +665,43 @@ async def build_badges_view(user_id, username):
     if not badges:
         return None
 
-    owned = await fetch_owned_badge_ids(user_id, [b["id"] for b in badges])
-
-    lines = []
-    for badge in badges:
-        has = badge["id"] in owned
-        name = badge.get("displayName") or badge.get("name") or "Unnamed"
-        lines.append(f"{'✅' if has else '⬜'} {f'**{name}**' if has else name}")
+    owned_ids = await fetch_owned_badge_ids(user_id, [b["id"] for b in badges])
+    owned = [b for b in badges if b["id"] in owned_ids]
 
     view = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container(accent_colour=PROFILE_COLOR)
     container.add_item(discord.ui.TextDisplay(
         f"## 🎖️ Badges — {username}\n-# {len(owned)} of {len(badges)} earned"
     ))
+
+    if not owned:
+        container.add_item(discord.ui.TextDisplay("-# No badges earned yet."))
+        view.add_item(container)
+        return view
+
     container.add_item(discord.ui.Separator())
-    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+
+    def badge_name(badge):
+        return badge.get("displayName") or badge.get("name") or "Unnamed"
+
+    icons = await fetch_badge_icons([b["id"] for b in owned])
+    galleries = 0
+    for start in range(0, len(owned), MEDIA_GALLERY_MAX):
+        gallery = discord.ui.MediaGallery()
+        for badge in owned[start:start + MEDIA_GALLERY_MAX]:
+            icon = icons.get(badge["id"])
+            if icon:
+                gallery.add_item(media=icon, description=badge_name(badge))
+        if gallery.items:
+            container.add_item(gallery)
+            galleries += 1
+
+    # No icon resolved for anything: fall back to naming them.
+    if not galleries:
+        container.add_item(discord.ui.TextDisplay(
+            "\n".join(f"✅ **{badge_name(b)}**" for b in owned)
+        ))
+
     view.add_item(container)
     return view
 
