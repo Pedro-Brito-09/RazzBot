@@ -7,6 +7,7 @@ import base64
 import zstandard as zstd
 import traceback
 import asyncio
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 
 # aiohttp defaults to a 5 minute total timeout, which just hangs the command.
@@ -34,9 +35,11 @@ def decode_buffer(value):
         return decoded_bytes
 
 async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
+    # Datastore names contain spaces ("Daily Cup Submissions"), so encode
+    # both segments rather than relying on the client to fix up the URL.
     url = (
         f"https://apis.roblox.com/cloud/v2/universes/8993151589/"
-        f"data-stores/{datastore}/entries/{entry_key}"
+        f"data-stores/{quote(datastore, safe='')}/entries/{quote(str(entry_key), safe='')}"
     )
     headers = {"x-api-key": API_KEY, "Accept": "application/json"}
     try:
