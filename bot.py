@@ -87,12 +87,19 @@ async def get_session():
         )
     return _session
 
-async def request_json(url, headers=None, label=""):
-    """GET JSON with retries. Returns None on any failure, never raises."""
+async def request_json(url, headers=None, label="", json_body=None):
+    """Fetch JSON with retries. POSTs when json_body is given, else GETs.
+
+    Returns None on any failure, never raises.
+    """
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             session = await get_session()
-            async with session.get(url, headers=headers) as resp:
+            if json_body is not None:
+                request = session.post(url, headers=headers, json=json_body)
+            else:
+                request = session.get(url, headers=headers)
+            async with request as resp:
                 if resp.status != 200:
                     body = (await resp.text())[:200]
                     print(f"{label} -> HTTP {resp.status}: {body}")
@@ -199,6 +206,24 @@ def get_medal_emoji(pos):
         return "<:BronzeMedal:1466201227997089873>"
     else:
         return ""
+
+async def fetch_user_id(username):
+    """Resolve a Roblox username to (id, canonical_name), or (None, None).
+
+    The lookup is a POST; Roblox retired the GET equivalent.
+    """
+    data = await request_json(
+        "https://users.roblox.com/v1/usernames/users",
+        label=f"fetch_user_id({username})",
+        json_body={"usernames": [username], "excludeBannedUsers": False},
+    )
+    if not data:
+        return None, None
+    users = data.get("data") or []
+    if not users:
+        return None, None
+    # Roblox matches case-insensitively; take the name it considers canonical.
+    return users[0].get("id"), users[0].get("name")
 
 async def fetch_username(user_id):
     url = f"https://users.roblox.com/v1/users/{user_id}"
