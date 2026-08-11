@@ -183,13 +183,16 @@ async def fetch_username(user_id):
     data = await request_json(url, label=f"fetch_username({user_id})")
     return data.get("name") if data else None
 
-def format_rank(pos, show_medals):
-    """Medal for the top places, a padded number for everyone else."""
-    if show_medals:
-        medal = get_medal_emoji(pos)
-        if medal:
-            return medal
-    return f"`{pos + 1:>2}.`"
+def format_position(pos):
+    return f"`#{pos + 1}`"
+
+def resolve_medal(entry, pos):
+    """The medal for a row. Single place to change when the rule changes.
+
+    Currently awarded purely by finishing position; takes the whole entry so
+    a value based rule can be dropped in without touching the renderers.
+    """
+    return get_medal_emoji(pos)
 
 async def collect_leaderboard_rows(leaderboard, limit):
     """Resolve a leaderboard into plain row dicts, ready for either renderer."""
@@ -214,6 +217,7 @@ async def collect_leaderboard_rows(leaderboard, limit):
             "name": name,
             "country": country,
             "time": format_time(value) if isinstance(value, (int, float)) else "--:--.---",
+            "medal": resolve_medal(entry, pos),
         })
     return rows
 
@@ -252,14 +256,16 @@ def render_leaderboard_fields(rows, *, show_country=True, show_medals=True):
     """
     players, times = [], []
     for r in rows:
-        parts = [format_rank(r["pos"], show_medals)]
+        parts = [format_position(r["pos"])]
         if show_country:
             flag = country_code_to_emoji(r["country"])
             if flag:
                 parts.append(flag)
         parts.append(f"**{r['name']}**")
         players.append(" ".join(parts))
-        times.append(f"`{r['time']}`")
+
+        medal = r["medal"] if show_medals else ""
+        times.append(f"{medal} `{r['time']}`" if medal else f"`{r['time']}`")
 
     return [
         ("Player", "\n".join(players), True),
@@ -270,13 +276,16 @@ def render_leaderboard_list(rows, *, show_country=True, show_medals=True):
     """Proportional rows that keep the custom medal emoji and flag emoji."""
     lines = []
     for r in rows:
-        parts = [format_rank(r["pos"], show_medals)]
+        parts = [format_position(r["pos"])]
         if show_country:
             flag = country_code_to_emoji(r["country"])
             if flag:
                 parts.append(flag)
         parts.append(f"**{r['name']}**")
-        lines.append(f"{' '.join(parts)} - `{r['time']}`")
+
+        medal = r["medal"] if show_medals else ""
+        tail = f"{medal} `{r['time']}`" if medal else f"`{r['time']}`"
+        lines.append(f"{' '.join(parts)} - {tail}")
     return "\n".join(lines)
 
 async def build_leaderboard_embed(
