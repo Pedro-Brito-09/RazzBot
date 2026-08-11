@@ -1,0 +1,38 @@
+[Unit]
+Description=RazzBot Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=razzbot
+Group=razzbot
+WorkingDirectory=/opt/razzbot
+EnvironmentFile=/etc/razzbot.env
+ExecStart=/opt/razzbot/.venv/bin/python -u /opt/razzbot/bot.py
+
+Restart=always
+RestartSec=10
+# don't give up if Discord/network is down for a long stretch
+StartLimitIntervalSec=0
+
+# keep the 1 GB box from being eaten by a runaway process
+MemoryMax=400M
+MemoryHigh=300M
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/razzbot
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=razzbot
+
+[Install]
+WantedBy=multi-user.target
