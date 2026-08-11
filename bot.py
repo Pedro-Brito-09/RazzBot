@@ -367,46 +367,6 @@ async def get_community_maps():
     print(f"community maps indexed: {len(by_id)} entries")
     return by_id
 
-async def build_map_embed(entry, *, color=MAP_COLOR):
-    name = entry.get("Name") or "Unnamed Map"
-    if entry.get("Featured"):
-        name = f"{name} 🌟"
-
-    creator_id = entry.get("Creator")
-    creator = await fetch_username(creator_id) if creator_id else None
-    if creator:
-        creator_text = f"@{creator}"
-    elif creator_id:
-        creator_text = f"User {creator_id}"
-    else:
-        creator_text = "Unknown"
-
-    plays = entry.get("Plays") or 0
-    favorites = entry.get("Favorites") or 0
-    playstyle = (entry.get("Playstyle") or "Unknown").upper()
-
-    embed = discord.Embed(
-        title=name,
-        description=(
-            f"By **{creator_text}**\n\n"
-            f"**{playstyle}**  ·  {plays:,} plays  ·  ⭐ {favorites:,}"
-        ),
-        color=color,
-    )
-
-    if creator_id:
-        headshots = await fetch_headshots([creator_id])
-        creator_headshot = headshots.get(creator_id)
-        if creator_headshot:
-            embed.set_thumbnail(url=creator_headshot)
-
-    footer = f"ID {entry.get('Id')}"
-    privacy = entry.get("Privacy")
-    if privacy:
-        footer += f"  ·  {privacy}"
-    embed.set_footer(text=footer)
-    return embed
-
 class MapView(discord.ui.LayoutView):
     """Components V2 map card: details, creator headshot, and two buttons."""
 
