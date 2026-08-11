@@ -40,9 +40,8 @@ MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
 
 # TODO placeholder: swap for the real deeplink once the format is known.
 PLAY_URL_TEMPLATE = "https://www.roblox.com/games/0?mapId={id}"
-# TODO unconfirmed: the key format for a community map's leaderboard. The
-# daily cup uses "DailyCup_{index}" in the same datastore.
-MAP_LEADERBOARD_KEY = "Map_{id}"
+# A community map's leaderboard is keyed by the map ID on its own.
+MAP_LEADERBOARD_KEY = "{id}"
 # How long the Leaderboard button stays clickable.
 MAP_VIEW_TIMEOUT = 900
 # Long names get truncated so the table keeps its columns.
@@ -336,7 +335,7 @@ async def get_community_maps():
 async def build_map_embed(entry, *, color=MAP_COLOR):
     name = entry.get("Name") or "Unnamed Map"
     if entry.get("Featured"):
-        name = f"{name} ⚡"
+        name = f"{name} 🌟"
 
     creator_id = entry.get("Creator")
     creator = await fetch_username(creator_id) if creator_id else None
