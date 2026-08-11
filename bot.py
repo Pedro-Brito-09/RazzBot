@@ -540,7 +540,7 @@ class ProfileView(discord.ui.LayoutView):
         # Buttons sit directly under the block above.
         row = discord.ui.ActionRow()
         maps_button = discord.ui.Button(
-            label="Created maps",
+            label="Maps",
             style=discord.ButtonStyle.secondary,
             emoji="🗺️",
         )
@@ -619,8 +619,7 @@ class ProfileView(discord.ui.LayoutView):
         view = await build_created_maps_view(self.user_id, self.username)
         if view is None:
             await interaction.followup.send(
-                f"**{self.username}** hasn't created any community maps.",
-                ephemeral=True,
+                "No public maps found...", ephemeral=True
             )
             return
 
@@ -666,7 +665,10 @@ async def build_created_maps_view(user_id, username, limit=10):
     if not maps_by_id:
         return None
 
-    owned = [m for m in maps_by_id.values() if m.get("Creator") == user_id]
+    owned = [
+        m for m in maps_by_id.values()
+        if m.get("Creator") == user_id and m.get("Privacy") == "Public"
+    ]
     if not owned:
         return None
     owned.sort(key=lambda m: m.get("Plays") or 0, reverse=True)
@@ -675,7 +677,7 @@ async def build_created_maps_view(user_id, username, limit=10):
     container = discord.ui.Container(accent_colour=MAP_COLOR)
     container.add_item(discord.ui.TextDisplay(
         f"## 🗺️ Maps by {username}\n"
-        f"-# {len(owned)} map{'s' if len(owned) != 1 else ''} created"
+        f"-# {len(owned)} public map{'s' if len(owned) != 1 else ''}"
     ))
     container.add_item(discord.ui.Separator())
 
