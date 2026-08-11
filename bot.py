@@ -7,11 +7,23 @@ import base64
 import zstandard as zstd
 import traceback
 import asyncio
+import io
+import socket
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 
-# aiohttp defaults to a 5 minute total timeout, which just hangs the command.
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
+# aiohttp's default UA ("Python/3.x aiohttp/3.x") appears to get blackholed by
+# Roblox's edge: requests that work instantly under curl never return headers.
+# Send a conventional UA instead.
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+# Staged rather than one total budget: fail fast on a dead connection, but
+# still allow a slow body through. aiohttp's default total is 5 minutes.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10, sock_read=30)
+MAX_ATTEMPTS = 3
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
@@ -24,11 +36,53 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 _synced = False
+_session = None
+
+async def get_session():
+    """One shared session for the process, built lazily on the running loop."""
+    global _session
+    if _session is None or _session.closed:
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,   # apis.roblox.com has no AAAA record
+            limit=10,
+            ttl_dns_cache=300,
+        )
+        _session = aiohttp.ClientSession(
+            timeout=REQUEST_TIMEOUT,
+            connector=connector,
+            headers={"User-Agent": USER_AGENT},
+        )
+    return _session
+
+async def request_json(url, headers=None, label=""):
+    """GET JSON with retries. Returns None on any failure, never raises."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            session = await get_session()
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:200]
+                    print(f"{label} -> HTTP {resp.status}: {body}")
+                    return None
+                # Roblox doesn't always send application/json.
+                return await resp.json(content_type=None)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            print(f"{label} -> attempt {attempt}/{MAX_ATTEMPTS} "
+                  f"failed: {type(e).__name__}: {e}")
+            if attempt == MAX_ATTEMPTS:
+                return None
+            await asyncio.sleep(2 * attempt)
+    return None
 
 def decode_buffer(value):
     compressed = base64.b64decode(value)
     dctx = zstd.ZstdDecompressor()
-    decoded_bytes = dctx.decompress(compressed)
+    try:
+        decoded_bytes = dctx.decompress(compressed)
+    except zstd.ZstdError:
+        # Frames written without the content size in the header can't be
+        # decompressed one-shot; stream them instead.
+        decoded_bytes = dctx.stream_reader(io.BytesIO(compressed)).read()
     try:
         return json.loads(decoded_bytes)
     except Exception:
@@ -42,15 +96,9 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
         f"data-stores/{quote(datastore, safe='')}/entries/{quote(str(entry_key), safe='')}"
     )
     headers = {"x-api-key": API_KEY, "Accept": "application/json"}
-    try:
-        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    print(f"fetch_entry({datastore}/{entry_key}) -> HTTP {resp.status}")
-                    return None
-                data = await resp.json()
-    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-        print(f"fetch_entry({datastore}/{entry_key}) -> {type(e).__name__}: {e}")
+    data = await request_json(url, headers=headers,
+                              label=f"fetch_entry({datastore}/{entry_key})")
+    if not data:
         return None
 
     value = data.get("value")
@@ -121,17 +169,8 @@ def get_medal_emoji(pos):
 
 async def fetch_username(user_id):
     url = f"https://users.roblox.com/v1/users/{user_id}"
-    try:
-        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    print(f"fetch_username({user_id}) -> HTTP {resp.status}")
-                    return None
-                data = await resp.json()
-                return data.get("name")
-    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-        print(f"fetch_username({user_id}) -> {type(e).__name__}: {e}")
-        return None
+    data = await request_json(url, label=f"fetch_username({user_id})")
+    return data.get("name") if data else None
 
 async def get_lb_entry(leaderboard, pos):
     entry = leaderboard[pos]
@@ -242,5 +281,15 @@ async def maps(ctx):
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
     await ctx.send("hello fuckers")
+
+_original_close = bot.close
+
+async def _close_with_session():
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    await _original_close()
+
+bot.close = _close_with_session
 
 bot.run(TOKEN)
