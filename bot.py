@@ -514,13 +514,9 @@ class ProfileView(discord.ui.LayoutView):
             heading += f"\n-# {subtitle}"
 
         container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-        if headshot:
-            container.add_item(discord.ui.Section(
-                discord.ui.TextDisplay(heading),
-                accessory=discord.ui.Thumbnail(media=headshot),
-            ))
-        else:
-            container.add_item(discord.ui.TextDisplay(heading))
+        # The heading stays a plain text display: a Section takes the height
+        # of its thumbnail, which would push the buttons below the image.
+        container.add_item(discord.ui.TextDisplay(heading))
 
         # Buttons sit directly under the equipped tag/skin line.
         row = discord.ui.ActionRow()
@@ -553,7 +549,15 @@ class ProfileView(discord.ui.LayoutView):
             for i, tier in enumerate(("Diamond", "Gold", "Silver", "Bronze"))
         ]
         medals = "  ·  ".join(f"{emoji} **{count}**" for emoji, count in medal_counts)
-        container.add_item(discord.ui.TextDisplay(f"{currency}\n\n{medals}"))
+        # The headshot rides here instead, where the block is tall enough to
+        # sit alongside it without leaving a gap.
+        if headshot:
+            container.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(f"{currency}\n\n{medals}"),
+                accessory=discord.ui.Thumbnail(media=headshot),
+            ))
+        else:
+            container.add_item(discord.ui.TextDisplay(f"{currency}\n\n{medals}"))
 
         container.add_item(discord.ui.Separator(
             visible=False, spacing=discord.SeparatorSpacing.small
