@@ -598,6 +598,7 @@ class MapView(discord.ui.LayoutView):
             label="Play",
             style=discord.ButtonStyle.link,
             url=PLAY_URL_TEMPLATE.format(id=map_id),
+            emoji="▶️",
         ))
         leaderboard_button = discord.ui.Button(
             label="Leaderboard",
