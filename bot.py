@@ -50,8 +50,13 @@ UNIVERSE_ID = 8993151589
 OWNED_BADGES_CACHE_TTL = 300
 BADGE_CONCURRENCY = 8
 BADGE_ICON_SIZE = "150x150"
-# Discord caps a media gallery at 10 images, so badges are chunked.
-MEDIA_GALLERY_MAX = 10
+# Discord decides gallery layout from the item count and features the first
+# image when there are many, so badges go out three at a time -- one even
+# row per gallery. The cap Discord enforces is 10.
+BADGES_PER_GALLERY = 3
+# A message caps at 40 components, and every gallery plus its images counts
+# toward that, so the grid is bounded and the rest is summarised.
+MAX_BADGE_GALLERIES = 8
 
 # TODO placeholder: swap for the real deeplink once the format is known.
 PLAY_URL_TEMPLATE = "https://www.roblox.com/games/0?mapId={id}"
@@ -684,17 +689,23 @@ async def build_badges_view(user_id, username):
     def badge_name(badge):
         return badge.get("displayName") or badge.get("name") or "Unnamed"
 
-    icons = await fetch_badge_icons([b["id"] for b in owned])
+    shown = owned[:MAX_BADGE_GALLERIES * BADGES_PER_GALLERY]
+    icons = await fetch_badge_icons([b["id"] for b in shown])
     galleries = 0
-    for start in range(0, len(owned), MEDIA_GALLERY_MAX):
+    for start in range(0, len(shown), BADGES_PER_GALLERY):
         gallery = discord.ui.MediaGallery()
-        for badge in owned[start:start + MEDIA_GALLERY_MAX]:
+        for badge in shown[start:start + BADGES_PER_GALLERY]:
             icon = icons.get(badge["id"])
             if icon:
                 gallery.add_item(media=icon, description=badge_name(badge))
         if gallery.items:
             container.add_item(gallery)
             galleries += 1
+
+    if len(owned) > len(shown):
+        container.add_item(discord.ui.TextDisplay(
+            f"-# and {len(owned) - len(shown)} more"
+        ))
 
     # No icon resolved for anything: fall back to naming them.
     if not galleries:
