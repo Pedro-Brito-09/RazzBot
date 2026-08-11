@@ -30,6 +30,7 @@ MAX_ATTEMPTS = 3
 # Twemoji's trophy gold, so the bar matches the 🏆 in the title.
 LEADERBOARD_COLOR = discord.Color(0xFFCC4D)
 MAP_COLOR = discord.Color.blurple()
+PROFILE_COLOR = discord.Color(0x9B59B6)
 MAX_LEADERBOARD_ROWS = 10
 HEADSHOT_SIZE = "150x150"
 # Custom emoji cannot render inside a code block, so the table style needs
@@ -194,6 +195,33 @@ def country_code_to_emoji(code: str) -> str:
     if len(code) != 2 or not code.isalpha():
         return ""
     return ''.join(chr(127397 + ord(c)) for c in code)
+
+def dig(data, *keys, default=None):
+    """Walk nested dicts, returning default the moment anything is missing."""
+    for key in keys:
+        if not isinstance(data, dict):
+            return default
+        data = data.get(key)
+        if data is None:
+            return default
+    return data
+
+def format_duration(total_seconds):
+    total = int(total_seconds or 0)
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+def format_number(value):
+    """Trim the .0 off whole floats so 21167.5 and 8 both read naturally."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return f"{value:,}" if isinstance(value, (int, float)) else "0"
 
 def get_medal_emoji(pos):
     if pos == 0:
@@ -391,6 +419,86 @@ async def get_community_maps():
     _maps_cache["at"] = now
     print(f"community maps indexed: {len(by_id)} entries")
     return by_id
+
+class ProfileView(discord.ui.LayoutView):
+    """Components V2 profile card built from a Main_Data entry."""
+
+    def __init__(self, entry, *, user_id, username, headshot=None, timeout=None):
+        super().__init__(timeout=timeout)
+
+        data = entry.get("Data") if isinstance(entry, dict) else None
+        data = data if isinstance(data, dict) else {}
+        meta = entry.get("MetaData") if isinstance(entry, dict) else None
+        meta = meta if isinstance(meta, dict) else {}
+
+        tag = dig(data, "Tags", "Equipped")
+        skin = dig(data, "Skins", "Equipped")
+        subtitle = "  ·  ".join(p for p in (
+            f"🏷️ {tag}" if tag else "",
+            f"🎨 {skin}" if skin else "",
+        ) if p)
+
+        heading = f"## {username}"
+        if subtitle:
+            heading += f"\n-# {subtitle}"
+
+        container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+        if headshot:
+            container.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(heading),
+                accessory=discord.ui.Thumbnail(media=headshot),
+            ))
+        else:
+            container.add_item(discord.ui.TextDisplay(heading))
+
+        container.add_item(discord.ui.Separator())
+
+        stars = format_number(data.get("Stars") or 0)
+        all_time = format_number(dig(data, "Stats", "AllTimeStars", default=0))
+        currency = f"⭐  **{stars}** Stars\n-# {all_time} earned all time"
+
+        # Medals are stored as lists of map IDs, so the count is the length.
+        medal_counts = [
+            (get_medal_emoji(i), len(dig(data, "Medals", tier, default=[]) or []))
+            for i, tier in enumerate(("Diamond", "Gold", "Silver", "Bronze"))
+        ]
+        medals = "  ".join(f"{emoji} **{count}**" for emoji, count in medal_counts)
+        container.add_item(discord.ui.TextDisplay(f"{currency}\n\n{medals}"))
+
+        container.add_item(discord.ui.Separator(
+            visible=False, spacing=discord.SeparatorSpacing.small
+        ))
+
+        stats = data.get("Stats") if isinstance(data.get("Stats"), dict) else {}
+        streak = data.get("LoginStreak") or 0
+        best_streak = stats.get("HighestLoginStreak") or 0
+        lines = [
+            f"🎮  **{format_number(stats.get('GamesPlayed') or 0)}** games played",
+            f"🏁  **{format_number(stats.get('FlagsReached') or 0)}** flags reached",
+            f"⚔️  **{format_number(stats.get('Kills') or 0)}** kills"
+            f"  ·  ☠️  **{format_number(stats.get('Deaths') or 0)}** deaths",
+            f"⏱️  **{format_duration(stats.get('TimePlayed'))}** played",
+            f"🔥  **{streak}** day streak  ·  best **{best_streak}**",
+        ]
+        rank = dig(data, "Partypass", "rank")
+        if rank is not None:
+            lines.append(f"🎟️  Party Pass rank **{rank}**")
+        container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+
+        container.add_item(discord.ui.Separator(
+            visible=False, spacing=discord.SeparatorSpacing.small
+        ))
+
+        footer = [f"ID {user_id}"]
+        created = meta.get("ProfileCreateTime")
+        if isinstance(created, (int, float)):
+            footer.append(f"joined <t:{int(created)}:D>")
+        last_login = data.get("LastLogin")
+        if isinstance(last_login, (int, float)):
+            footer.append(f"last seen <t:{int(last_login)}:R>")
+        container.add_item(discord.ui.TextDisplay("-# " + "  ·  ".join(footer)))
+
+        self.add_item(container)
 
 class MapView(discord.ui.LayoutView):
     """Components V2 map card: details, creator headshot, and two buttons."""
@@ -675,6 +783,26 @@ async def map_command(ctx, map_id: int):
 
     view = MapView(entry, headshot=headshot, creator_text=creator_text)
     view.message = await ctx.send(view=view)
+
+@bot.hybrid_command(name="profile", description="Show a player's profile")
+@app_commands.describe(username="Roblox username")
+async def profile_command(ctx, username: str):
+    await ctx.defer()
+
+    user_id, canonical = await fetch_user_id(username)
+    if not user_id:
+        await ctx.send(f"No Roblox user named `{username}`.")
+        return
+
+    entry = await fetch_entry(str(user_id), datastore="Main_Data")
+    if not entry:
+        await ctx.send(f"No game data saved for **{canonical}**.")
+        return
+
+    headshot = (await fetch_headshots([user_id])).get(user_id)
+    await ctx.send(view=ProfileView(
+        entry, user_id=user_id, username=canonical, headshot=headshot,
+    ))
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
