@@ -6,7 +6,11 @@ import json
 import base64
 import zstandard as zstd
 import traceback
+import asyncio
 from datetime import datetime, timedelta, timezone
+
+# aiohttp defaults to a 5 minute total timeout, which just hangs the command.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
@@ -35,18 +39,23 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
         f"data-stores/{datastore}/entries/{entry_key}"
     )
     headers = {"x-api-key": API_KEY, "Accept": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                print(f"fetch_entry({datastore}/{entry_key}) -> HTTP {resp.status}")
-                return None
-            data = await resp.json()
-            value = data.get("value")
-            if not value:
-                return None
-            if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
-                return decode_buffer(value["zbase64"])
-            return value
+    try:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    print(f"fetch_entry({datastore}/{entry_key}) -> HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        print(f"fetch_entry({datastore}/{entry_key}) -> {type(e).__name__}: {e}")
+        return None
+
+    value = data.get("value")
+    if not value:
+        return None
+    if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
+        return decode_buffer(value["zbase64"])
+    return value
 
 def compute_maps(submissions, todays_map):
     accepted = [
@@ -109,13 +118,17 @@ def get_medal_emoji(pos):
 
 async def fetch_username(user_id):
     url = f"https://users.roblox.com/v1/users/{user_id}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                print(f"fetch_username({user_id}) -> HTTP {resp.status}")
-                return None
-            data = await resp.json()
-            return data.get("name")
+    try:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    print(f"fetch_username({user_id}) -> HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+                return data.get("name")
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        print(f"fetch_username({user_id}) -> {type(e).__name__}: {e}")
+        return None
 
 async def get_lb_entry(leaderboard, pos):
     entry = leaderboard[pos]
