@@ -30,6 +30,7 @@ MAX_ATTEMPTS = 3
 LEADERBOARD_COLOR = discord.Color.purple()
 MAP_COLOR = discord.Color.blurple()
 MAX_LEADERBOARD_ROWS = 10
+HEADSHOT_SIZE = "150x150"
 
 # The Community Maps "Ids" entry holds ~85k records, so it is fetched once and
 # indexed rather than downloaded and decompressed on every lookup.
@@ -211,6 +212,26 @@ def resolve_medal(entry, pos):
     """
     return get_medal_emoji(pos)
 
+async def fetch_headshots(user_ids):
+    """Roblox avatar headshot URLs, keyed by user ID. One batched request."""
+    ids = [str(u) for u in user_ids if u is not None]
+    if not ids:
+        return {}
+
+    url = (
+        "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+        f"?userIds={','.join(ids)}&size={HEADSHOT_SIZE}&format=Png&isCircular=true"
+    )
+    data = await request_json(url, label="fetch_headshots")
+    if not data:
+        return {}
+
+    headshots = {}
+    for item in data.get("data", []):
+        if item.get("state") == "Completed" and item.get("imageUrl"):
+            headshots[item.get("targetId")] = item["imageUrl"]
+    return headshots
+
 async def collect_leaderboard_rows(leaderboard, limit):
     """Resolve a leaderboard into plain row dicts, ready for either renderer."""
     rows = []
@@ -231,6 +252,7 @@ async def collect_leaderboard_rows(leaderboard, limit):
         value = entry.get("Value")
         rows.append({
             "pos": pos,
+            "user_id": user_id,
             "name": name,
             "country": country,
             "time": format_time(value) if isinstance(value, (int, float)) else "--:--.---",
@@ -428,8 +450,9 @@ async def build_leaderboard_embed(
     subtitle=None,
     limit=MAX_LEADERBOARD_ROWS,
     style="fields",
-    show_medals=True,
+    show_medals=False,
     show_country=True,
+    show_headshot=True,
     color=LEADERBOARD_COLOR,
 ):
     """Render any leaderboard-shaped list into an embed.
@@ -473,6 +496,13 @@ async def build_leaderboard_embed(
         embed.add_field(name=field_name, value=field_value, inline=field_inline)
     if subtitle:
         embed.set_author(name=subtitle)
+
+    # An embed allows exactly one thumbnail, so it goes to the leader.
+    if show_headshot:
+        headshots = await fetch_headshots([rows[0]["user_id"]])
+        leader_headshot = headshots.get(rows[0]["user_id"])
+        if leader_headshot:
+            embed.set_thumbnail(url=leader_headshot)
 
     total = len(leaderboard)
     if total > len(rows):
@@ -553,6 +583,7 @@ async def cup(ctx):
         leaderboard,
         title=f"🏆 Leaderboard — {get_todays_date()}",
         subtitle=f"Daily Cup #{index}",
+        show_medals=True,
     )
     if lb_embed is None:
         await ctx.send("The leaderboard came back empty.")
