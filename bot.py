@@ -206,17 +206,6 @@ def dig(data, *keys, default=None):
             return default
     return data
 
-def format_duration(total_seconds):
-    total = int(total_seconds or 0)
-    days, rest = divmod(total, 86400)
-    hours, rest = divmod(rest, 3600)
-    minutes = rest // 60
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
-
 def format_number(value):
     """Trim the .0 off whole floats so 21167.5 and 8 both read naturally."""
     if isinstance(value, float) and value.is_integer():
@@ -477,7 +466,7 @@ class ProfileView(discord.ui.LayoutView):
             f"🏁  **{format_number(stats.get('FlagsReached') or 0)}** flags reached",
             f"⚔️  **{format_number(stats.get('Kills') or 0)}** kills"
             f"  ·  ☠️  **{format_number(stats.get('Deaths') or 0)}** deaths",
-            f"⏱️  **{format_duration(stats.get('TimePlayed'))}** played",
+            f"🏔️  furthest round **{format_number(stats.get('FurthestRound') or 0)}**",
             f"🔥  **{streak}** day streak  ·  best **{best_streak}**",
         ]
         rank = dig(data, "Partypass", "rank")
