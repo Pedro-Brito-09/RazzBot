@@ -286,11 +286,18 @@ def compute_maps(submissions, todays_map):
         next_map = {"Id": ids[0]}
     return current_map, next_map
 
-def get_todays_date():
-    now = datetime.now(timezone.utc)
-    shifted = now - timedelta(hours=9)
+def cup_day_today():
+    """The cup's current day. Its rollover is 9 hours behind UTC."""
+    return (datetime.now(timezone.utc) - timedelta(hours=9)).date()
 
-    return shifted.strftime("%d/%m/%Y")
+def get_todays_date():
+    return cup_day_today().strftime("%d/%m/%Y")
+
+def parse_cup_date(text):
+    try:
+        return datetime.strptime(text.strip(), "%d/%m/%Y").date()
+    except (ValueError, AttributeError):
+        return None
 
 def format_time(time_value):
     minutes = (time_value / 60) % 60
@@ -1014,17 +1021,64 @@ async def on_command_error(ctx, error):
     else:
         await ctx.send(message)
 
+async def send_cup_leaderboard(ctx, index, date_text):
+    """Post one cup's leaderboard, or explain why it isn't there."""
+    leaderboard = await fetch_entry(f"DailyCup_{index}", datastore="Leaderboards")
+    if not leaderboard:
+        await ctx.send(f"No leaderboard found for `DailyCup_{index}` ({date_text}).")
+        return
+
+    embed = await build_leaderboard_embed(
+        leaderboard,
+        title=f"🏆 Leaderboard — {date_text}",
+        subtitle=f"Daily Cup #{index}",
+        show_medals=True,
+    )
+    if embed is None:
+        await ctx.send("The leaderboard came back empty.")
+        return
+
+    await ctx.send(embed=embed)
+
 @bot.hybrid_command(description="Show the current and next daily cup map, plus today's leaderboard")
-async def cup(ctx):
+@app_commands.describe(date="Cup date as DD/MM/YYYY. Defaults to today.")
+async def cup(ctx, date: str = None):
     # The Roblox lookups take longer than the 3s interaction deadline.
     await ctx.defer()
+
+    todays_map = await fetch_entry("TodaysMap") or {}
+    current_index = todays_map.get("Index")
+
+    if date is not None:
+        target = parse_cup_date(date)
+        if target is None:
+            await ctx.send("Date must look like `DD/MM/YYYY` — e.g. `10/08/2026`.")
+            return
+        if not isinstance(current_index, int):
+            await ctx.send("Can't reach past cups: TodaysMap has no index.")
+            return
+
+        # The index advances by one per cup day, so counting days back from
+        # today's index lands on that day's cup.
+        days_back = (cup_day_today() - target).days
+        if days_back < 0:
+            await ctx.send(f"`{target:%d/%m/%Y}` is in the future.")
+            return
+
+        index = current_index - days_back
+        if index < 0:
+            await ctx.send(
+                f"No cup on `{target:%d/%m/%Y}` — that's before the first one."
+            )
+            return
+
+        await send_cup_leaderboard(ctx, index, f"{target:%d/%m/%Y}")
+        return
 
     submissions = await fetch_entry("Submissions")
     if not submissions:
         await ctx.send("Failed to fetch submissions from Roblox cloud.")
         return
-
-    todays_map = await fetch_entry("TodaysMap") or {}
 
     current_map, next_map = compute_maps(submissions, todays_map)
     if not current_map or not next_map:
@@ -1036,27 +1090,11 @@ async def cup(ctx):
         f"Next map ID: {next_map['Id']}"
     )
 
-    index = todays_map.get("Index")
-    if index is None:
+    if current_index is None:
         await ctx.send("No daily cup index set, so there's no leaderboard to show.")
         return
 
-    leaderboard = await fetch_entry(f"DailyCup_{index}", datastore="Leaderboards")
-    if not leaderboard:
-        await ctx.send(f"No leaderboard found for `DailyCup_{index}`.")
-        return
-
-    title = f"🏆 Leaderboard — {get_todays_date()}"
-    subtitle = f"Daily Cup #{index}"
-
-    lb_embed = await build_leaderboard_embed(
-        leaderboard, title=title, subtitle=subtitle, show_medals=True,
-    )
-    if lb_embed is None:
-        await ctx.send("The leaderboard came back empty.")
-        return
-
-    await ctx.send(embed=lb_embed)
+    await send_cup_leaderboard(ctx, current_index, get_todays_date())
 
 @bot.hybrid_command(name="maps", description="Show a player's public community maps")
 @app_commands.describe(username="Roblox username")
