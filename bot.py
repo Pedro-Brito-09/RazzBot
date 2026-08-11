@@ -381,6 +381,12 @@ async def build_map_embed(entry, *, color=MAP_COLOR):
         color=color,
     )
 
+    if creator_id:
+        headshots = await fetch_headshots([creator_id])
+        creator_headshot = headshots.get(creator_id)
+        if creator_headshot:
+            embed.set_thumbnail(url=creator_headshot)
+
     footer = f"ID {entry.get('Id')}"
     privacy = entry.get("Privacy")
     if privacy:
