@@ -10,10 +10,15 @@ from datetime import datetime, timedelta, timezone
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
+# Optional: syncing to one guild makes slash commands appear instantly.
+# A global sync (no GUILD_ID) can take up to an hour to propagate.
+GUILD_ID = os.getenv("GUILD_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+_synced = False
 
 def decode_buffer(value):
     compressed = base64.b64decode(value)
@@ -135,7 +140,26 @@ async def get_lb_entry(leaderboard, pos):
 
 @bot.event
 async def on_ready():
+    global _synced
     print(f"Logged in as {bot.user}")
+
+    # on_ready fires again on every reconnect; only sync once per process.
+    if _synced:
+        return
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} slash command(s) globally "
+                  f"(may take up to an hour to show up)")
+        _synced = True
+    except Exception:
+        print("Slash command sync failed:")
+        traceback.print_exc()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -143,10 +167,18 @@ async def on_command_error(ctx, error):
         return
     original = getattr(error, "original", error)
     traceback.print_exception(type(original), original, original.__traceback__)
-    await ctx.send(f"Something broke running that command: `{type(original).__name__}: {original}`")
+    message = f"Something broke running that command: `{type(original).__name__}: {original}`"
+    # A deferred interaction has to be answered with a followup.
+    if ctx.interaction is not None and ctx.interaction.response.is_done():
+        await ctx.followup.send(message)
+    else:
+        await ctx.send(message)
 
-@bot.command()
+@bot.hybrid_command(description="Show the current and next daily cup map, plus today's leaderboard")
 async def maps(ctx):
+    # The Roblox lookups take longer than the 3s interaction deadline.
+    await ctx.defer()
+
     submissions = await fetch_entry("Submissions")
     if not submissions:
         await ctx.send("Failed to fetch submissions from Roblox cloud.")
@@ -191,7 +223,7 @@ async def maps(ctx):
     )
     await ctx.send(embed=lb_embed)
 
-@bot.command()
+@bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
     await ctx.send("hello fuckers")
 
