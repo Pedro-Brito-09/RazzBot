@@ -513,12 +513,34 @@ class ProfileView(discord.ui.LayoutView):
         if subtitle:
             heading += f"\n-# {subtitle}"
 
-        container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-        # The heading stays a plain text display: a Section takes the height
-        # of its thumbnail, which would push the buttons below the image.
-        container.add_item(discord.ui.TextDisplay(heading))
+        stars = format_number(data.get("Stars") or 0)
+        all_time = format_number(dig(data, "Stats", "AllTimeStars", default=0))
+        currency = f"⭐  **{stars}** Stars\n-# {all_time} earned all time"
 
-        # Buttons sit directly under the equipped tag/skin line.
+        # Medals are stored as lists of map IDs, so the count is the length.
+        medal_counts = [
+            (get_medal_emoji(i), len(dig(data, "Medals", tier, default=[]) or []))
+            for i, tier in enumerate(("Diamond", "Gold", "Silver", "Bronze"))
+        ]
+        medals = "  ·  ".join(f"{emoji} **{count}**" for emoji, count in medal_counts)
+
+        container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+        # A Section takes the height of its thumbnail, so the heading block
+        # carries enough text to fill it -- otherwise the leftover space shows
+        # as a gap above the buttons. Three text displays is the maximum.
+        if headshot:
+            container.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(heading),
+                discord.ui.TextDisplay(currency),
+                discord.ui.TextDisplay(medals),
+                accessory=discord.ui.Thumbnail(media=headshot),
+            ))
+        else:
+            container.add_item(discord.ui.TextDisplay(
+                f"{heading}\n\n{currency}\n\n{medals}"
+            ))
+
+        # Buttons sit directly under the block above.
         row = discord.ui.ActionRow()
         maps_button = discord.ui.Button(
             label="Created maps",
@@ -538,30 +560,6 @@ class ProfileView(discord.ui.LayoutView):
         container.add_item(row)
 
         container.add_item(discord.ui.Separator())
-
-        stars = format_number(data.get("Stars") or 0)
-        all_time = format_number(dig(data, "Stats", "AllTimeStars", default=0))
-        currency = f"⭐  **{stars}** Stars\n-# {all_time} earned all time"
-
-        # Medals are stored as lists of map IDs, so the count is the length.
-        medal_counts = [
-            (get_medal_emoji(i), len(dig(data, "Medals", tier, default=[]) or []))
-            for i, tier in enumerate(("Diamond", "Gold", "Silver", "Bronze"))
-        ]
-        medals = "  ·  ".join(f"{emoji} **{count}**" for emoji, count in medal_counts)
-        # The headshot rides here instead, where the block is tall enough to
-        # sit alongside it without leaving a gap.
-        if headshot:
-            container.add_item(discord.ui.Section(
-                discord.ui.TextDisplay(f"{currency}\n\n{medals}"),
-                accessory=discord.ui.Thumbnail(media=headshot),
-            ))
-        else:
-            container.add_item(discord.ui.TextDisplay(f"{currency}\n\n{medals}"))
-
-        container.add_item(discord.ui.Separator(
-            visible=False, spacing=discord.SeparatorSpacing.small
-        ))
 
         stats = data.get("Stats") if isinstance(data.get("Stats"), dict) else {}
         streak = data.get("LoginStreak") or 0
