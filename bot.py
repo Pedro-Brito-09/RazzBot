@@ -470,20 +470,22 @@ class MapView(discord.ui.LayoutView):
         key = MAP_LEADERBOARD_KEY.format(id=map_id)
         leaderboard = await fetch_entry(key, datastore="Leaderboards")
 
-        layout = None
+        embed = None
         if isinstance(leaderboard, list):
-            layout = await build_leaderboard_layout(
+            embed = await build_leaderboard_embed(
                 leaderboard,
                 title=f"🏆 {self.entry.get('Name') or 'Unnamed Map'}",
                 subtitle=f"Map #{map_id}",
             )
-        if layout is None:
+        if embed is None:
             await interaction.followup.send(
                 f"No leaderboard found for `{key}`.", ephemeral=True
             )
             return
 
-        await interaction.followup.send(view=layout)
+        # A separate message, so an embed is fine even though the map card
+        # it came from is Components V2.
+        await interaction.followup.send(embed=embed)
 
     async def on_timeout(self):
         for item in self.children:
@@ -495,55 +497,6 @@ class MapView(discord.ui.LayoutView):
             except discord.HTTPException:
                 pass
 
-async def build_leaderboard_layout(
-    leaderboard,
-    *,
-    title,
-    subtitle=None,
-    limit=MAX_LEADERBOARD_ROWS,
-    show_medals=False,
-    show_country=True,
-    color=LEADERBOARD_COLOR,
-):
-    """Components V2 version of the leaderboard.
-
-    V2 has no column primitive -- the component set is section, text display,
-    thumbnail, gallery, file, separator and container -- so the columns come
-    from a monospace code block, the one thing Discord aligns. Custom emoji
-    cannot render there, hence the Unicode medals.
-
-    Returns a LayoutView, or None when there is nothing to render. A V2
-    message cannot also carry content or embeds, so this is sent on its own.
-    """
-    if not leaderboard:
-        return None
-
-    rows = await collect_leaderboard_rows(leaderboard, limit)
-    if not rows:
-        return None
-
-    view = discord.ui.LayoutView(timeout=None)
-    container = discord.ui.Container(accent_colour=color)
-
-    heading = f"## {title}"
-    if subtitle:
-        heading += f"\n-# {subtitle}"
-    container.add_item(discord.ui.TextDisplay(heading))
-    container.add_item(discord.ui.TextDisplay(
-        render_leaderboard_table(rows, show_country=show_country,
-                                 show_medals=show_medals)
-    ))
-
-    total = len(leaderboard)
-    if total > len(rows):
-        footer = f"Top {len(rows)} of {total}"
-    else:
-        footer = f"{total} {'entry' if total == 1 else 'entries'}"
-    container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
-
-    view.add_item(container)
-    return view
-
 async def build_leaderboard_embed(
     leaderboard,
     *,
@@ -553,7 +506,7 @@ async def build_leaderboard_embed(
     style="fields",
     show_medals=False,
     show_country=True,
-    show_headshot=True,
+    show_headshot=False,
     color=LEADERBOARD_COLOR,
 ):
     """Render any leaderboard-shaped list into an embed.
@@ -649,8 +602,7 @@ async def on_command_error(ctx, error):
         await ctx.send(message)
 
 @bot.hybrid_command(description="Show the current and next daily cup map, plus today's leaderboard")
-@app_commands.describe(v2="Render the leaderboard with the new Components V2 layout")
-async def cup(ctx, v2: bool = False):
+async def cup(ctx):
     # The Roblox lookups take longer than the 3s interaction deadline.
     await ctx.defer()
 
@@ -683,16 +635,6 @@ async def cup(ctx, v2: bool = False):
 
     title = f"🏆 Leaderboard — {get_todays_date()}"
     subtitle = f"Daily Cup #{index}"
-
-    if v2:
-        layout = await build_leaderboard_layout(
-            leaderboard, title=title, subtitle=subtitle, show_medals=True,
-        )
-        if layout is None:
-            await ctx.send("The leaderboard came back empty.")
-            return
-        await ctx.send(view=layout)
-        return
 
     lb_embed = await build_leaderboard_embed(
         leaderboard, title=title, subtitle=subtitle, show_medals=True,
