@@ -531,14 +531,11 @@ class ProfileView(discord.ui.LayoutView):
         if headshot:
             container.add_item(discord.ui.Section(
                 discord.ui.TextDisplay(heading),
-                discord.ui.TextDisplay(currency),
                 discord.ui.TextDisplay(medals),
                 accessory=discord.ui.Thumbnail(media=headshot),
             ))
         else:
-            container.add_item(discord.ui.TextDisplay(
-                f"{heading}\n\n{currency}\n\n{medals}"
-            ))
+            container.add_item(discord.ui.TextDisplay(f"{heading}\n\n{medals}"))
 
         # Buttons sit directly under the block above.
         row = discord.ui.ActionRow()
@@ -560,6 +557,12 @@ class ProfileView(discord.ui.LayoutView):
         container.add_item(row)
 
         container.add_item(discord.ui.Separator())
+
+        container.add_item(discord.ui.TextDisplay(currency))
+
+        container.add_item(discord.ui.Separator(
+            visible=False, spacing=discord.SeparatorSpacing.small
+        ))
 
         stats = data.get("Stats") if isinstance(data.get("Stats"), dict) else {}
         streak = data.get("LoginStreak") or 0
