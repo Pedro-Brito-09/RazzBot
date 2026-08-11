@@ -27,7 +27,8 @@ USER_AGENT = (
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10, sock_read=30)
 MAX_ATTEMPTS = 3
 
-LEADERBOARD_COLOR = discord.Color.purple()
+# Twemoji's trophy gold, so the bar matches the 🏆 in the title.
+LEADERBOARD_COLOR = discord.Color(0xFFCC4D)
 MAP_COLOR = discord.Color.blurple()
 MAX_LEADERBOARD_ROWS = 10
 HEADSHOT_SIZE = "150x150"
