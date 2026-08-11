@@ -457,9 +457,14 @@ async def build_leaderboard_layout(
     limit=MAX_LEADERBOARD_ROWS,
     show_medals=False,
     show_country=True,
+    compact=True,
     color=LEADERBOARD_COLOR,
 ):
     """Components V2 version: one section per player, each with a headshot.
+
+    compact puts each row on a single line with the time as subtext, which
+    keeps sections short. Discord fixes the thumbnail size itself -- there is
+    no size parameter -- but shorter sections may render a smaller one.
 
     Returns a LayoutView, or None when there is nothing to render. A V2
     message cannot also carry content or embeds, so this is sent on its own.
@@ -492,7 +497,10 @@ async def build_leaderboard_layout(
 
         medal = r["medal"] if show_medals else ""
         time_text = f"{medal} `{r['time']}`" if medal else f"`{r['time']}`"
-        text = f"{' '.join(parts)}\n{time_text}"
+        if compact:
+            text = f"-# {' '.join(parts)}  ·  {time_text}"
+        else:
+            text = f"{' '.join(parts)}\n{time_text}"
 
         # A Section requires an accessory, so rows without a headshot fall
         # back to plain text rather than an empty thumbnail slot.
