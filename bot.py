@@ -417,9 +417,6 @@ def format_ban_notice(restriction):
             except ValueError:
                 pass
 
-    reason = restriction.get("displayReason") or restriction.get("privateReason")
-    if reason:
-        line += f"\n-# {reason}"
     return line
 
 def format_ban_duration(seconds):
