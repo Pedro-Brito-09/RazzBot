@@ -10,6 +10,7 @@ import traceback
 import asyncio
 import io
 import socket
+import re
 import secrets
 import string
 import time
@@ -35,6 +36,10 @@ MAP_COLOR = discord.Color.blurple()
 DAILY_CUP_COLOR = discord.Color(0xF1C40F)
 PROFILE_COLOR = discord.Color(0x9B59B6)
 MAX_LEADERBOARD_ROWS = 10
+# Admin commands are prefix-only and answer to this account alone, so they
+# never appear in anyone's slash command list.
+ADMIN_USER_ID = 541010558653169667
+
 GLOBAL_LEADERBOARDS = {
     "wins": ("Wins", "Wins"),
     "medals": ("Medals", "Medals"),
@@ -146,18 +151,19 @@ async def get_session():
         )
     return _session
 
-async def request_json(url, headers=None, label="", json_body=None):
+async def request_json(url, headers=None, label="", json_body=None, method=None):
     """Fetch JSON with retries. POSTs when json_body is given, else GETs.
 
-    Returns None on any failure, never raises.
+    Pass method to override ("PATCH", "DELETE", ...). Returns None on any
+    failure, never raises.
     """
+    if method is None:
+        method = "POST" if json_body is not None else "GET"
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             session = await get_session()
-            if json_body is not None:
-                request = session.post(url, headers=headers, json=json_body)
-            else:
-                request = session.get(url, headers=headers)
+            request = session.request(method, url, headers=headers, json=json_body)
             async with request as resp:
                 if resp.status != 200:
                     body = (await resp.text())[:200]
@@ -206,6 +212,151 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
     if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
         return decode_buffer(value["zbase64"])
     return value
+
+def user_restriction_url(user_id):
+    return (
+        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}"
+        f"/user-restrictions/{quote(str(user_id), safe='')}"
+    )
+
+async def fetch_user_restriction(user_id):
+    """The player's current game-join restriction, or None."""
+    data = await request_json(
+        user_restriction_url(user_id),
+        headers={"x-api-key": API_KEY, "Accept": "application/json"},
+        label=f"fetch_user_restriction({user_id})",
+    )
+    if not isinstance(data, dict):
+        return None
+    restriction = data.get("gameJoinRestriction")
+    return restriction if isinstance(restriction, dict) else None
+
+async def set_user_restriction(user_id, *, active, duration_seconds=None,
+                               display_reason="", private_reason=""):
+    """Ban or unban. Omitting the duration makes a ban permanent."""
+    restriction = {"active": bool(active)}
+    if active:
+        if duration_seconds is not None:
+            restriction["duration"] = f"{int(duration_seconds)}s"
+        if display_reason:
+            restriction["displayReason"] = display_reason[:400]
+        if private_reason:
+            restriction["privateReason"] = private_reason[:400]
+
+    data = await request_json(
+        user_restriction_url(user_id) + "?updateMask=gameJoinRestriction",
+        headers={
+            "x-api-key": API_KEY,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        label=f"set_user_restriction({user_id}, active={active})",
+        json_body={"gameJoinRestriction": restriction},
+        method="PATCH",
+    )
+    return data is not None
+
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+def parse_ban_duration(text):
+    """'7d' / '12h30m' / 'perm' -> seconds, or None for permanent.
+
+    Returns ("permanent", None), ("seconds", n) or ("invalid", None).
+    """
+    if text is None:
+        return "permanent", None
+    cleaned = text.strip().lower()
+    if cleaned in ("perm", "permanent", "forever", "inf", "0"):
+        return "permanent", None
+
+    matches = re.findall(r"(\d+)\s*([smhdw])", cleaned)
+    if not matches or re.sub(r"\d+\s*[smhdw]\s*", "", cleaned):
+        return "invalid", None
+
+    total = sum(int(amount) * DURATION_UNITS[unit] for amount, unit in matches)
+    return ("seconds", total) if total > 0 else ("invalid", None)
+
+def format_ban_notice(restriction):
+    """One line describing an active ban, or None when the player is clear."""
+    if not isinstance(restriction, dict) or not restriction.get("active"):
+        return None
+
+    duration = restriction.get("duration")
+    seconds = None
+    if isinstance(duration, str) and duration.endswith("s"):
+        try:
+            seconds = int(float(duration[:-1]))
+        except ValueError:
+            seconds = None
+
+    if seconds is None:
+        line = "🔨 **Banned** · permanent"
+    else:
+        line = f"🔨 **Banned** · {format_ban_duration(seconds)}"
+        # startTime plus duration gives the moment it lifts.
+        start = restriction.get("startTime")
+        if isinstance(start, str):
+            try:
+                began = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                ends = began + timedelta(seconds=seconds)
+                line += f", ends <t:{int(ends.timestamp())}:R>"
+            except ValueError:
+                pass
+
+    reason = restriction.get("displayReason") or restriction.get("privateReason")
+    if reason:
+        line += f"\n-# {reason}"
+    return line
+
+def format_ban_duration(seconds):
+    seconds = int(seconds)
+    for unit, label, size in (
+        ("w", "week", 604800), ("d", "day", 86400),
+        ("h", "hour", 3600), ("m", "minute", 60),
+    ):
+        if seconds >= size and seconds % size == 0:
+            count = seconds // size
+            return f"{count} {label}{'s' if count != 1 else ''}"
+    return f"{seconds} seconds"
+
+def ordered_entry_url(entry_key, datastore, scope):
+    return (
+        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
+        f"ordered-data-stores/{quote(datastore, safe='')}/"
+        f"scopes/{quote(scope, safe='')}/"
+        f"entries/{quote(str(entry_key), safe='')}"
+    )
+
+async def delete_ordered_entry(entry_key, datastore="Data", scope="Wins"):
+    """Drop one entry from an ordered datastore. True when it's gone."""
+    url = ordered_entry_url(entry_key, datastore, scope)
+    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    session = await get_session()
+    try:
+        async with session.delete(url, headers=headers) as resp:
+            # 404 means it wasn't there, which is the state we wanted anyway.
+            if resp.status in (200, 204, 404):
+                return True
+            body = (await resp.text())[:200]
+            print(f"delete_ordered_entry({datastore}/{scope}/{entry_key}) "
+                  f"-> HTTP {resp.status}: {body}")
+            return False
+    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+        print(f"delete_ordered_entry({datastore}/{scope}/{entry_key}) failed: "
+              f"{type(error).__name__}: {error}")
+        return False
+
+async def purge_player_from_leaderboards(user_id):
+    """Remove a player from the global ordered leaderboards.
+
+    Returns the names of the boards they were removed from. The Daily Cup
+    board is a list inside a regular entry and is handled separately.
+    """
+    removed = []
+    for scope in ("Wins", "Medals"):
+        if await delete_ordered_entry(str(user_id), datastore="Data", scope=scope):
+            removed.append(scope)
+    return removed
 
 def data_store_entry_url(entry_key, datastore):
     return (
@@ -928,7 +1079,7 @@ class ProfileView(discord.ui.LayoutView):
     """Components V2 profile card built from a Main_Data entry."""
 
     def __init__(self, entry, *, user_id, username, headshot=None, wins=None,
-                 timeout=MAP_VIEW_TIMEOUT):
+                 restriction=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
         self.user_id = user_id
         self.username = username
@@ -961,18 +1112,28 @@ class ProfileView(discord.ui.LayoutView):
         ]
         medals = "  ·  ".join(f"{emoji} **{count}**" for emoji, count in medal_counts)
 
+        ban_notice = format_ban_notice(restriction)
+
         container = discord.ui.Container(accent_colour=PROFILE_COLOR)
         # A Section takes the height of its thumbnail, so the heading block
         # carries enough text to fill it -- otherwise the leftover space shows
         # as a gap above the buttons. Three text displays is the maximum.
         if headshot:
+            children = [discord.ui.TextDisplay(heading)]
+            # A Section allows three text displays, so the ban notice takes
+            # the medals' slot and the medals move below it.
+            if ban_notice:
+                children.append(discord.ui.TextDisplay(ban_notice))
+            children.append(discord.ui.TextDisplay(medals))
             container.add_item(discord.ui.Section(
-                discord.ui.TextDisplay(heading),
-                discord.ui.TextDisplay(medals),
-                accessory=discord.ui.Thumbnail(media=headshot),
+                *children, accessory=discord.ui.Thumbnail(media=headshot)
             ))
         else:
-            container.add_item(discord.ui.TextDisplay(f"{heading}\n\n{medals}"))
+            blocks = [heading]
+            if ban_notice:
+                blocks.append(ban_notice)
+            blocks.append(medals)
+            container.add_item(discord.ui.TextDisplay("\n\n".join(blocks)))
 
         # Buttons sit directly under the block above.
         row = discord.ui.ActionRow()
@@ -1185,11 +1346,15 @@ async def build_profile_view(user_id, username):
     if not entry:
         return None
 
-    headshot = (await fetch_headshots([user_id])).get(user_id)
-    wins = await fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins")
+    headshot_map, wins, restriction = await asyncio.gather(
+        fetch_headshots([user_id]),
+        fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins"),
+        fetch_user_restriction(user_id),
+    )
+    headshot = headshot_map.get(user_id)
     return ProfileView(
         entry, user_id=user_id, username=username,
-        headshot=headshot, wins=wins,
+        headshot=headshot, wins=wins, restriction=restriction,
     )
 
 class MapView(discord.ui.LayoutView):
@@ -2062,6 +2227,85 @@ async def profile_command(ctx, username: str = None):
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
     await ctx.send("hello fuckers")
+
+def is_admin():
+    """Prefix-command gate. Stays silent for everyone else."""
+    async def predicate(ctx):
+        return ctx.author.id == ADMIN_USER_ID
+    return commands.check(predicate)
+
+async def resolve_admin_target(ctx, player):
+    """Username or ID -> (user_id, name). Reports and returns None on miss."""
+    cleaned = player.strip()
+    if cleaned.isdigit():
+        user_id = int(cleaned)
+        return user_id, (await fetch_username(user_id)) or str(user_id)
+
+    user_id, canonical = await fetch_user_id(cleaned)
+    if user_id is None:
+        await ctx.send(f"No Roblox user named `{cleaned}`.")
+        return None, None
+    return user_id, canonical
+
+@bot.command(name="ban", hidden=True)
+@is_admin()
+async def admin_ban(ctx, player: str, duration: str = "perm", *, reason: str = ""):
+    """!ban <player> [duration] [reason] -- duration like 7d, 12h, or perm."""
+    async with ctx.typing():
+        user_id, name = await resolve_admin_target(ctx, player)
+        if user_id is None:
+            return
+
+        kind, seconds = parse_ban_duration(duration)
+        if kind == "invalid":
+            await ctx.send(
+                f"Couldn't read `{duration}` as a duration. Use `7d`, `12h`, "
+                f"`30m`, or `perm`."
+            )
+            return
+
+        permanent = kind == "permanent"
+        display_reason = reason or "Banned by an administrator."
+        ok = await set_user_restriction(
+            user_id,
+            active=True,
+            duration_seconds=None if permanent else seconds,
+            display_reason=display_reason,
+            private_reason=f"{display_reason} (by {ctx.author} / {ctx.author.id})",
+        )
+        if not ok:
+            await ctx.send(
+                f"Failed to ban **{name}**. Check the logs — the API key may be "
+                f"missing `universe.user-restriction:write`."
+            )
+            return
+
+        length = "permanently" if permanent else f"for {format_ban_duration(seconds)}"
+        lines = [f"🔨 Banned **{name}** (`{user_id}`) {length}."]
+        if reason:
+            lines.append(f"-# {reason}")
+
+        if permanent:
+            removed = await purge_player_from_leaderboards(user_id)
+            lines.append(
+                "-# Removed from: " + (", ".join(removed) if removed else "nothing")
+            )
+
+        await ctx.send("\n".join(lines))
+
+@bot.command(name="unban", hidden=True)
+@is_admin()
+async def admin_unban(ctx, player: str):
+    """!unban <player>"""
+    async with ctx.typing():
+        user_id, name = await resolve_admin_target(ctx, player)
+        if user_id is None:
+            return
+
+        if await set_user_restriction(user_id, active=False):
+            await ctx.send(f"✅ Unbanned **{name}** (`{user_id}`).")
+        else:
+            await ctx.send(f"Failed to unban **{name}**. Check the logs.")
 
 @bot.command(name="testcup", hidden=True)
 @commands.is_owner()
