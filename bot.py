@@ -377,6 +377,48 @@ def get_medal_emoji(pos):
     else:
         return ""
 
+def get_cup_medal_emoji(rank, total):
+    """Match the game's 1-based GetMedal(Rank, Total) calculation."""
+    if total <= 0:
+        return ""
+
+    diamond_slots = 1
+    gold_slots = 1
+    silver_slots = 1
+    bronze_slots = 1
+
+    remaining = total - (
+        diamond_slots + gold_slots + silver_slots + bronze_slots
+    )
+    if remaining > 0:
+        extra_diamond = (total * 5 // 100) - diamond_slots
+        extra_gold = (total * 25 // 100) - gold_slots
+        extra_silver = (total * 50 // 100) - silver_slots
+        extra_bronze = (total * 90 // 100) - bronze_slots
+
+        diamond_slots = max(diamond_slots, extra_diamond)
+        gold_slots = max(gold_slots, extra_gold)
+        silver_slots = max(silver_slots, extra_silver)
+        bronze_slots = max(bronze_slots, extra_bronze)
+
+    cumulative = diamond_slots
+    if rank <= cumulative:
+        return get_medal_emoji(0)
+
+    cumulative += gold_slots
+    if rank <= cumulative:
+        return get_medal_emoji(1)
+
+    cumulative += silver_slots
+    if rank <= cumulative:
+        return get_medal_emoji(2)
+
+    cumulative += bronze_slots
+    if rank <= cumulative:
+        return get_medal_emoji(3)
+
+    return ""
+
 async def fetch_user_id(username):
     """Resolve a Roblox username to (id, canonical_name), or (None, None).
 
@@ -403,13 +445,9 @@ async def fetch_username(user_id):
 def format_position(pos):
     return f"`{f'#{pos + 1}':>3}`"
 
-def resolve_medal(entry, pos):
-    """The medal for a row. Single place to change when the rule changes.
-
-    Currently awarded purely by finishing position; takes the whole entry so
-    a value based rule can be dropped in without touching the renderers.
-    """
-    return get_medal_emoji(pos)
+def resolve_medal(pos, total):
+    """Resolve a cup medal using the full participant count."""
+    return get_cup_medal_emoji(pos + 1, total)
 
 async def fetch_headshots(user_ids):
     """Roblox avatar headshot URLs, keyed by user ID. One batched request."""
@@ -436,6 +474,7 @@ async def collect_leaderboard_rows(
 ):
     """Resolve a leaderboard into plain row dicts, ready for either renderer."""
     rows = []
+    total = len(leaderboard)
     for pos in range(min(len(leaderboard), limit)):
         entry = leaderboard[pos]
         if not isinstance(entry, dict):
@@ -459,7 +498,7 @@ async def collect_leaderboard_rows(
             "name": name,
             "country": country,
             "value": value_formatter(value) if isinstance(value, (int, float)) else "--",
-            "medal": resolve_medal(entry, pos),
+            "medal": resolve_medal(pos, total),
         })
     return rows
 
@@ -1120,6 +1159,7 @@ async def send_cup_leaderboard(ctx, index, date_text):
         title=f"🏆 Leaderboard — {date_text}",
         subtitle=f"Daily Cup #{index}",
         show_medals=True,
+        show_country=True,
     )
     if embed is None:
         await ctx.send("The leaderboard came back empty.")
