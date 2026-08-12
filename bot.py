@@ -314,6 +314,13 @@ def decode_buffer(value):
     except Exception:
         return decoded_bytes
 
+def is_buffer_value(value):
+    """Recognize Roblox's buffer envelope regardless of its type marker."""
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("zbase64"), str)
+    )
+
 async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
     # Datastore names contain spaces ("Daily Cup Submissions"), so encode
     # both segments rather than relying on the client to fix up the URL.
@@ -330,9 +337,7 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
     value = data.get("value")
     if not value:
         return None
-    if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
-        return decode_buffer(value["zbase64"])
-    return value
+    return decode_entry_value(value)
 
 def user_restriction_url(user_id):
     return (
@@ -549,7 +554,7 @@ async def update_entry_resource(
         return "error"
 
 def decode_entry_value(value):
-    if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
+    if is_buffer_value(value):
         return decode_buffer(value["zbase64"])
     return value
 
@@ -559,18 +564,17 @@ def encode_entry_value(original, new_value):
     Community Maps and the leaderboards are stored as zstd-compressed
     buffers, so writing plain JSON back would make them unreadable.
     """
-    if isinstance(original, dict) and original.get("t") == "buffer":
+    if is_buffer_value(original):
         raw = json.dumps(new_value, separators=(",", ":"),
                          ensure_ascii=False).encode("utf-8")
         compressed = zstd.ZstdCompressor().compress(raw)
+        # Keep Roblox's exact discriminator and any non-null metadata. Its
+        # buffer type marker is not consistently the literal string "buffer".
         envelope = {
-            "t": "buffer",
-            "zbase64": base64.b64encode(compressed).decode("ascii"),
+            key: value for key, value in original.items()
+            if key != "zbase64" and value is not None
         }
-        # Open Cloud rejects the whole write when "m" is null, so carry it
-        # over only when the entry actually has one.
-        if original.get("m") is not None:
-            envelope["m"] = original["m"]
+        envelope["zbase64"] = base64.b64encode(compressed).decode("ascii")
         return envelope
     return new_value
 
