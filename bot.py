@@ -3707,7 +3707,13 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
         except (TypeError, ValueError):
             badge_id = None
         badge_name = (badge_names or {}).get(badge_id)
-        condition = f"Own badge **{badge_name or 'Unknown badge'}**"
+        if badge_name and badge_id is not None:
+            link_text = " ".join(str(badge_name).split())
+            link_text = link_text.replace("\\", "\\\\").replace("]", "\\]")
+            badge_url = f"https://www.roblox.com/badges/{badge_id}/Badge"
+            condition = f"Own badge **[{link_text}]({badge_url})**"
+        else:
+            condition = "Own badge **Unknown badge**"
     elif rule.get("type") == "map":
         condition = f"Complete map **#{rule.get('value', '?')}**"
     else:
