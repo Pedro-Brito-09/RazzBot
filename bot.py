@@ -10,6 +10,8 @@ import traceback
 import asyncio
 import io
 import socket
+import secrets
+import string
 import time
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
@@ -80,9 +82,13 @@ MAP_LEADERBOARD_KEY = "{id}"
 MAP_VIEW_TIMEOUT = 900
 # Long names get truncated so the table keeps its columns.
 MAX_NAME_WIDTH = 18
+LINK_CODE_LENGTH = 8
+LINK_CODE_ALPHABET = string.ascii_uppercase + string.digits
+ACCOUNT_LINK_DATASTORE = "AccountLinking"
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
+VERIFICATION_GAME_URL = os.getenv("VERIFICATION_GAME_URL")
 # Optional: also sync a guild-only test copy so changes appear instantly there.
 # Global commands are always synced because user installs only support them.
 GUILD_ID = os.getenv("GUILD_ID")
@@ -100,6 +106,7 @@ bot = commands.Bot(
 
 _synced = False
 _session = None
+_account_link_lock = asyncio.Lock()
 
 async def get_session():
     """One shared session for the process, built lazily on the running loop."""
@@ -183,6 +190,141 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
     if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
         return decode_buffer(value["zbase64"])
     return value
+
+def data_store_entry_url(entry_key, datastore):
+    return (
+        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
+        f"data-stores/{quote(datastore, safe='')}/entries/"
+        f"{quote(str(entry_key), safe='')}"
+    )
+
+async def fetch_entry_resource(entry_key, datastore):
+    """Fetch the full Open Cloud entry, including its concurrency ETag."""
+    url = data_store_entry_url(entry_key, datastore)
+    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    session = await get_session()
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 404:
+                return "missing", None
+            if resp.status != 200:
+                body = (await resp.text())[:200]
+                print(
+                    f"fetch_entry_resource({datastore}/{entry_key}) "
+                    f"-> HTTP {resp.status}: {body}"
+                )
+                return "error", None
+            return "ok", await resp.json(content_type=None)
+    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+        print(
+            f"fetch_entry_resource({datastore}/{entry_key}) failed: "
+            f"{type(error).__name__}: {error}"
+        )
+        return "error", None
+
+async def update_entry_resource(
+    entry_key, datastore, value, *, etag=None, allow_missing=False
+):
+    """Update an existing entry without silently replacing a newer version."""
+    url = data_store_entry_url(entry_key, datastore)
+    if allow_missing:
+        url += "?allowMissing=true"
+    headers = {
+        "x-api-key": API_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {"value": value}
+    if etag:
+        payload["etag"] = etag
+
+    session = await get_session()
+    try:
+        async with session.patch(url, headers=headers, json=payload) as resp:
+            if resp.status in (200, 201):
+                return "ok"
+            if resp.status in (409, 412):
+                return "conflict"
+            body = (await resp.text())[:200]
+            print(
+                f"update_entry_resource({datastore}/{entry_key}) "
+                f"-> HTTP {resp.status}: {body}"
+            )
+            return "error"
+    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+        print(
+            f"update_entry_resource({datastore}/{entry_key}) failed: "
+            f"{type(error).__name__}: {error}"
+        )
+        return "error"
+
+def decode_entry_value(value):
+    if isinstance(value, dict) and value.get("t") == "buffer" and "zbase64" in value:
+        return decode_buffer(value["zbase64"])
+    return value
+
+def find_account_code(codes, account_id):
+    account_id = str(account_id)
+    for code, record in codes.items():
+        if isinstance(record, dict) and str(record.get("AccountId")) == account_id:
+            return code
+    return None
+
+async def create_link_code(account_id, *, previous_code=None):
+    """Atomically-ish add a code using entry ETags; returns (status, code)."""
+    async with _account_link_lock:
+        for _ in range(MAX_ATTEMPTS):
+            fetch_status, resource = await fetch_entry_resource(
+                "Codes", ACCOUNT_LINK_DATASTORE
+            )
+            if fetch_status == "error":
+                return "error", None
+
+            resource = resource or {}
+            codes = decode_entry_value(resource.get("value"))
+            if not isinstance(codes, dict):
+                codes = {}
+
+            active_code = find_account_code(codes, account_id)
+            if previous_code is not None:
+                if previous_code in codes:
+                    return "pending", previous_code
+                if active_code is not None:
+                    return "active", active_code
+            elif active_code is not None:
+                return "active", active_code
+
+            code = "".join(
+                secrets.choice(LINK_CODE_ALPHABET) for _ in range(LINK_CODE_LENGTH)
+            )
+            while code in codes:
+                code = "".join(
+                    secrets.choice(LINK_CODE_ALPHABET)
+                    for _ in range(LINK_CODE_LENGTH)
+                )
+
+            codes[code] = {"AccountId": str(account_id)}
+            result = await update_entry_resource(
+                "Codes", ACCOUNT_LINK_DATASTORE, codes,
+                etag=resource.get("etag"),
+                allow_missing=fetch_status == "missing",
+            )
+            if result == "ok":
+                return "created", code
+            if result != "conflict":
+                return "error", None
+
+        return "error", None
+
+async def fetch_linked_user_id(account_id):
+    linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
+    if not isinstance(linked, dict):
+        return None
+    user_id = linked.get(str(account_id))
+    try:
+        return int(user_id)
+    except (TypeError, ValueError):
+        return None
 
 _owned_badges_cache = {}
 
@@ -473,6 +615,29 @@ async def fetch_username(user_id):
     url = f"https://users.roblox.com/v1/users/{user_id}"
     data = await request_json(url, label=f"fetch_username({user_id})")
     return data.get("name") if data else None
+
+async def resolve_command_user(ctx, username):
+    """Resolve an explicit username or the caller's linked Roblox account."""
+    if username:
+        user_id, canonical = await fetch_user_id(username)
+        if not user_id:
+            await ctx.send(f"No Roblox user named `{username}`.")
+            return None, None
+        return user_id, canonical
+
+    user_id = await fetch_linked_user_id(ctx.author.id)
+    if user_id is None:
+        await ctx.send(
+            "You don't have a linked Roblox account. Use `/link` or provide "
+            "a username."
+        )
+        return None, None
+
+    canonical = await fetch_username(user_id)
+    if canonical is None:
+        await ctx.send("Your linked Roblox account could not be found.")
+        return None, None
+    return user_id, canonical
 
 def format_position(pos):
     return f"`{f'#{pos + 1}':>3}`"
@@ -1210,6 +1375,89 @@ async def send_cup_leaderboard(ctx, index, date_text, *, todays_map=None):
 
     await ctx.send(embed=embed)
 
+class AccountLinkView(discord.ui.View):
+    def __init__(self, account_id, code):
+        super().__init__(timeout=900)
+        self.account_id = account_id
+        self.code = code
+
+        self.add_item(discord.ui.Button(
+            label="Join Verification Game",
+            style=discord.ButtonStyle.link,
+            url=VERIFICATION_GAME_URL,
+            emoji="▶️",
+        ))
+
+    @discord.ui.button(
+        label="Regenerate Code",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔄",
+    )
+    async def regenerate(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if interaction.user.id != self.account_id:
+            await interaction.response.send_message(
+                "Only the user who created this code can regenerate it.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        status, code = await create_link_code(
+            self.account_id, previous_code=self.code
+        )
+        if status == "pending":
+            await interaction.followup.send(
+                "That code is still active. Enter it in the verification game "
+                "before generating another one.",
+                ephemeral=True,
+            )
+            return
+        if status not in ("created", "active") or code is None:
+            await interaction.followup.send(
+                "Couldn't generate a new code. Try again in a moment.",
+                ephemeral=True,
+            )
+            return
+
+        self.code = code
+        await interaction.edit_original_response(
+            content=link_code_message(code), view=self
+        )
+
+def link_code_message(code):
+    return (
+        "## Link your Roblox account\n"
+        "Join the verification game and enter this code:\n\n"
+        f"# `{code}`\n\n"
+        "The code can only be regenerated after the game consumes it."
+    )
+
+@bot.hybrid_command(name="link", description="Link your Discord and Roblox accounts")
+async def link_command(ctx):
+    if not VERIFICATION_GAME_URL:
+        await ctx.send(
+            "The verification game URL has not been configured yet.",
+            ephemeral=ctx.interaction is not None,
+        )
+        return
+
+    if ctx.interaction is not None:
+        await ctx.defer(ephemeral=True)
+    else:
+        await ctx.defer()
+    status, code = await create_link_code(ctx.author.id)
+    if status not in ("created", "active") or code is None:
+        await ctx.send("Couldn't generate a link code. Try again in a moment.")
+        return
+
+    await ctx.send(
+        link_code_message(code),
+        view=AccountLinkView(ctx.author.id, code),
+        ephemeral=ctx.interaction is not None,
+    )
+
 @bot.hybrid_command(description="Show a daily cup leaderboard by date or index")
 @app_commands.describe(
     date="Cup date as DD/MM/YYYY. Defaults to today.",
@@ -1289,13 +1537,12 @@ async def cup(ctx, date: str = None, index: int = None):
     )
 
 @bot.hybrid_command(name="maps", description="Show a player's public community maps")
-@app_commands.describe(username="Roblox username")
-async def maps_command(ctx, username: str):
+@app_commands.describe(username="Roblox username. Uses your linked account if omitted.")
+async def maps_command(ctx, username: str = None):
     await ctx.defer()
 
-    user_id, canonical = await fetch_user_id(username)
-    if not user_id:
-        await ctx.send(f"No Roblox user named `{username}`.")
+    user_id, canonical = await resolve_command_user(ctx, username)
+    if user_id is None:
         return
 
     view = await build_created_maps_view(user_id, canonical)
@@ -1306,13 +1553,12 @@ async def maps_command(ctx, username: str):
     await ctx.send(view=view)
 
 @bot.hybrid_command(name="badges", description="Show which game badges a player has earned")
-@app_commands.describe(username="Roblox username")
-async def badges_command(ctx, username: str):
+@app_commands.describe(username="Roblox username. Uses your linked account if omitted.")
+async def badges_command(ctx, username: str = None):
     await ctx.defer()
 
-    user_id, canonical = await fetch_user_id(username)
-    if not user_id:
-        await ctx.send(f"No Roblox user named `{username}`.")
+    user_id, canonical = await resolve_command_user(ctx, username)
+    if user_id is None:
         return
 
     view = await build_badges_view(user_id, canonical)
@@ -1416,13 +1662,12 @@ async def map_command(ctx, map_id: int):
     view.message = await ctx.send(view=view)
 
 @bot.hybrid_command(name="profile", description="Show a player's profile")
-@app_commands.describe(username="Roblox username")
-async def profile_command(ctx, username: str):
+@app_commands.describe(username="Roblox username. Uses your linked account if omitted.")
+async def profile_command(ctx, username: str = None):
     await ctx.defer()
 
-    user_id, canonical = await fetch_user_id(username)
-    if not user_id:
-        await ctx.send(f"No Roblox user named `{username}`.")
+    user_id, canonical = await resolve_command_user(ctx, username)
+    if user_id is None:
         return
 
     view = await build_profile_view(user_id, canonical)
