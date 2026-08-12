@@ -1702,6 +1702,63 @@ async def build_profile_view(user_id, username, parent=None):
         headshot=headshot, wins=wins, restriction=restriction, parent=parent,
     )
 
+def build_map_container(entry, *, headshot=None, creator_text="Unknown",
+                        accent_colour=MAP_COLOR, banner=None):
+    """The body of a map card, without any action buttons.
+
+    Shared by the normal map card and the delete confirmation, so the two
+    can't drift apart.
+    """
+    map_id = entry.get("Id")
+    name = entry.get("Name") or "Unnamed Map"
+    if entry.get("Featured"):
+        name = f"{name} 🌟"
+
+    plays = entry.get("Plays") or 0
+    favorites = entry.get("Favorites") or 0
+    playstyle = (entry.get("Playstyle") or "Unknown").upper()
+    privacy = entry.get("Privacy")
+
+    heading = f"## {name}\n-# by {creator_text}"
+
+    container = discord.ui.Container(accent_colour=accent_colour)
+    if banner:
+        container.add_item(discord.ui.TextDisplay(banner))
+        container.add_item(discord.ui.Separator())
+
+    # The headshot rides along as a section accessory when we have one.
+    if headshot:
+        container.add_item(discord.ui.Section(
+            discord.ui.TextDisplay(heading),
+            accessory=discord.ui.Thumbnail(media=headshot),
+        ))
+    else:
+        container.add_item(discord.ui.TextDisplay(heading))
+
+    container.add_item(discord.ui.Separator())
+
+    container.add_item(discord.ui.TextDisplay(
+        f"🎮  **{playstyle}**\n"
+        f"▶️  **{plays:,}** plays\n"
+        f"⭐  **{favorites:,}** favourites"
+    ))
+
+    # Invisible separator: breathing room without a second rule.
+    container.add_item(discord.ui.Separator(
+        visible=False, spacing=discord.SeparatorSpacing.small
+    ))
+
+    footer = f"ID {map_id}"
+    if privacy:
+        badge = {"Public": "🌐", "Private": "🔒"}.get(privacy, "")
+        footer += f"  ·  {badge} {privacy}".rstrip()
+    container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+
+    container.add_item(discord.ui.Separator(
+        visible=False, spacing=discord.SeparatorSpacing.small
+    ))
+    return container
+
 class MapView(CardView):
     """Components V2 map card with configurable action buttons."""
 
@@ -1717,49 +1774,10 @@ class MapView(CardView):
         self.creator_name = creator_name
 
         map_id = entry.get("Id")
-        name = entry.get("Name") or "Unnamed Map"
-        if entry.get("Featured"):
-            name = f"{name} 🌟"
-
-        plays = entry.get("Plays") or 0
-        favorites = entry.get("Favorites") or 0
-        playstyle = (entry.get("Playstyle") or "Unknown").upper()
         privacy = entry.get("Privacy")
-
-        heading = f"## {name}\n-# by {creator_text}"
-
-        container = discord.ui.Container(accent_colour=MAP_COLOR)
-        # The headshot rides along as a section accessory when we have one.
-        if headshot:
-            container.add_item(discord.ui.Section(
-                discord.ui.TextDisplay(heading),
-                accessory=discord.ui.Thumbnail(media=headshot),
-            ))
-        else:
-            container.add_item(discord.ui.TextDisplay(heading))
-
-        container.add_item(discord.ui.Separator())
-
-        container.add_item(discord.ui.TextDisplay(
-            f"🎮  **{playstyle}**\n"
-            f"▶️  **{plays:,}** plays\n"
-            f"⭐  **{favorites:,}** favourites"
-        ))
-
-        # Invisible separator: breathing room without a second rule.
-        container.add_item(discord.ui.Separator(
-            visible=False, spacing=discord.SeparatorSpacing.small
-        ))
-
-        footer = f"ID {map_id}"
-        if privacy:
-            badge = {"Public": "🌐", "Private": "🔒"}.get(privacy, "")
-            footer += f"  ·  {badge} {privacy}".rstrip()
-        container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
-
-        container.add_item(discord.ui.Separator(
-            visible=False, spacing=discord.SeparatorSpacing.small
-        ))
+        container = build_map_container(
+            entry, headshot=headshot, creator_text=creator_text
+        )
 
         row = discord.ui.ActionRow()
         has_actions = False
@@ -2807,18 +2825,12 @@ async def admin_unfeature(ctx, map_id: int):
     """Take the featured mark off a community map."""
     await set_map_featured(ctx, map_id, False)
 
-@bot.command(name="deletemap", hidden=True)
-@is_admin()
-async def admin_delete_map(ctx, map_id: int, confirm: str = ""):
-    """Remove a map from the index and delete its entry. Irreversible."""
-    if confirm.strip().lower() != "confirm":
-        await ctx.send(
-            f"This permanently removes map `{map_id}` from the index of "
-            f"~85k maps and deletes its entry. There is no undo.\n"
-            f"Run `!deletemap {map_id} confirm` if you're sure."
-        )
-        return
+async def perform_map_delete(map_id):
+    """Drop a map from the index, then delete its own entry.
 
+    Returns (status, name, key_deleted). The map's entry is only touched
+    once the index write succeeded, so a failure can't half-delete it.
+    """
     state = {"name": None, "found": False}
 
     def transform(entries):
@@ -2831,32 +2843,124 @@ async def admin_delete_map(ctx, map_id: int, confirm: str = ""):
                 return entries[:position] + entries[position + 1:]
         return None
 
-    async with ctx.typing():
-        result = await update_entry_with_retry("Ids", "Community Maps", transform)
+    result = await update_entry_with_retry("Ids", "Community Maps", transform)
+    if not state["found"]:
+        return "missing", None, False
+    if result != "ok":
+        return result, state["name"], False
 
-        if not state["found"]:
+    invalidate_maps_cache()
+    key_deleted = await delete_entry_resource(str(map_id), "Community Maps")
+    return "ok", state["name"], key_deleted
+
+class DeleteMapView(CardView):
+    """The map about to be deleted, with the confirmation on it."""
+
+    def __init__(self, entry, *, headshot=None, creator_text="Unknown",
+                 timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(timeout=timeout)
+        self.entry = entry
+
+        map_id = entry.get("Id")
+        container = build_map_container(
+            entry,
+            headshot=headshot,
+            creator_text=creator_text,
+            accent_colour=discord.Color.red(),
+            banner=("### ⚠️ Delete this map?\n"
+                    "-# Removes it from the index of ~85k maps and deletes its "
+                    "entry. There is no undo."),
+        )
+
+        row = discord.ui.ActionRow()
+        confirm = discord.ui.Button(
+            label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️"
+        )
+        confirm.callback = self.confirm_delete
+        row.add_item(confirm)
+
+        cancel = discord.ui.Button(
+            label="Cancel", style=discord.ButtonStyle.secondary
+        )
+        cancel.callback = self.cancel_delete
+        row.add_item(cancel)
+        container.add_item(row)
+
+        note = dev_universe_note()
+        if note:
+            container.add_item(discord.ui.TextDisplay(note))
+
+        self.add_item(container)
+
+    def finish(self, text, colour):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=colour)
+        container.add_item(discord.ui.TextDisplay(text))
+        note = dev_universe_note()
+        if note:
+            container.add_item(discord.ui.TextDisplay(note))
+        self.add_item(container)
+
+    @keeps_context
+    async def confirm_delete(self, interaction):
+        await interaction.response.defer()
+        map_id = self.entry.get("Id")
+        name = self.entry.get("Name") or "Unnamed Map"
+
+        status, deleted_name, key_deleted = await perform_map_delete(map_id)
+        if status == "missing":
+            self.finish(f"No community map with ID `{map_id}`.",
+                        discord.Color.red())
+        elif status != "ok":
+            self.finish(
+                f"Failed to remove **{name}** (`{map_id}`) from the index "
+                f"({status}). Nothing was deleted — check the logs.",
+                discord.Color.red(),
+            )
+        else:
+            text = (f"🗑️ Deleted **{deleted_name}** (`{map_id}`).\n"
+                    + ("-# Removed from the index and its entry deleted."
+                       if key_deleted else
+                       f"-# ⚠️ Index updated, but deleting key `{map_id}` failed."))
+            self.finish(text, discord.Color.red())
+
+        self.stop()
+        await interaction.edit_original_response(view=self)
+
+    @keeps_context
+    async def cancel_delete(self, interaction):
+        await interaction.response.defer()
+        name = self.entry.get("Name") or "Unnamed Map"
+        self.finish(f"Cancelled. **{name}** was not touched.",
+                    discord.Color.greyple())
+        self.stop()
+        await interaction.edit_original_response(view=self)
+
+@bot.command(name="deletemap", hidden=True)
+@is_admin()
+async def admin_delete_map(ctx, map_id: int):
+    """Remove a map from the index and delete its entry. Irreversible."""
+    async with ctx.typing():
+        maps_by_id = await get_community_maps()
+        if not maps_by_id:
+            await ctx.send("Failed to fetch the community map list.")
+            return
+
+        entry = maps_by_id.get(map_id)
+        if entry is None:
             await ctx.send(f"No community map with ID `{map_id}`.")
             return
-        if result != "ok":
-            await ctx.send(
-                f"Failed to remove `{map_id}` from the index ({result}). "
-                f"Nothing was deleted — check the logs."
-            )
-            return
 
-        invalidate_maps_cache()
-        # Only touch the map's own entry once the index write succeeded.
-        key_deleted = await delete_entry_resource(str(map_id), "Community Maps")
+        creator_id = entry.get("Creator")
+        creator = await fetch_username(creator_id) if creator_id else None
+        creator_text = (f"@{creator}" if creator
+                        else f"User {creator_id}" if creator_id else "Unknown")
+        headshot = None
+        if creator_id:
+            headshot = (await fetch_headshots([creator_id])).get(creator_id)
 
-    lines = [f"🗑️ Removed **{state['name']}** (`{map_id}`) from the map index."]
-    lines.append(
-        "-# Its own entry was deleted." if key_deleted
-        else f"-# ⚠️ The index was updated but deleting key `{map_id}` failed."
-    )
-    note = dev_universe_note()
-    if note:
-        lines.append(note)
-    await ctx.send("\n".join(lines))
+    view = DeleteMapView(entry, headshot=headshot, creator_text=creator_text)
+    view.message = await ctx.send(view=view)
 
 @bot.command(name="testcup", hidden=True)
 @commands.is_owner()
