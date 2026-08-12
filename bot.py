@@ -133,6 +133,11 @@ _session = None
 # Which universe the command currently running should talk to. A ContextVar
 # rather than a global so concurrent invocations can't read each other's.
 _active_universe = contextvars.ContextVar("active_universe", default=None)
+# Who invoked the running command, so its components can refuse everyone else.
+_active_invoker = contextvars.ContextVar("active_invoker", default=None)
+
+def current_invoker():
+    return _active_invoker.get()
 
 def current_universe():
     return _active_universe.get() or UNIVERSE_ID
@@ -146,21 +151,39 @@ def dev_universe_note():
         return None
     return f"-# 🧪 test universe `{current_universe()}` — not the live game"
 
-def keeps_universe(method):
-    """Restore the view's universe for the duration of a component callback.
+def keeps_context(method):
+    """Restore the view's universe and owner around a component callback.
 
     A button runs in its own task long after the command returned, by which
-    point the ContextVar has reset -- so without this, the buttons on a
-    !dev_ card would quietly query the live universe.
+    point the ContextVars have reset -- so without this, the buttons on a
+    !dev_ card would quietly query the live universe, and any card they open
+    would forget who is allowed to press it.
     """
     @functools.wraps(method)
     async def wrapper(self, *args, **kwargs):
-        token = _active_universe.set(getattr(self, "universe", None))
+        universe = _active_universe.set(getattr(self, "universe", None))
+        invoker = _active_invoker.set(getattr(self, "owner_id", None))
         try:
             return await method(self, *args, **kwargs)
         finally:
-            _active_universe.reset(token)
+            _active_universe.reset(universe)
+            _active_invoker.reset(invoker)
     return wrapper
+
+class OwnedView:
+    """Mixin: only the person who ran the command may press the buttons."""
+
+    def bind_owner(self):
+        self.owner_id = current_invoker()
+
+    async def interaction_check(self, interaction):
+        if self.owner_id is None or interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who ran the command can use these buttons.",
+            ephemeral=True,
+        )
+        return False
 _account_link_lock = asyncio.Lock()
 _link_code_expirations = {}
 _link_code_tasks = {}
@@ -1193,13 +1216,14 @@ async def get_community_maps():
     print(f"community maps indexed: {len(by_id)} entries (universe {universe})")
     return by_id
 
-class ProfileView(discord.ui.LayoutView):
+class ProfileView(OwnedView, discord.ui.LayoutView):
     """Components V2 profile card built from a Main_Data entry."""
 
     def __init__(self, entry, *, user_id, username, headshot=None, wins=None,
                  restriction=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
         self.universe = current_universe()
+        self.bind_owner()
         self.user_id = user_id
         self.username = username
         self.message = None
@@ -1318,9 +1342,11 @@ class ProfileView(discord.ui.LayoutView):
 
         self.add_item(container)
 
-    @keeps_universe
+    @keeps_context
     async def show_badges(self, interaction):
-        await interaction.response.defer(thinking=True)
+        # thinking=True would post a new message and
+        # edit_original_response would then edit that, not the card.
+        await interaction.response.defer()
 
         view = await build_badges_view(self.user_id, self.username)
         if view is None:
@@ -1329,11 +1355,14 @@ class ProfileView(discord.ui.LayoutView):
             )
             return
 
-        await interaction.followup.send(view=view)
+        view.message = interaction.message
+        await interaction.edit_original_response(view=view)
 
-    @keeps_universe
+    @keeps_context
     async def show_created_maps(self, interaction):
-        await interaction.response.defer(thinking=True)
+        # thinking=True would post a new message and
+        # edit_original_response would then edit that, not the card.
+        await interaction.response.defer()
 
         view = await build_created_maps_view(self.user_id, self.username)
         if view is None:
@@ -1342,7 +1371,8 @@ class ProfileView(discord.ui.LayoutView):
             )
             return
 
-        await interaction.followup.send(view=view)
+        view.message = interaction.message
+        await interaction.edit_original_response(view=view)
 
     async def on_timeout(self):
         for item in self.walk_children():
@@ -1489,7 +1519,7 @@ async def build_profile_view(user_id, username):
         headshot=headshot, wins=wins, restriction=restriction,
     )
 
-class MapView(discord.ui.LayoutView):
+class MapView(OwnedView, discord.ui.LayoutView):
     """Components V2 map card with configurable action buttons."""
 
     def __init__(self, entry, *, headshot=None, creator_text="Unknown",
@@ -1499,6 +1529,7 @@ class MapView(discord.ui.LayoutView):
                  show_leaderboard=True, show_creator=True):
         super().__init__(timeout=timeout)
         self.universe = current_universe()
+        self.bind_owner()
         self.entry = entry
         self.message = None
         self.creator_id = creator_id
@@ -1586,7 +1617,7 @@ class MapView(discord.ui.LayoutView):
 
         self.add_item(container)
 
-    @keeps_universe
+    @keeps_context
     async def show_leaderboard(self, interaction):
         await interaction.response.defer(thinking=True)
 
@@ -1601,13 +1632,17 @@ class MapView(discord.ui.LayoutView):
             )
             return
 
-        # A separate message, so an embed is fine even though the map card
-        # it came from is Components V2.
+        # This one can't edit the card in place: the map card is a Components
+        # V2 message, and Discord won't let that flag be cleared, so it can
+        # never carry an embed. The leaderboard needs embed fields for its
+        # columns, so it goes out as its own message.
         await interaction.followup.send(embed=embed)
 
-    @keeps_universe
+    @keeps_context
     async def show_creator_profile(self, interaction):
-        await interaction.response.defer(thinking=True)
+        # thinking=True would post a new message and
+        # edit_original_response would then edit that, not the card.
+        await interaction.response.defer()
 
         name = self.creator_name or str(self.creator_id)
         view = await build_profile_view(self.creator_id, name)
@@ -1617,7 +1652,8 @@ class MapView(discord.ui.LayoutView):
             )
             return
 
-        await interaction.followup.send(view=view)
+        view.message = interaction.message
+        await interaction.edit_original_response(view=view)
 
     async def on_timeout(self):
         for item in self.children:
@@ -1629,11 +1665,12 @@ class MapView(discord.ui.LayoutView):
             except discord.HTTPException:
                 pass
 
-class DailyCupMapView(discord.ui.View):
+class DailyCupMapView(OwnedView, discord.ui.View):
     """The Daily Cup card's single experience Play action."""
 
     def __init__(self):
         super().__init__(timeout=None)
+        self.owner_id = None   # posted by the scheduler; anyone may use it
         self.message = None
         self.add_item(discord.ui.Button(
             label="Play",
@@ -1925,6 +1962,11 @@ async def daily_cup_announcement():
 async def before_daily_cup_announcement():
     await bot.wait_until_ready()
 
+@bot.before_invoke
+async def remember_invoker(ctx):
+    """Runs in the command's own task, so views built there see the caller."""
+    _active_invoker.set(ctx.author.id)
+
 @bot.event
 async def on_ready():
     global _synced
@@ -2009,10 +2051,11 @@ async def send_cup_leaderboard(ctx, index, date_text, *, todays_map=None):
 
     await ctx.send(embed=embed)
 
-class AccountLinkView(discord.ui.View):
+class AccountLinkView(OwnedView, discord.ui.View):
     def __init__(self, account_id, code, expires_at):
         super().__init__(timeout=900)
         self.universe = current_universe()
+        self.bind_owner()
         self.account_id = account_id
         self.code = code
         self.expires_at = expires_at
@@ -2029,7 +2072,7 @@ class AccountLinkView(discord.ui.View):
         style=discord.ButtonStyle.success,
         emoji="✅",
     )
-    @keeps_universe
+    @keeps_context
     async def confirm(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
