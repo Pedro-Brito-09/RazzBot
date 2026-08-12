@@ -1413,24 +1413,27 @@ async def build_map_card(entry, **view_options):
         **view_options,
     )
 
-async def publish_daily_cup_announcement():
+async def publish_daily_cup_announcement(destination=None):
     """Post yesterday's cup leaderboard, followed by today's map card."""
-    try:
-        channel_id = int(DAILY_CUP_CHANNEL_ID)
-    except (TypeError, ValueError):
-        print("Daily Cup announcement skipped: invalid DAILY_CUP_CHANNEL_ID")
-        return
+    if destination is None:
+        try:
+            channel_id = int(DAILY_CUP_CHANNEL_ID)
+        except (TypeError, ValueError):
+            print("Daily Cup announcement skipped: invalid DAILY_CUP_CHANNEL_ID")
+            return False
 
-    channel = bot.get_channel(channel_id)
-    if channel is None:
-        channel = await bot.fetch_channel(channel_id)
+        destination = bot.get_channel(channel_id)
+        if destination is None:
+            destination = await bot.fetch_channel(channel_id)
+    else:
+        channel_id = destination.id
 
     todays_map = await fetch_entry("TodaysMap") or {}
     current_index = todays_map.get("Index")
     map_id = todays_map.get("Id")
     if not isinstance(current_index, int) or map_id is None:
         print("Daily Cup announcement skipped: TodaysMap has no Index or Id")
-        return
+        return False
 
     previous_index = current_index - 1
     previous_date = cup_day_today() - timedelta(days=1)
@@ -1454,7 +1457,7 @@ async def publish_daily_cup_announcement():
             "Daily Cup announcement skipped: no leaderboard for "
             f"DailyCup_{previous_index}"
         )
-        return
+        return False
 
     if previous_map_id is not None:
         entry_count = leaderboard_embed.footer.text
@@ -1465,7 +1468,7 @@ async def publish_daily_cup_announcement():
 
     if not maps_by_id:
         print("Daily Cup announcement skipped: community maps are unavailable")
-        return
+        return False
     try:
         lookup_id = int(map_id)
     except (TypeError, ValueError):
@@ -1473,7 +1476,7 @@ async def publish_daily_cup_announcement():
     entry = maps_by_id.get(lookup_id)
     if entry is None:
         print(f"Daily Cup announcement skipped: map {map_id} was not found")
-        return
+        return False
 
     map_view = await build_map_card(
         entry,
@@ -1484,12 +1487,13 @@ async def publish_daily_cup_announcement():
     )
 
     # Preserve the requested order: completed cup first, new cup second.
-    await channel.send(embed=leaderboard_embed)
-    map_view.message = await channel.send(view=map_view)
+    await destination.send(embed=leaderboard_embed)
+    map_view.message = await destination.send(view=map_view)
     print(
         f"Posted Daily Cup #{previous_index} results and "
         f"Daily Cup #{current_index} map {map_id} to channel {channel_id}"
     )
+    return True
 
 @tasks.loop(time=datetime_time(hour=9, minute=0, tzinfo=timezone.utc))
 async def daily_cup_announcement():
@@ -1940,6 +1944,18 @@ async def profile_command(ctx, username: str = None):
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
     await ctx.send("hello fuckers")
+
+@bot.command(name="testcup", hidden=True)
+@commands.is_owner()
+async def test_cup_announcement(ctx):
+    """Owner-only preview of the scheduled Daily Cup messages."""
+    async with ctx.typing():
+        posted = await publish_daily_cup_announcement(ctx.channel)
+    if not posted:
+        await ctx.send(
+            "Couldn't build the Daily Cup announcement. Check the bot logs "
+            "for the missing Roblox data."
+        )
 
 _original_close = bot.close
 
