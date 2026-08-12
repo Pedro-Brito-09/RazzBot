@@ -1428,7 +1428,7 @@ async def build_map_card(entry, **view_options):
         **view_options,
     )
 
-async def build_daily_cup_map_card(entry, cup_index):
+async def build_daily_cup_map_card(entry, cup_index, cup_date):
     """Build the Daily Cup-specific embed and its one-button view."""
     creator_id = entry.get("Creator")
     creator = await fetch_username(creator_id) if creator_id else None
@@ -1464,7 +1464,9 @@ async def build_daily_cup_map_card(entry, cup_index):
         value=f"▶️ {plays:,} plays\n⭐ {favorites:,} favourites",
         inline=True,
     )
-    embed.set_footer(text=f"Daily Cup #{cup_index}  ·  Map ID {map_id}")
+    embed.set_footer(
+        text=f"Daily Cup #{cup_index}  ·  {cup_date:%d/%m/%Y}  ·  Map ID {map_id}"
+    )
     if headshot:
         embed.set_thumbnail(url=headshot)
 
@@ -1512,8 +1514,8 @@ async def publish_daily_cup_announcement(destination=None):
         print("Daily Cup announcement skipped: TodaysMap has no Index or Id")
         return False
 
+    current_date = cup_day_today()
     previous_index = current_index - 1
-    previous_date = cup_day_today() - timedelta(days=1)
     previous_leaderboard, previous_map_id, maps_by_id = await asyncio.gather(
         fetch_entry(
             f"DailyCup_{previous_index}", datastore="Leaderboards"
@@ -1524,7 +1526,7 @@ async def publish_daily_cup_announcement(destination=None):
 
     leaderboard_embed = await build_leaderboard_embed(
         previous_leaderboard,
-        title=f"🏆 Leaderboard — {previous_date:%d/%m/%Y}",
+        title="🏆 Yesterday's Results",
         subtitle=f"Daily Cup #{previous_index}",
         show_medals=True,
         show_country=True,
@@ -1555,14 +1557,13 @@ async def publish_daily_cup_announcement(destination=None):
         print(f"Daily Cup announcement skipped: map {map_id} was not found")
         return False
 
-    map_embed, map_view = await build_daily_cup_map_card(entry, current_index)
+    map_embed, map_view = await build_daily_cup_map_card(
+        entry, current_index, current_date
+    )
     role_mention = daily_cup_role_mention(destination)
 
     # Preserve the requested order: completed cup first, new cup second.
-    await destination.send(
-        content="# Yesterday's Results",
-        embed=leaderboard_embed,
-    )
+    await destination.send(embed=leaderboard_embed)
     map_view.message = await destination.send(
         content=(
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
