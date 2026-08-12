@@ -58,6 +58,10 @@ MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
               "Playstyle", "Privacy", "Featured")
 
 UNIVERSE_ID = 8993151589
+# The commands that rewrite zstd buffers (!feature, !unfeature, !deletemap)
+# run against this universe instead, so a bad write can't damage the live
+# 85k map index. Set MAP_WRITE_UNIVERSE_ID to UNIVERSE_ID to go live.
+MAP_WRITE_UNIVERSE_ID = int(os.getenv("MAP_WRITE_UNIVERSE_ID") or 7117693401)
 # Ownership is checked one badge per request against inventory.roblox.com,
 # the only endpoint that answers without authentication.
 OWNED_BADGES_CACHE_TTL = 300
@@ -100,6 +104,8 @@ ACCOUNT_LINK_DATASTORE = "AccountLinking"
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
+# Falls back to API_KEY when the same key covers both universes.
+MAP_WRITE_API_KEY = os.getenv("MAP_WRITE_API_KEY") or API_KEY
 VERIFICATION_GAME_URL = os.getenv(
     "VERIFICATION_GAME_URL",
     "https://www.roblox.com/games/start?placeId=120140749641241",
@@ -358,17 +364,18 @@ async def purge_player_from_leaderboards(user_id):
             removed.append(scope)
     return removed
 
-def data_store_entry_url(entry_key, datastore):
+def data_store_entry_url(entry_key, datastore, universe_id=None):
     return (
-        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
+        f"https://apis.roblox.com/cloud/v2/universes/{universe_id or UNIVERSE_ID}/"
         f"data-stores/{quote(datastore, safe='')}/entries/"
         f"{quote(str(entry_key), safe='')}"
     )
 
-async def fetch_entry_resource(entry_key, datastore):
+async def fetch_entry_resource(entry_key, datastore, *, universe_id=None,
+                               api_key=None):
     """Fetch the full Open Cloud entry, including its concurrency ETag."""
-    url = data_store_entry_url(entry_key, datastore)
-    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    url = data_store_entry_url(entry_key, datastore, universe_id)
+    headers = {"x-api-key": api_key or API_KEY, "Accept": "application/json"}
     session = await get_session()
     try:
         async with session.get(url, headers=headers) as resp:
@@ -390,14 +397,15 @@ async def fetch_entry_resource(entry_key, datastore):
         return "error", None
 
 async def update_entry_resource(
-    entry_key, datastore, value, *, etag=None, allow_missing=False
+    entry_key, datastore, value, *, etag=None, allow_missing=False,
+    universe_id=None, api_key=None
 ):
     """Update an existing entry without silently replacing a newer version."""
-    url = data_store_entry_url(entry_key, datastore)
+    url = data_store_entry_url(entry_key, datastore, universe_id)
     if allow_missing:
         url += "?allowMissing=true"
     headers = {
-        "x-api-key": API_KEY,
+        "x-api-key": api_key or API_KEY,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -451,14 +459,17 @@ def encode_entry_value(original, new_value):
         return envelope
     return new_value
 
-async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4):
+async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4,
+                                  universe_id=None, api_key=None):
     """Read-modify-write guarded by the ETag -- Open Cloud's UpdateAsync.
 
     transform(decoded_value) returns the new value, or None to leave the
     entry alone. Returns "ok", "skipped", "conflict", "missing" or "error".
     """
     for attempt in range(1, attempts + 1):
-        status, resource = await fetch_entry_resource(entry_key, datastore)
+        status, resource = await fetch_entry_resource(
+            entry_key, datastore, universe_id=universe_id, api_key=api_key
+        )
         if status != "ok":
             return status
 
@@ -471,6 +482,7 @@ async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4
             entry_key, datastore,
             encode_entry_value(raw_value, new_value),
             etag=resource.get("etag"),
+            universe_id=universe_id, api_key=api_key,
         )
         if result != "conflict":
             return result
@@ -481,10 +493,11 @@ async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4
         await asyncio.sleep(0.5 * attempt)
     return "conflict"
 
-async def delete_entry_resource(entry_key, datastore):
+async def delete_entry_resource(entry_key, datastore, *, universe_id=None,
+                                api_key=None):
     """Delete one datastore entry. True when it's gone."""
-    url = data_store_entry_url(entry_key, datastore)
-    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    url = data_store_entry_url(entry_key, datastore, universe_id)
+    headers = {"x-api-key": api_key or API_KEY, "Accept": "application/json"}
     session = await get_session()
     try:
         async with session.delete(url, headers=headers) as resp:
@@ -500,8 +513,18 @@ async def delete_entry_resource(entry_key, datastore):
         return False
 
 def invalidate_maps_cache():
+    # The cache mirrors the live universe, so a test-universe write leaves it
+    # alone -- there is nothing stale to drop.
+    if MAP_WRITE_UNIVERSE_ID != UNIVERSE_ID:
+        return
     _maps_cache["by_id"] = None
     _maps_cache["at"] = 0.0
+
+def map_write_target_note():
+    """Warn on every reply when map writes aren't hitting the live universe."""
+    if MAP_WRITE_UNIVERSE_ID == UNIVERSE_ID:
+        return None
+    return f"-# ⚠️ test universe `{MAP_WRITE_UNIVERSE_ID}` — not the live game"
 
 def find_account_code(codes, account_id):
     account_id = str(account_id)
@@ -2399,7 +2422,10 @@ async def set_map_featured(ctx, map_id, featured):
         return None
 
     async with ctx.typing():
-        result = await update_entry_with_retry("Ids", "Community Maps", transform)
+        result = await update_entry_with_retry(
+            "Ids", "Community Maps", transform,
+            universe_id=MAP_WRITE_UNIVERSE_ID, api_key=MAP_WRITE_API_KEY,
+        )
 
     word = "featured" if featured else "unfeatured"
     if not state["found"]:
@@ -2417,7 +2443,11 @@ async def set_map_featured(ctx, map_id, featured):
 
     invalidate_maps_cache()
     icon = "🌟" if featured else "☆"
-    await ctx.send(f"{icon} **{state['name']}** (`{map_id}`) is now {word}.")
+    lines = [f"{icon} **{state['name']}** (`{map_id}`) is now {word}."]
+    note = map_write_target_note()
+    if note:
+        lines.append(note)
+    await ctx.send("\n".join(lines))
 
 @bot.command(name="feature", hidden=True)
 @is_admin()
@@ -2456,7 +2486,10 @@ async def admin_delete_map(ctx, map_id: int, confirm: str = ""):
         return None
 
     async with ctx.typing():
-        result = await update_entry_with_retry("Ids", "Community Maps", transform)
+        result = await update_entry_with_retry(
+            "Ids", "Community Maps", transform,
+            universe_id=MAP_WRITE_UNIVERSE_ID, api_key=MAP_WRITE_API_KEY,
+        )
 
         if not state["found"]:
             await ctx.send(f"No community map with ID `{map_id}`.")
@@ -2470,13 +2503,19 @@ async def admin_delete_map(ctx, map_id: int, confirm: str = ""):
 
         invalidate_maps_cache()
         # Only touch the map's own entry once the index write succeeded.
-        key_deleted = await delete_entry_resource(str(map_id), "Community Maps")
+        key_deleted = await delete_entry_resource(
+            str(map_id), "Community Maps",
+            universe_id=MAP_WRITE_UNIVERSE_ID, api_key=MAP_WRITE_API_KEY,
+        )
 
     lines = [f"🗑️ Removed **{state['name']}** (`{map_id}`) from the map index."]
     lines.append(
         "-# Its own entry was deleted." if key_deleted
         else f"-# ⚠️ The index was updated but deleting key `{map_id}` failed."
     )
+    note = map_write_target_note()
+    if note:
+        lines.append(note)
     await ctx.send("\n".join(lines))
 
 @bot.command(name="testcup", hidden=True)
