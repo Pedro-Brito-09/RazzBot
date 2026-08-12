@@ -3527,6 +3527,79 @@ async def admin_lookup(ctx, *, query: str):
     view.add_item(container)
     await ctx.send(view=view)
 
+def datastore_debug_json_default(value):
+    """Keep diagnostic output JSON-serializable without discarding bytes."""
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        return {
+            "pythonType": type(value).__name__,
+            "utf8": text,
+            "base64": base64.b64encode(raw).decode("ascii"),
+        }
+    return {
+        "pythonType": type(value).__name__,
+        "repr": repr(value),
+    }
+
+@bot.command(name="debuglinked", hidden=True)
+@is_admin()
+async def admin_debug_linked(ctx):
+    """Attach the raw and decoded AccountLinking/Linked datastore value."""
+    async with ctx.typing():
+        status, resource = await fetch_entry_resource(
+            "Linked", ACCOUNT_LINK_DATASTORE, fresh=True
+        )
+        raw_value = resource.get("value") if isinstance(resource, dict) else None
+        report = {
+            "universeId": current_universe(),
+            "dataStore": ACCOUNT_LINK_DATASTORE,
+            "entry": "Linked",
+            "fetchStatus": status,
+            "resource": resource,
+            "rawValuePythonType": type(raw_value).__name__,
+            "rawValueKeys": (
+                [str(key) for key in raw_value.keys()]
+                if isinstance(raw_value, dict) else None
+            ),
+            "rawValueFieldTypes": (
+                {
+                    str(key): type(value).__name__
+                    for key, value in raw_value.items()
+                }
+                if isinstance(raw_value, dict) else None
+            ),
+        }
+
+        try:
+            decoded = decode_json_value(raw_value)
+        except Exception as error:
+            report["decodeError"] = {
+                "type": type(error).__name__,
+                "message": str(error),
+                "traceback": traceback.format_exc(),
+            }
+        else:
+            report["decodedPythonType"] = type(decoded).__name__
+            report["decodedValue"] = decoded
+
+        payload = json.dumps(
+            report,
+            indent=2,
+            ensure_ascii=False,
+            default=datastore_debug_json_default,
+        ).encode("utf-8")
+
+    await ctx.send(
+        "Fresh `AccountLinking/Linked` diagnostic:",
+        file=discord.File(
+            io.BytesIO(payload), filename="account-linking-linked-debug.json"
+        ),
+    )
+
 def simple_card(text, *, colour=PROFILE_COLOR, heading=None):
     """A one-block Components V2 card, for short replies."""
     container = discord.ui.Container(accent_colour=colour)
