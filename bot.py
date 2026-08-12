@@ -566,25 +566,6 @@ def parse_cup_date(text):
     except (ValueError, AttributeError):
         return None
 
-def parse_cup_stamp(value):
-    """Read TodaysMap's Date into a cup day, whatever shape it arrives in."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            moment = datetime.fromtimestamp(value, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
-        return (moment - timedelta(hours=9)).date()
-    if isinstance(value, str):
-        text = value.strip()
-        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(text, fmt).date()
-            except ValueError:
-                continue
-    return None
-
 async def resolve_current_cup(todays_map):
     """Today's cup index and map ID, allowing for a stale TodaysMap.
 
@@ -599,7 +580,7 @@ async def resolve_current_cup(todays_map):
         return None, None
 
     raw_date = todays_map.get("Date")
-    stamp = parse_cup_stamp(raw_date)
+    stamp = parse_cup_date(raw_date)
     if stamp is None:
         print(f"TodaysMap Date unreadable ({raw_date!r}); "
               f"using stored Daily Cup #{index}")
