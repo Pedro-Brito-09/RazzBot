@@ -3751,16 +3751,20 @@ async def roles_slash_command(interaction: discord.Interaction):
     await interaction.followup.send(view=view, allowed_mentions=SILENT)
 
 @bot.group(name="roles", hidden=True, invoke_without_command=True)
-@is_admin()
 async def admin_roles(ctx):
-    """Manage the role rules /sync applies."""
+    """View role rewards; admins also see management details."""
+    if ctx.guild is None:
+        await ctx.send("This command only works inside a server.")
+        return
     rules = await fetch_role_rules(ctx.guild.id)
+    admin = ctx.author.id == ADMIN_USER_ID
     await ctx.send(
-        view=build_role_rules_view(rules, ctx.guild, admin=True),
+        view=build_role_rules_view(rules, ctx.guild, admin=admin),
         allowed_mentions=SILENT,
     )
 
 @admin_roles.command(name="add")
+@is_admin()
 async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
     """!roles add <@role> <badge|map> <id>"""
     kind = condition.strip().lower()
@@ -3818,6 +3822,7 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
     ), allowed_mentions=SILENT)
 
 @admin_roles.command(name="remove")
+@is_admin()
 async def admin_roles_remove(ctx, rule_id: str):
     """!roles remove <rule_id>"""
     wanted = rule_id.strip().lower()
