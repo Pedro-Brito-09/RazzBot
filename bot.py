@@ -444,7 +444,9 @@ def encode_entry_value(original, new_value):
             "t": "buffer",
             "zbase64": base64.b64encode(compressed).decode("ascii"),
         }
-        if "m" in original:
+        # Open Cloud rejects the whole write when "m" is null, so carry it
+        # over only when the entry actually has one.
+        if original.get("m") is not None:
             envelope["m"] = original["m"]
         return envelope
     return new_value
