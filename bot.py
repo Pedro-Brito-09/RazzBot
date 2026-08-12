@@ -3748,24 +3748,42 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
     lines.extend((f"**Role:** {role_text}", f"**Requirement:** {condition}"))
     return "\n".join(lines)
 
-def build_role_rules_view(rules, guild, *, admin=False, badge_names=None):
+def build_role_rules_view(
+    rules, guild, *, admin=False, badge_names=None, player=None
+):
     """Render public role rewards, with management details only for admin."""
+    player_name = (
+        discord.utils.escape_markdown(player.display_name) if player else None
+    )
     if not rules:
-        text = "No role rewards are configured yet."
-        if admin:
+        if player:
+            text = f"**{player_name}** has no configured reward roles."
+        else:
+            text = "No role rewards are configured yet."
+        if admin and player is None:
             text += (
                 "\n-# Add: `!roles add @Role map <map ID>` or "
                 "`!roles add @Role badge <badge ID>`"
             )
         return simple_card(
             text,
-            heading="🎭 Role rewards",
+            heading=(
+                f"🎭 {player_name}'s role rewards"
+                if player else "🎭 Role rewards"
+            ),
             colour=discord.Color.greyple(),
         )
 
     container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+    if player:
+        heading = (
+            f"## 🎭 {player_name}'s role rewards\n"
+            f"-# {len(rules)} currently assigned"
+        )
+    else:
+        heading = f"## 🎭 Role rewards\n-# {len(rules)} available"
     container.add_item(discord.ui.TextDisplay(
-        f"## 🎭 Role rewards\n-# {len(rules)} available"
+        heading
     ))
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(
@@ -3779,12 +3797,14 @@ def build_role_rules_view(rules, guild, *, admin=False, badge_names=None):
     container.add_item(discord.ui.Separator(
         visible=False, spacing=discord.SeparatorSpacing.small
     ))
-    if admin:
+    if admin and player is None:
         footer = (
             "-# Remove: `!roles remove <rule ID>`\n"
             "-# Add: `!roles add @Role map <map ID>` or "
             "`!roles add @Role badge <badge ID>`"
         )
+    elif player:
+        footer = "-# Configured reward roles currently assigned to this member."
     else:
         footer = "-# Use `/sync` to update your roles."
     container.add_item(discord.ui.TextDisplay(footer))
@@ -3798,7 +3818,10 @@ def build_role_rules_view(rules, guild, *, admin=False, badge_names=None):
     return view
 
 @bot.tree.command(name="roles", description="View the server's Roblox role rewards")
-async def roles_slash_command(interaction: discord.Interaction):
+@app_commands.describe(player="Only show reward roles assigned to this member")
+async def roles_slash_command(
+    interaction: discord.Interaction, player: discord.Member = None
+):
     if interaction.guild is None:
         await interaction.response.send_message(
             "This command only works inside a server.", ephemeral=True
@@ -3807,12 +3830,19 @@ async def roles_slash_command(interaction: discord.Interaction):
 
     await interaction.response.defer()
     rules = await fetch_role_rules(interaction.guild.id)
+    if player is not None:
+        held_role_ids = {role.id for role in player.roles}
+        rules = [
+            rule for rule in rules
+            if rule_role_id(rule) in held_role_ids
+        ]
     badge_names = await role_rule_badge_names(rules)
     view = build_role_rules_view(
         rules,
         interaction.guild,
         admin=interaction.user.id == ADMIN_USER_ID,
         badge_names=badge_names,
+        player=player,
     )
     await interaction.followup.send(view=view, allowed_mentions=SILENT)
 
