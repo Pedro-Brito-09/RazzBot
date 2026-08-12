@@ -430,6 +430,77 @@ def decode_entry_value(value):
         return decode_buffer(value["zbase64"])
     return value
 
+def encode_entry_value(original, new_value):
+    """Re-encode a value in whatever envelope the entry already used.
+
+    Community Maps and the leaderboards are stored as zstd-compressed
+    buffers, so writing plain JSON back would make them unreadable.
+    """
+    if isinstance(original, dict) and original.get("t") == "buffer":
+        raw = json.dumps(new_value, separators=(",", ":"),
+                         ensure_ascii=False).encode("utf-8")
+        compressed = zstd.ZstdCompressor().compress(raw)
+        envelope = {
+            "t": "buffer",
+            "zbase64": base64.b64encode(compressed).decode("ascii"),
+        }
+        if "m" in original:
+            envelope["m"] = original["m"]
+        return envelope
+    return new_value
+
+async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4):
+    """Read-modify-write guarded by the ETag -- Open Cloud's UpdateAsync.
+
+    transform(decoded_value) returns the new value, or None to leave the
+    entry alone. Returns "ok", "skipped", "conflict", "missing" or "error".
+    """
+    for attempt in range(1, attempts + 1):
+        status, resource = await fetch_entry_resource(entry_key, datastore)
+        if status != "ok":
+            return status
+
+        raw_value = resource.get("value")
+        new_value = transform(decode_entry_value(raw_value))
+        if new_value is None:
+            return "skipped"
+
+        result = await update_entry_resource(
+            entry_key, datastore,
+            encode_entry_value(raw_value, new_value),
+            etag=resource.get("etag"),
+        )
+        if result != "conflict":
+            return result
+
+        # The game wrote underneath us; re-read and reapply.
+        print(f"update_entry_with_retry({datastore}/{entry_key}) "
+              f"conflict on attempt {attempt}")
+        await asyncio.sleep(0.5 * attempt)
+    return "conflict"
+
+async def delete_entry_resource(entry_key, datastore):
+    """Delete one datastore entry. True when it's gone."""
+    url = data_store_entry_url(entry_key, datastore)
+    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    session = await get_session()
+    try:
+        async with session.delete(url, headers=headers) as resp:
+            if resp.status in (200, 204, 404):
+                return True
+            body = (await resp.text())[:200]
+            print(f"delete_entry_resource({datastore}/{entry_key}) "
+                  f"-> HTTP {resp.status}: {body}")
+            return False
+    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+        print(f"delete_entry_resource({datastore}/{entry_key}) failed: "
+              f"{type(error).__name__}: {error}")
+        return False
+
+def invalidate_maps_cache():
+    _maps_cache["by_id"] = None
+    _maps_cache["at"] = 0.0
+
 def find_account_code(codes, account_id):
     account_id = str(account_id)
     for code, stored_account_id in codes.items():
@@ -2306,6 +2377,105 @@ async def admin_unban(ctx, player: str):
             await ctx.send(f"✅ Unbanned **{name}** (`{user_id}`).")
         else:
             await ctx.send(f"Failed to unban **{name}**. Check the logs.")
+
+async def set_map_featured(ctx, map_id, featured):
+    """Flip Featured on one map inside the Community Maps index."""
+    state = {"name": None, "found": False, "already": False}
+
+    def transform(entries):
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("Id") == map_id:
+                state["found"] = True
+                state["name"] = entry.get("Name") or "Unnamed Map"
+                if bool(entry.get("Featured")) == featured:
+                    state["already"] = True
+                    return None
+                entry["Featured"] = featured
+                return entries
+        return None
+
+    async with ctx.typing():
+        result = await update_entry_with_retry("Ids", "Community Maps", transform)
+
+    word = "featured" if featured else "unfeatured"
+    if not state["found"]:
+        await ctx.send(f"No community map with ID `{map_id}`.")
+        return
+    if state["already"]:
+        await ctx.send(f"**{state['name']}** (`{map_id}`) is already {word}.")
+        return
+    if result != "ok":
+        await ctx.send(
+            f"Failed to update `{map_id}` ({result}). The map list was left "
+            f"untouched — check the logs."
+        )
+        return
+
+    invalidate_maps_cache()
+    icon = "🌟" if featured else "☆"
+    await ctx.send(f"{icon} **{state['name']}** (`{map_id}`) is now {word}.")
+
+@bot.command(name="feature", hidden=True)
+@is_admin()
+async def admin_feature(ctx, map_id: int):
+    """!feature <map_id>"""
+    await set_map_featured(ctx, map_id, True)
+
+@bot.command(name="unfeature", hidden=True)
+@is_admin()
+async def admin_unfeature(ctx, map_id: int):
+    """!unfeature <map_id>"""
+    await set_map_featured(ctx, map_id, False)
+
+@bot.command(name="deletemap", hidden=True)
+@is_admin()
+async def admin_delete_map(ctx, map_id: int, confirm: str = ""):
+    """!deletemap <map_id> confirm -- removes it from the index and its key."""
+    if confirm.strip().lower() != "confirm":
+        await ctx.send(
+            f"This permanently removes map `{map_id}` from the index of "
+            f"~85k maps and deletes its entry. There is no undo.\n"
+            f"Run `!deletemap {map_id} confirm` if you're sure."
+        )
+        return
+
+    state = {"name": None, "found": False}
+
+    def transform(entries):
+        if not isinstance(entries, list):
+            return None
+        for position, entry in enumerate(entries):
+            if isinstance(entry, dict) and entry.get("Id") == map_id:
+                state["found"] = True
+                state["name"] = entry.get("Name") or "Unnamed Map"
+                return entries[:position] + entries[position + 1:]
+        return None
+
+    async with ctx.typing():
+        result = await update_entry_with_retry("Ids", "Community Maps", transform)
+
+        if not state["found"]:
+            await ctx.send(f"No community map with ID `{map_id}`.")
+            return
+        if result != "ok":
+            await ctx.send(
+                f"Failed to remove `{map_id}` from the index ({result}). "
+                f"Nothing was deleted — check the logs."
+            )
+            return
+
+        invalidate_maps_cache()
+        # Only touch the map's own entry once the index write succeeded.
+        key_deleted = await delete_entry_resource(str(map_id), "Community Maps")
+
+    lines = [f"🗑️ Removed **{state['name']}** (`{map_id}`) from the map index."]
+    lines.append(
+        "-# Its own entry was deleted." if key_deleted
+        else f"-# ⚠️ The index was updated but deleting key `{map_id}` failed."
+    )
+    await ctx.send("\n".join(lines))
 
 @bot.command(name="testcup", hidden=True)
 @commands.is_owner()

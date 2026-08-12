@@ -91,6 +91,10 @@ is omitted, the bot falls back to a role named exactly `Daily Cup Notification`.
 The Open Cloud API key needs read, create, and update access to the
 `AccountLinking` data store in addition to the bot's existing data-store access.
 
+The admin commands need more: `universe.user-restriction:write` for `!ban` and
+`!unban`, plus delete access on the `Community Maps` data store and the ordered
+data stores for `!deletemap` and permanent bans.
+
 ## 6. systemd
 
 ```bash
