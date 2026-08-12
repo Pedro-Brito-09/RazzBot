@@ -1,7 +1,7 @@
 [Unit]
 Description=RazzBot Discord bot
-After=network-online.target
-Wants=network-online.target
+After=network-online.target razzbot-update.service
+Wants=network-online.target razzbot-update.service
 
 [Service]
 Type=simple

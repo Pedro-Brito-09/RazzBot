@@ -79,10 +79,16 @@ Never commit this file. `.env` is gitignored.
 ## 6. systemd
 
 ```bash
+sudo cp /opt/razzbot/razzbot-update.service /etc/systemd/system/razzbot-update.service
 sudo cp /opt/razzbot/razzbot.service /etc/systemd/system/razzbot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now razzbot
 ```
+
+Every start of `razzbot.service`, including startup after a reboot, first runs
+`git pull --ff-only origin main` as the unprivileged `razzbot` user. If the update
+fails because GitHub or the network is temporarily unavailable, systemd logs the
+failure and starts the currently installed version of the bot.
 
 Verify:
 
@@ -98,8 +104,10 @@ You want `Logged in as RazzBot#....` in the log.
 ## Updating after a code change
 
 ```bash
-sudo -u razzbot git -C /opt/razzbot pull && sudo systemctl restart razzbot
+sudo systemctl restart razzbot
 ```
+
+The restart automatically runs the updater before launching the bot.
 
 If dependencies changed, re-run the `pip install` line from step 4 before restarting.
 

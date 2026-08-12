@@ -1,0 +1,15 @@
+[Unit]
+Description=Update RazzBot from GitHub
+After=network-online.target
+Wants=network-online.target
+Before=razzbot.service
+
+[Service]
+Type=oneshot
+User=razzbot
+Group=razzbot
+WorkingDirectory=/opt/razzbot
+Environment=GIT_TERMINAL_PROMPT=0
+ExecStart=/usr/bin/git -C /opt/razzbot pull --ff-only origin main
+TimeoutStartSec=60
+
