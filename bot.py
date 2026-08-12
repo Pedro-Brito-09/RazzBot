@@ -10,6 +10,8 @@ import traceback
 import asyncio
 import io
 import socket
+import contextvars
+import functools
 import re
 import secrets
 import string
@@ -58,10 +60,8 @@ MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
               "Playstyle", "Privacy", "Featured")
 
 UNIVERSE_ID = 8993151589
-# The commands that rewrite zstd buffers (!feature, !unfeature, !deletemap)
-# run against this universe instead, so a bad write can't damage the live
-# 85k map index. Set MAP_WRITE_UNIVERSE_ID to UNIVERSE_ID to go live.
-MAP_WRITE_UNIVERSE_ID = int(os.getenv("MAP_WRITE_UNIVERSE_ID") or 7117693401)
+# Every command has a !dev_ twin that runs against this universe instead.
+DEV_UNIVERSE_ID = int(os.getenv("DEV_UNIVERSE_ID") or 7117693401)
 # Ownership is checked one badge per request against inventory.roblox.com,
 # the only endpoint that answers without authentication.
 OWNED_BADGES_CACHE_TTL = 300
@@ -104,8 +104,6 @@ ACCOUNT_LINK_DATASTORE = "AccountLinking"
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
-# Falls back to API_KEY when the same key covers both universes.
-MAP_WRITE_API_KEY = os.getenv("MAP_WRITE_API_KEY") or API_KEY
 VERIFICATION_GAME_URL = os.getenv(
     "VERIFICATION_GAME_URL",
     "https://www.roblox.com/games/start?placeId=120140749641241",
@@ -131,6 +129,22 @@ bot = commands.Bot(
 
 _synced = False
 _session = None
+
+# Which universe the command currently running should talk to. A ContextVar
+# rather than a global so concurrent invocations can't read each other's.
+_active_universe = contextvars.ContextVar("active_universe", default=None)
+
+def current_universe():
+    return _active_universe.get() or UNIVERSE_ID
+
+def on_dev_universe():
+    return current_universe() != UNIVERSE_ID
+
+def dev_universe_note():
+    """Warn on replies whenever a command isn't touching the live game."""
+    if not on_dev_universe():
+        return None
+    return f"-# 🧪 test universe `{current_universe()}` — not the live game"
 _account_link_lock = asyncio.Lock()
 _link_code_expirations = {}
 _link_code_tasks = {}
@@ -203,7 +217,7 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
     # Datastore names contain spaces ("Daily Cup Submissions"), so encode
     # both segments rather than relying on the client to fix up the URL.
     url = (
-        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}/"
         f"data-stores/{quote(datastore, safe='')}/entries/{quote(str(entry_key), safe='')}"
     )
     headers = {"x-api-key": API_KEY, "Accept": "application/json"}
@@ -221,7 +235,7 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
 
 def user_restriction_url(user_id):
     return (
-        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}"
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}"
         f"/user-restrictions/{quote(str(user_id), safe='')}"
     )
 
@@ -327,7 +341,7 @@ def format_ban_duration(seconds):
 
 def ordered_entry_url(entry_key, datastore, scope):
     return (
-        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}/"
         f"ordered-data-stores/{quote(datastore, safe='')}/"
         f"scopes/{quote(scope, safe='')}/"
         f"entries/{quote(str(entry_key), safe='')}"
@@ -366,7 +380,7 @@ async def purge_player_from_leaderboards(user_id):
 
 def data_store_entry_url(entry_key, datastore, universe_id=None):
     return (
-        f"https://apis.roblox.com/cloud/v2/universes/{universe_id or UNIVERSE_ID}/"
+        f"https://apis.roblox.com/cloud/v2/universes/{universe_id or current_universe()}/"
         f"data-stores/{quote(datastore, safe='')}/entries/"
         f"{quote(str(entry_key), safe='')}"
     )
@@ -513,18 +527,7 @@ async def delete_entry_resource(entry_key, datastore, *, universe_id=None,
         return False
 
 def invalidate_maps_cache():
-    # The cache mirrors the live universe, so a test-universe write leaves it
-    # alone -- there is nothing stale to drop.
-    if MAP_WRITE_UNIVERSE_ID != UNIVERSE_ID:
-        return
-    _maps_cache["by_id"] = None
-    _maps_cache["at"] = 0.0
-
-def map_write_target_note():
-    """Warn on every reply when map writes aren't hitting the live universe."""
-    if MAP_WRITE_UNIVERSE_ID == UNIVERSE_ID:
-        return None
-    return f"-# ⚠️ test universe `{MAP_WRITE_UNIVERSE_ID}` — not the live game"
+    _maps_cache.pop(current_universe(), None)
 
 def find_account_code(codes, account_id):
     account_id = str(account_id)
@@ -666,7 +669,7 @@ async def fetch_universe_badges():
     """Every badge the game defines. Public, no auth needed."""
     badges, cursor = [], None
     while True:
-        url = (f"https://badges.roblox.com/v1/universes/{UNIVERSE_ID}/badges"
+        url = (f"https://badges.roblox.com/v1/universes/{current_universe()}/badges"
                f"?limit=100&sortOrder=Asc")
         if cursor:
             url += f"&cursor={quote(cursor)}"
@@ -692,7 +695,8 @@ async def fetch_owned_badge_ids(user_id, badge_ids):
     """Which of badge_ids the player owns. One request per badge, so the
     result is cached briefly per player."""
     now = time.monotonic()
-    cached = _owned_badges_cache.get(user_id)
+    cache_key = (current_universe(), user_id)
+    cached = _owned_badges_cache.get(cache_key)
     if cached and now - cached[0] < OWNED_BADGES_CACHE_TTL:
         return cached[1]
 
@@ -701,7 +705,7 @@ async def fetch_owned_badge_ids(user_id, badge_ids):
         _badge_is_owned(user_id, badge_id, semaphore) for badge_id in badge_ids
     ))
     owned = {badge_id for badge_id, has in results if has}
-    _owned_badges_cache[user_id] = (now, owned)
+    _owned_badges_cache[cache_key] = (now, owned)
     return owned
 
 async def fetch_badge_icons(badge_ids):
@@ -732,7 +736,7 @@ async def fetch_ordered_entry(entry_key, datastore="Data", scope="Wins"):
     in JSON, so the value is coerced.
     """
     url = (
-        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}/"
         f"ordered-data-stores/{quote(datastore, safe='')}/"
         f"scopes/{quote(scope, safe='')}/"
         f"entries/{quote(str(entry_key), safe='')}"
@@ -756,7 +760,7 @@ async def fetch_ordered_entry(entry_key, datastore="Data", scope="Wins"):
 async def fetch_ordered_leaderboard(datastore="Data", scope="Wins", limit=10):
     """Return the highest-valued entries from an ordered datastore."""
     url = (
-        f"https://apis.roblox.com/cloud/v2/universes/{UNIVERSE_ID}/"
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}/"
         f"ordered-data-stores/{quote(datastore, safe='')}/"
         f"scopes/{quote(scope, safe='')}/entries"
         f"?maxPageSize={limit}&orderBy={quote('value desc', safe='')}"
@@ -1144,7 +1148,8 @@ def render_leaderboard_list(
         lines.append(f"{' '.join(parts)} - {tail}")
     return "\n".join(lines)
 
-_maps_cache = {"at": 0.0, "by_id": None}
+# Keyed by universe: a !dev_ command must never poison the live cache.
+_maps_cache = {}
 
 async def get_community_maps():
     """Community maps indexed by Id, cached for MAPS_CACHE_TTL seconds.
@@ -1152,9 +1157,11 @@ async def get_community_maps():
     On a failed refresh the previous index is kept and returned, so a blip
     upstream doesn't take the command down.
     """
+    universe = current_universe()
     now = time.monotonic()
-    cached = _maps_cache["by_id"]
-    if cached and now - _maps_cache["at"] < MAPS_CACHE_TTL:
+    entry = _maps_cache.get(universe)
+    cached = entry["by_id"] if entry else None
+    if cached and now - entry["at"] < MAPS_CACHE_TTL:
         return cached
 
     entries = await fetch_entry("Ids", datastore="Community Maps")
@@ -1166,9 +1173,8 @@ async def get_community_maps():
         if isinstance(e, dict) and e.get("Id") is not None:
             by_id[e["Id"]] = {k: e.get(k) for k in MAP_FIELDS}
 
-    _maps_cache["by_id"] = by_id
-    _maps_cache["at"] = now
-    print(f"community maps indexed: {len(by_id)} entries")
+    _maps_cache[universe] = {"by_id": by_id, "at": now}
+    print(f"community maps indexed: {len(by_id)} entries (universe {universe})")
     return by_id
 
 class ProfileView(discord.ui.LayoutView):
@@ -2324,11 +2330,12 @@ async def profile_command(ctx, username: str = None):
 async def ping(ctx):
     await ctx.send("hello fuckers")
 
+async def admin_only_predicate(ctx):
+    return ctx.author.id == ADMIN_USER_ID
+
 def is_admin():
     """Prefix-command gate. Stays silent for everyone else."""
-    async def predicate(ctx):
-        return ctx.author.id == ADMIN_USER_ID
-    return commands.check(predicate)
+    return commands.check(admin_only_predicate)
 
 async def resolve_admin_target(ctx, player):
     """Username or ID -> (user_id, name). Reports and returns None on miss."""
@@ -2422,10 +2429,7 @@ async def set_map_featured(ctx, map_id, featured):
         return None
 
     async with ctx.typing():
-        result = await update_entry_with_retry(
-            "Ids", "Community Maps", transform,
-            universe_id=MAP_WRITE_UNIVERSE_ID, api_key=MAP_WRITE_API_KEY,
-        )
+        result = await update_entry_with_retry("Ids", "Community Maps", transform)
 
     word = "featured" if featured else "unfeatured"
     if not state["found"]:
@@ -2444,7 +2448,7 @@ async def set_map_featured(ctx, map_id, featured):
     invalidate_maps_cache()
     icon = "🌟" if featured else "☆"
     lines = [f"{icon} **{state['name']}** (`{map_id}`) is now {word}."]
-    note = map_write_target_note()
+    note = dev_universe_note()
     if note:
         lines.append(note)
     await ctx.send("\n".join(lines))
@@ -2486,10 +2490,7 @@ async def admin_delete_map(ctx, map_id: int, confirm: str = ""):
         return None
 
     async with ctx.typing():
-        result = await update_entry_with_retry(
-            "Ids", "Community Maps", transform,
-            universe_id=MAP_WRITE_UNIVERSE_ID, api_key=MAP_WRITE_API_KEY,
-        )
+        result = await update_entry_with_retry("Ids", "Community Maps", transform)
 
         if not state["found"]:
             await ctx.send(f"No community map with ID `{map_id}`.")
@@ -2503,17 +2504,14 @@ async def admin_delete_map(ctx, map_id: int, confirm: str = ""):
 
         invalidate_maps_cache()
         # Only touch the map's own entry once the index write succeeded.
-        key_deleted = await delete_entry_resource(
-            str(map_id), "Community Maps",
-            universe_id=MAP_WRITE_UNIVERSE_ID, api_key=MAP_WRITE_API_KEY,
-        )
+        key_deleted = await delete_entry_resource(str(map_id), "Community Maps")
 
     lines = [f"🗑️ Removed **{state['name']}** (`{map_id}`) from the map index."]
     lines.append(
         "-# Its own entry was deleted." if key_deleted
         else f"-# ⚠️ The index was updated but deleting key `{map_id}` failed."
     )
-    note = map_write_target_note()
+    note = dev_universe_note()
     if note:
         lines.append(note)
     await ctx.send("\n".join(lines))
@@ -2529,6 +2527,49 @@ async def test_cup_announcement(ctx):
             "Couldn't build the Daily Cup announcement. Check the bot logs "
             "for the missing Roblox data."
         )
+
+def register_dev_variants():
+    """Give every command a prefix-only !dev_ twin bound to DEV_UNIVERSE_ID.
+
+    The twin reuses the original callback, so the two can never drift; only
+    the active universe differs.
+    """
+    added = []
+    for command in list(bot.commands):
+        if command.name.startswith("dev_") or command.name == "help":
+            continue
+
+        def make(original_callback):
+            @functools.wraps(original_callback)
+            async def run_on_dev_universe(*args, **kwargs):
+                token = _active_universe.set(DEV_UNIVERSE_ID)
+                try:
+                    # Mark the invocation so a dev run is never mistaken for
+                    # a live one, whatever the command replies with.
+                    ctx = args[0] if args else None
+                    if isinstance(ctx, commands.Context):
+                        try:
+                            await ctx.message.add_reaction("🧪")
+                        except discord.HTTPException:
+                            pass
+                    return await original_callback(*args, **kwargs)
+                finally:
+                    _active_universe.reset(token)
+            return run_on_dev_universe
+
+        twin = commands.Command(
+            make(command.callback),
+            name=f"dev_{command.name}",
+            help=command.help,
+            hidden=True,
+            checks=[admin_only_predicate],
+        )
+        bot.add_command(twin)
+        added.append(twin.name)
+
+    print(f"Registered {len(added)} dev command(s) on universe {DEV_UNIVERSE_ID}")
+
+register_dev_variants()
 
 _original_close = bot.close
 

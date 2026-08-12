@@ -95,6 +95,10 @@ The admin commands need more: `universe.user-restriction:write` for `!ban` and
 `!unban`, plus delete access on the `Community Maps` data store and the ordered
 data stores for `!deletemap` and permanent bans.
 
+Every command also has a prefix-only `!dev_` twin that runs against the test
+universe in `DEV_UNIVERSE_ID` (`!dev_map`, `!dev_cup`, `!dev_deletemap`, ...).
+The same Open Cloud key must list both universes.
+
 ## 6. systemd
 
 ```bash
