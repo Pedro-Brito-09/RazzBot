@@ -107,6 +107,15 @@ LINK_CODE_EXPIRATIONS_KEY = "CodeExpirations"
 # Discord role rules live here, keyed by guild.
 ROLES_DATASTORE = "Roles"
 ROLE_CONDITIONS = ("badge", "map")
+# Always granted by /sync, but omitted from its change summary. These organize
+# achievement roles into Discord profile categories rather than representing
+# achievements themselves.
+SYNC_CATEGORY_ROLE_IDS = {
+    1537171022782926950,
+    1537170258853503037,
+    1537170680146165840,
+    1537172902376509490,
+}
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
@@ -1070,7 +1079,7 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
     governed = {
         role_id for rule in rules
         if (role_id := rule_role_id(rule)) is not None
-    }
+    } - SYNC_CATEGORY_ROLE_IDS
     held = {role.id for role in member.roles}
 
     blocked = []
@@ -1087,8 +1096,17 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
         elif role_id not in earned and role_id in held:
             remove.append(role)
 
-    if add:
-        await member.add_roles(*add, reason="RazzBot role sync")
+    # Category roles are unconditional and deliberately absent from the
+    # returned `add` list, keeping them out of the user-facing sync summary.
+    category_add = []
+    for role_id in SYNC_CATEGORY_ROLE_IDS - held:
+        role = manageable_role(member.guild, role_id)
+        if role is not None:
+            category_add.append(role)
+
+    roles_to_add = add + category_add
+    if roles_to_add:
+        await member.add_roles(*roles_to_add, reason="RazzBot role sync")
     if remove:
         await member.remove_roles(*remove, reason="RazzBot role sync")
     return add, remove, blocked
@@ -3143,14 +3161,6 @@ async def sync_command(ctx, *, target: str = None):
         return
 
     rules = await fetch_role_rules(ctx.guild.id)
-    if not rules:
-        await ctx.send(view=simple_card(
-            "No role rules are configured for this server.\n"
-            "-# `!roles add <@role> badge <id>` to make one.",
-            colour=discord.Color.greyple(),
-        ))
-        return
-
     map_cache = {}
 
     # Everyone linked, admin only.
