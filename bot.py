@@ -3658,20 +3658,22 @@ def simple_card(text, *, colour=PROFILE_COLOR, heading=None):
 # Role mentions render inside a card, so keep them from pinging.
 SILENT = discord.AllowedMentions.none()
 
-def describe_rule(rule, guild):
+def describe_rule(rule, guild, *, admin=False):
     role_id = rule_role_id(rule)
     role = guild.get_role(role_id) if guild and role_id is not None else None
     if role is not None:
         role_text = f"{role.mention} (**{role.name}**)"
     elif role_id is not None:
-        role_text = (
-            f"⚠️ **Role no longer exists in this server** (`{role_id}`)"
-        )
+        role_text = "⚠️ **Role unavailable**"
+        if admin:
+            role_text += f" — it no longer exists in this server (`{role_id}`)"
     else:
-        role_text = (
-            "⚠️ **Unknown role** — its ID was saved using the old number "
-            "format and lost precision. Remove and recreate this rule."
-        )
+        role_text = "⚠️ **Role unavailable**"
+        if admin:
+            role_text += (
+                " — its ID was saved using the old number format and lost "
+                "precision. Remove and recreate this rule."
+            )
 
     if rule.get("type") == "badge":
         condition = f"Own badge **#{rule.get('value', '?')}**"
@@ -3679,43 +3681,49 @@ def describe_rule(rule, guild):
         condition = f"Complete map **#{rule.get('value', '?')}**"
     else:
         condition = "⚠️ Unknown requirement"
-    return (
-        f"**Rule `{rule.get('id', '?')}`**\n"
-        f"**Role:** {role_text}\n"
-        f"**Requirement:** {condition}"
-    )
+    lines = []
+    if admin:
+        lines.append(f"**Rule `{rule.get('id', '?')}`**")
+    lines.extend((f"**Role:** {role_text}", f"**Requirement:** {condition}"))
+    return "\n".join(lines)
 
-@bot.group(name="roles", hidden=True, invoke_without_command=True)
-@is_admin()
-async def admin_roles(ctx):
-    """Manage the role rules /sync applies."""
-    rules = await fetch_role_rules(ctx.guild.id)
+def build_role_rules_view(rules, guild, *, admin=False):
+    """Render public role rewards, with management details only for admin."""
     if not rules:
-        await ctx.send(view=simple_card(
-            "No rules yet.\n"
-            "-# `!roles add <@role> badge <badge_id>`\n"
-            "-# `!roles add <@role> map <map_id>`",
-            heading="🎭 Role rules",
+        text = "No role rewards are configured yet."
+        if admin:
+            text += (
+                "\n-# Add: `!roles add @Role map <map ID>` or "
+                "`!roles add @Role badge <badge ID>`"
+            )
+        return simple_card(
+            text,
+            heading="🎭 Role rewards",
             colour=discord.Color.greyple(),
-        ))
-        return
+        )
 
     container = discord.ui.Container(accent_colour=PROFILE_COLOR)
     container.add_item(discord.ui.TextDisplay(
-        f"## 🎭 Role rules\n-# {len(rules)} configured"
+        f"## 🎭 Role rewards\n-# {len(rules)} available"
     ))
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(
-        "\n\n".join(describe_rule(rule, ctx.guild) for rule in rules)
+        "\n\n".join(
+            describe_rule(rule, guild, admin=admin) for rule in rules
+        )
     ))
     container.add_item(discord.ui.Separator(
         visible=False, spacing=discord.SeparatorSpacing.small
     ))
-    container.add_item(discord.ui.TextDisplay(
-        "-# Remove: `!roles remove <rule ID>`\n"
-        "-# Add: `!roles add @Role map <map ID>` or "
-        "`!roles add @Role badge <badge ID>`"
-    ))
+    if admin:
+        footer = (
+            "-# Remove: `!roles remove <rule ID>`\n"
+            "-# Add: `!roles add @Role map <map ID>` or "
+            "`!roles add @Role badge <badge ID>`"
+        )
+    else:
+        footer = "-# Use `/sync` to update your roles."
+    container.add_item(discord.ui.TextDisplay(footer))
 
     note = dev_universe_note()
     if note:
@@ -3723,7 +3731,34 @@ async def admin_roles(ctx):
 
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
-    await ctx.send(view=view, allowed_mentions=SILENT)
+    return view
+
+@bot.tree.command(name="roles", description="View the server's Roblox role rewards")
+async def roles_slash_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command only works inside a server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    rules = await fetch_role_rules(interaction.guild.id)
+    view = build_role_rules_view(
+        rules,
+        interaction.guild,
+        admin=interaction.user.id == ADMIN_USER_ID,
+    )
+    await interaction.followup.send(view=view, allowed_mentions=SILENT)
+
+@bot.group(name="roles", hidden=True, invoke_without_command=True)
+@is_admin()
+async def admin_roles(ctx):
+    """Manage the role rules /sync applies."""
+    rules = await fetch_role_rules(ctx.guild.id)
+    await ctx.send(
+        view=build_role_rules_view(rules, ctx.guild, admin=True),
+        allowed_mentions=SILENT,
+    )
 
 @admin_roles.command(name="add")
 async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
@@ -3778,7 +3813,7 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
         ))
         return
     await ctx.send(view=simple_card(
-        describe_rule(state["rule"], ctx.guild),
+        describe_rule(state["rule"], ctx.guild, admin=True),
         heading="✅ Rule added",
     ), allowed_mentions=SILENT)
 
@@ -3809,7 +3844,7 @@ async def admin_roles_remove(ctx, rule_id: str):
         ))
         return
     await ctx.send(view=simple_card(
-        describe_rule(state["rule"], ctx.guild),
+        describe_rule(state["rule"], ctx.guild, admin=True),
         heading="🗑️ Rule removed",
         colour=discord.Color.orange(),
     ), allowed_mentions=SILENT)
