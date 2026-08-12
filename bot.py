@@ -192,10 +192,6 @@ class CardView(OwnedView, discord.ui.LayoutView):
     is kept and restored rather than rebuilt -- no refetching to go back.
     """
 
-    # How a button returning to this card is labelled.
-    card_label = "Back"
-    card_emoji = "↩️"
-
     def __init__(self, *, parent=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
         self.universe = current_universe()
@@ -208,9 +204,9 @@ class CardView(OwnedView, discord.ui.LayoutView):
         if self.parent is None:
             return None
         button = discord.ui.Button(
-            label=self.parent.card_label,
-            style=discord.ButtonStyle.secondary,
-            emoji=self.parent.card_emoji,
+            label="Back",
+            style=discord.ButtonStyle.danger,
+            emoji="↩️",
         )
         button.callback = self.go_back
         return button
@@ -1276,18 +1272,13 @@ async def get_community_maps():
     return by_id
 
 class BadgesCardView(CardView):
-    card_label = "Badges"
-    card_emoji = "🎖️"
+    pass
 
 class MapsCardView(CardView):
-    card_label = "Maps"
-    card_emoji = "🗺️"
+    pass
 
 class ProfileView(CardView):
     """Components V2 profile card built from a Main_Data entry."""
-
-    card_label = "Profile"
-    card_emoji = "👤"
 
     def __init__(self, entry, *, user_id, username, headshot=None, wins=None,
                  restriction=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
@@ -1587,9 +1578,6 @@ async def build_profile_view(user_id, username, parent=None):
 
 class MapView(CardView):
     """Components V2 map card with configurable action buttons."""
-
-    card_label = "Map"
-    card_emoji = "🗺️"
 
     def __init__(self, entry, *, headshot=None, creator_text="Unknown",
                  creator_id=None, creator_name=None, parent=None,
