@@ -1167,14 +1167,45 @@ async def send_cup_leaderboard(ctx, index, date_text):
 
     await ctx.send(embed=embed)
 
-@bot.hybrid_command(description="Show a daily cup leaderboard")
-@app_commands.describe(date="Cup date as DD/MM/YYYY. Defaults to today.")
-async def cup(ctx, date: str = None):
+@bot.hybrid_command(description="Show a daily cup leaderboard by date or index")
+@app_commands.describe(
+    date="Cup date as DD/MM/YYYY. Defaults to today.",
+    index="Daily Cup index",
+)
+async def cup(ctx, date: str = None, index: int = None):
     # The Roblox lookups take longer than the 3s interaction deadline.
     await ctx.defer()
 
     todays_map = await fetch_entry("TodaysMap") or {}
     current_index = todays_map.get("Index")
+
+    if date is not None and index is not None:
+        await ctx.send("Choose either a date or an index, not both.")
+        return
+
+    # Keep prefix usage convenient: `!cup 123` means index 123, while slash
+    # commands also expose a dedicated integer `index` option.
+    if date is not None:
+        try:
+            index = int(date.strip())
+        except ValueError:
+            pass
+        else:
+            date = None
+
+    if index is not None:
+        if index < 0:
+            await ctx.send("Cup index must be zero or greater.")
+            return
+
+        if isinstance(current_index, int):
+            cup_date = cup_day_today() + timedelta(days=index - current_index)
+            date_text = f"{cup_date:%d/%m/%Y}"
+        else:
+            date_text = f"Index {index}"
+
+        await send_cup_leaderboard(ctx, index, date_text)
+        return
 
     if date is not None:
         target = parse_cup_date(date)
