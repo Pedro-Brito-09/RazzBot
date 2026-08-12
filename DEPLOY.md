@@ -70,12 +70,19 @@ sudo tee /etc/razzbot.env >/dev/null <<'EOF'
 TOKEN=your_discord_bot_token_here
 API_KEY=your_roblox_open_cloud_api_key_here
 VERIFICATION_GAME_URL=https://www.roblox.com/games/start?placeId=120140749641241
+DAILY_CUP_CHANNEL_ID=your_discord_channel_id_here
 EOF
 sudo chown root:razzbot /etc/razzbot.env
 sudo chmod 640 /etc/razzbot.env
 ```
 
 Never commit this file. `.env` is gitignored.
+
+`DAILY_CUP_CHANNEL_ID` is the channel that receives the previous day's
+leaderboard and the new Daily Cup map card at **09:00 UTC** each day. Enable
+Discord Developer Mode, right-click the destination channel, and choose
+**Copy Channel ID**. The bot needs View Channel, Send Messages, Embed Links,
+and Use External Emojis permissions there.
 
 The Open Cloud API key needs read, create, and update access to the
 `AccountLinking` data store in addition to the bot's existing data-store access.

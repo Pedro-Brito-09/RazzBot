@@ -1,6 +1,6 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import aiohttp
 import json
@@ -14,7 +14,7 @@ import secrets
 import string
 import time
 from urllib.parse import quote
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 
 # aiohttp's default UA ("Python/3.x aiohttp/3.x") appears to get blackholed by
 # Roblox's edge: requests that work instantly under curl never return headers.
@@ -76,6 +76,11 @@ PLAY_URL_TEMPLATE = (
     "https://www.roblox.com/games/start"
     "?placeId=86832525327994&launchData=Map%2F{id}"
 )
+# Daily Cup announcements use the cup experience rather than Challenge Mode.
+DAILY_CUP_PLAY_URL_TEMPLATE = (
+    "https://www.roblox.com/games/start"
+    "?placeId=133478407190616&launchData=Map%2F{id}"
+)
 # A community map's leaderboard is keyed by the map ID on its own.
 MAP_LEADERBOARD_KEY = "{id}"
 # How long the Leaderboard button stays clickable.
@@ -96,6 +101,9 @@ VERIFICATION_GAME_URL = os.getenv(
 # Optional: also sync a guild-only test copy so changes appear instantly there.
 # Global commands are always synced because user installs only support them.
 GUILD_ID = os.getenv("GUILD_ID")
+# Channel that receives the previous leaderboard and new map every day at the
+# Daily Cup rollover (09:00 UTC, matching cup_day_today()).
+DAILY_CUP_CHANNEL_ID = os.getenv("DAILY_CUP_CHANNEL_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1158,7 +1166,9 @@ class MapView(discord.ui.LayoutView):
     """Components V2 map card: details, creator headshot, and two buttons."""
 
     def __init__(self, entry, *, headshot=None, creator_text="Unknown",
-                 creator_id=None, creator_name=None, timeout=MAP_VIEW_TIMEOUT):
+                 creator_id=None, creator_name=None, timeout=MAP_VIEW_TIMEOUT,
+                 play_label="Play in Challenge Mode",
+                 play_url_template=PLAY_URL_TEMPLATE):
         super().__init__(timeout=timeout)
         self.entry = entry
         self.message = None
@@ -1213,9 +1223,9 @@ class MapView(discord.ui.LayoutView):
         row = discord.ui.ActionRow()
         if privacy != "Private":
             row.add_item(discord.ui.Button(
-                label="Play in Challenge Mode",
+                label=play_label,
                 style=discord.ButtonStyle.link,
-                url=PLAY_URL_TEMPLATE.format(id=map_id),
+                url=play_url_template.format(id=map_id),
                 emoji="▶️",
             ))
         leaderboard_button = discord.ui.Button(
@@ -1372,10 +1382,126 @@ async def build_map_leaderboard_embed(map_id, map_name):
         subtitle=f"Map #{map_id}",
     )
 
+async def build_map_card(entry, **view_options):
+    """Resolve a map creator and build the same card used by /map."""
+    creator_id = entry.get("Creator")
+    creator = await fetch_username(creator_id) if creator_id else None
+    if creator:
+        creator_text = f"@{creator}"
+    elif creator_id:
+        creator_text = f"User {creator_id}"
+    else:
+        creator_text = "Unknown"
+
+    headshot = None
+    if creator_id:
+        headshot = (await fetch_headshots([creator_id])).get(creator_id)
+
+    return MapView(
+        entry,
+        headshot=headshot,
+        creator_text=creator_text,
+        creator_id=creator_id,
+        creator_name=creator,
+        **view_options,
+    )
+
+async def publish_daily_cup_announcement():
+    """Post yesterday's cup leaderboard, followed by today's map card."""
+    try:
+        channel_id = int(DAILY_CUP_CHANNEL_ID)
+    except (TypeError, ValueError):
+        print("Daily Cup announcement skipped: invalid DAILY_CUP_CHANNEL_ID")
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(channel_id)
+
+    todays_map = await fetch_entry("TodaysMap") or {}
+    current_index = todays_map.get("Index")
+    map_id = todays_map.get("Id")
+    if not isinstance(current_index, int) or map_id is None:
+        print("Daily Cup announcement skipped: TodaysMap has no Index or Id")
+        return
+
+    previous_index = current_index - 1
+    previous_date = cup_day_today() - timedelta(days=1)
+    previous_leaderboard, previous_map_id, maps_by_id = await asyncio.gather(
+        fetch_entry(
+            f"DailyCup_{previous_index}", datastore="Leaderboards"
+        ),
+        get_cup_map_id(previous_index, todays_map),
+        get_community_maps(),
+    )
+
+    leaderboard_embed = await build_leaderboard_embed(
+        previous_leaderboard,
+        title=f"🏆 Leaderboard — {previous_date:%d/%m/%Y}",
+        subtitle=f"Daily Cup #{previous_index}",
+        show_medals=True,
+        show_country=True,
+    )
+    if leaderboard_embed is None:
+        print(
+            "Daily Cup announcement skipped: no leaderboard for "
+            f"DailyCup_{previous_index}"
+        )
+        return
+
+    if previous_map_id is not None:
+        entry_count = leaderboard_embed.footer.text
+        map_footer = f"Map ID: {previous_map_id}"
+        leaderboard_embed.set_footer(
+            text=f"{entry_count}  ·  {map_footer}" if entry_count else map_footer
+        )
+
+    if not maps_by_id:
+        print("Daily Cup announcement skipped: community maps are unavailable")
+        return
+    try:
+        lookup_id = int(map_id)
+    except (TypeError, ValueError):
+        lookup_id = map_id
+    entry = maps_by_id.get(lookup_id)
+    if entry is None:
+        print(f"Daily Cup announcement skipped: map {map_id} was not found")
+        return
+
+    map_view = await build_map_card(
+        entry,
+        play_label="Play",
+        play_url_template=DAILY_CUP_PLAY_URL_TEMPLATE,
+    )
+
+    # Preserve the requested order: completed cup first, new cup second.
+    await channel.send(embed=leaderboard_embed)
+    map_view.message = await channel.send(view=map_view)
+    print(
+        f"Posted Daily Cup #{previous_index} results and "
+        f"Daily Cup #{current_index} map {map_id} to channel {channel_id}"
+    )
+
+@tasks.loop(time=datetime_time(hour=9, minute=0, tzinfo=timezone.utc))
+async def daily_cup_announcement():
+    try:
+        await publish_daily_cup_announcement()
+    except Exception:
+        print("Daily Cup announcement failed:")
+        traceback.print_exc()
+
+@daily_cup_announcement.before_loop
+async def before_daily_cup_announcement():
+    await bot.wait_until_ready()
+
 @bot.event
 async def on_ready():
     global _synced
     print(f"Logged in as {bot.user}")
+
+    if DAILY_CUP_CHANNEL_ID and not daily_cup_announcement.is_running():
+        daily_cup_announcement.start()
+        print("Daily Cup announcements scheduled for 09:00 UTC")
 
     # on_ready fires again on every reconnect; only sync once per process.
     if _synced:
