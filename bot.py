@@ -2793,16 +2793,17 @@ async def help_command(ctx):
         await ctx.send(view=admin_view)
 
 def summarize_sync(added, removed, blocked):
-    parts = []
+    lines = []
     if added:
-        parts.append("+ " + ", ".join(r.name for r in added))
+        lines.append("➕ " + ", ".join(r.mention for r in added))
     if removed:
-        parts.append("− " + ", ".join(r.name for r in removed))
-    if not parts:
-        parts.append("already up to date")
+        lines.append("➖ " + ", ".join(r.mention for r in removed))
+    if not lines:
+        lines.append("-# Already up to date — nothing changed.")
     if blocked:
-        parts.append(f"⚠️ {len(blocked)} role(s) I can't manage")
-    return "  ·  ".join(parts)
+        lines.append(f"-# ⚠️ {len(blocked)} role(s) I can't manage: "
+                     + ", ".join(f"`{r}`" for r in blocked))
+    return "\n".join(lines)
 
 @bot.hybrid_command(name="sync", description="Update your roles from your Roblox progress")
 @app_commands.describe(
@@ -2810,19 +2811,25 @@ def summarize_sync(added, removed, blocked):
 )
 async def sync_command(ctx, *, target: str = None):
     if ctx.guild is None:
-        await ctx.send("This only works inside a server.")
+        await ctx.send(view=simple_card("This only works inside a server.",
+                                        colour=discord.Color.red()))
         return
 
     await ctx.defer()
 
     is_admin_user = ctx.author.id == ADMIN_USER_ID
     if target and not is_admin_user:
-        await ctx.send("Only an admin can sync someone else.")
+        await ctx.send(view=simple_card("Only an admin can sync someone else.",
+                                        colour=discord.Color.red()))
         return
 
     rules = await fetch_role_rules(ctx.guild.id)
     if not rules:
-        await ctx.send("No role rules are configured for this server.")
+        await ctx.send(view=simple_card(
+            "No role rules are configured for this server.\n"
+            "-# `!roles add <@role> badge <id>` to make one.",
+            colour=discord.Color.greyple(),
+        ))
         return
 
     map_cache = {}
@@ -2849,17 +2856,21 @@ async def sync_command(ctx, *, target: str = None):
             if added or removed:
                 changed += 1
 
-        await ctx.send(
-            f"🔄 Synced **{synced}** member(s), **{changed}** changed."
+        await ctx.send(view=simple_card(
+            f"**{synced}** member(s) synced  ·  **{changed}** changed"
             + (f"\n-# {skipped} skipped — not in this server, or I couldn't "
-               f"edit their roles." if skipped else "")
-        )
+               f"edit their roles." if skipped else ""),
+            heading="🔄 Sync complete",
+        ))
         return
 
     if target:
         member = await find_discord_user(ctx, target)
         if member is None or ctx.guild.get_member(member.id) is None:
-            await ctx.send(f"Couldn't find `{target.strip()}` in this server.")
+            await ctx.send(view=simple_card(
+                f"Couldn't find `{target.strip()}` in this server.",
+                colour=discord.Color.red(),
+            ))
             return
         member = ctx.guild.get_member(member.id)
     else:
@@ -2868,7 +2879,10 @@ async def sync_command(ctx, *, target: str = None):
     roblox_id = await fetch_linked_user_id(member.id)
     if roblox_id is None:
         who = "You haven't" if member.id == ctx.author.id else f"**{member}** hasn't"
-        await ctx.send(f"{who} linked a Roblox account. Use `/link` first.")
+        await ctx.send(view=simple_card(
+            f"{who} linked a Roblox account. Use `/link` first.",
+            colour=discord.Color.greyple(),
+        ))
         return
 
     try:
@@ -2876,14 +2890,40 @@ async def sync_command(ctx, *, target: str = None):
             member, roblox_id, rules, map_cache=map_cache
         )
     except discord.Forbidden:
-        await ctx.send("I don't have permission to edit those roles.")
+        await ctx.send(view=simple_card(
+            "I don't have permission to edit those roles.",
+            colour=discord.Color.red(),
+        ))
         return
 
-    name = await fetch_username(roblox_id) or roblox_id
-    await ctx.send(
-        f"🔄 Synced **{member}** (Roblox: **{name}**)\n"
-        f"-# {summarize_sync(added, removed, blocked)}"
+    name, headshots = await asyncio.gather(
+        fetch_username(roblox_id), fetch_headshots([roblox_id])
     )
+    heading = (f"## 🔄 Roles synced\n"
+               f"{member.mention}  ·  🎮 **{name or roblox_id}**")
+
+    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+    headshot = headshots.get(roblox_id)
+    if headshot:
+        container.add_item(discord.ui.Section(
+            discord.ui.TextDisplay(heading),
+            accessory=discord.ui.Thumbnail(media=headshot),
+        ))
+    else:
+        container.add_item(discord.ui.TextDisplay(heading))
+
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        summarize_sync(added, removed, blocked)
+    ))
+
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await ctx.send(view=view, allowed_mentions=SILENT)
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
@@ -3396,6 +3436,25 @@ async def admin_lookup(ctx, *, query: str):
     view.add_item(container)
     await ctx.send(view=view)
 
+def simple_card(text, *, colour=PROFILE_COLOR, heading=None):
+    """A one-block Components V2 card, for short replies."""
+    container = discord.ui.Container(accent_colour=colour)
+    if heading:
+        container.add_item(discord.ui.TextDisplay(f"## {heading}"))
+        container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(text))
+
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+# Role mentions render inside a card, so keep them from pinging.
+SILENT = discord.AllowedMentions.none()
+
 def describe_rule(rule, guild):
     role = guild.get_role(rule["role"]) if guild else None
     role_text = role.mention if role else f"`{rule['role']}` (deleted?)"
@@ -3411,34 +3470,55 @@ async def admin_roles(ctx):
     """Manage the role rules /sync applies."""
     rules = await fetch_role_rules(ctx.guild.id)
     if not rules:
-        await ctx.send(
-            "No role rules yet.\n"
-            "-# `!roles add <@role> badge <badge_id>` or "
-            "`!roles add <@role> map <map_id>`"
-        )
+        await ctx.send(view=simple_card(
+            "No rules yet.\n"
+            "-# `!roles add <@role> badge <badge_id>`\n"
+            "-# `!roles add <@role> map <map_id>`",
+            heading="🎭 Role rules",
+            colour=discord.Color.greyple(),
+        ))
         return
 
-    lines = "\n".join(describe_rule(rule, ctx.guild) for rule in rules)
-    await ctx.send(
-        f"**Role rules** ({len(rules)})\n{lines}\n"
-        f"-# `!roles remove <id>` to delete one",
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## 🎭 Role rules\n-# {len(rules)} configured"
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        "\n".join(describe_rule(rule, ctx.guild) for rule in rules)
+    ))
+    container.add_item(discord.ui.Separator(
+        visible=False, spacing=discord.SeparatorSpacing.small
+    ))
+    container.add_item(discord.ui.TextDisplay(
+        "-# `!roles remove <id>` to delete one"
+    ))
+
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await ctx.send(view=view, allowed_mentions=SILENT)
 
 @admin_roles.command(name="add")
 async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
     """!roles add <@role> <badge|map> <id>"""
     kind = condition.strip().lower()
     if kind not in ROLE_CONDITIONS:
-        await ctx.send(f"Condition must be one of: {', '.join(ROLE_CONDITIONS)}.")
+        await ctx.send(view=simple_card(
+            f"Condition must be one of: {', '.join(ROLE_CONDITIONS)}.",
+            colour=discord.Color.red(),
+        ))
         return
 
     if manageable_role(ctx.guild, role.id) is None:
-        await ctx.send(
+        await ctx.send(view=simple_card(
             f"I can't manage {role.mention} — it's above me in the role list, "
             f"or I'm missing Manage Roles.",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+            colour=discord.Color.red(),
+        ), allowed_mentions=SILENT)
         return
 
     state = {"duplicate": False, "rule": None}
@@ -3463,15 +3543,19 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
         result = await save_role_rules(ctx.guild.id, mutate)
 
     if state["duplicate"]:
-        await ctx.send("That exact rule already exists.")
+        await ctx.send(view=simple_card("That exact rule already exists.",
+                                        colour=discord.Color.greyple()))
         return
     if result != "ok":
-        await ctx.send(f"Couldn't save the rule ({result}). Check the logs.")
+        await ctx.send(view=simple_card(
+            f"Couldn't save the rule ({result}). Check the logs.",
+            colour=discord.Color.red(),
+        ))
         return
-    await ctx.send(
-        f"✅ Added {describe_rule(state['rule'], ctx.guild)}",
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    await ctx.send(view=simple_card(
+        describe_rule(state["rule"], ctx.guild),
+        heading="✅ Rule added",
+    ), allowed_mentions=SILENT)
 
 @admin_roles.command(name="remove")
 async def admin_roles_remove(ctx, rule_id: str):
@@ -3490,15 +3574,20 @@ async def admin_roles_remove(ctx, rule_id: str):
         result = await save_role_rules(ctx.guild.id, mutate)
 
     if state["rule"] is None:
-        await ctx.send(f"No rule with ID `{wanted}`.")
+        await ctx.send(view=simple_card(f"No rule with ID `{wanted}`.",
+                                        colour=discord.Color.red()))
         return
     if result != "ok":
-        await ctx.send(f"Couldn't save the change ({result}). Check the logs.")
+        await ctx.send(view=simple_card(
+            f"Couldn't save the change ({result}). Check the logs.",
+            colour=discord.Color.red(),
+        ))
         return
-    await ctx.send(
-        f"🗑️ Removed {describe_rule(state['rule'], ctx.guild)}",
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    await ctx.send(view=simple_card(
+        describe_rule(state["rule"], ctx.guild),
+        heading="🗑️ Rule removed",
+        colour=discord.Color.orange(),
+    ), allowed_mentions=SILENT)
 
 @bot.command(name="testcup", hidden=True)
 @commands.is_owner()
