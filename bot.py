@@ -2962,6 +2962,161 @@ async def admin_delete_map(ctx, map_id: int):
     view = DeleteMapView(entry, headshot=headshot, creator_text=creator_text)
     view.message = await ctx.send(view=view)
 
+async def find_discord_user(ctx, query):
+    """Resolve a Discord mention, ID, or username to a user."""
+    cleaned = query.strip()
+    mention = re.fullmatch(r"<@!?(\d+)>", cleaned)
+    if mention:
+        cleaned = mention.group(1)
+
+    if cleaned.isdigit():
+        user = bot.get_user(int(cleaned))
+        if user is not None:
+            return user
+        try:
+            return await bot.fetch_user(int(cleaned))
+        except discord.HTTPException:
+            return None
+
+    name = cleaned.lstrip("@").lower()
+    if ctx.guild is not None:
+        # query_members goes over the gateway, so it works without the
+        # privileged members intent.
+        try:
+            found = await ctx.guild.query_members(query=name, limit=10)
+        except (discord.HTTPException, asyncio.TimeoutError):
+            found = []
+        for member in found:
+            if name in (member.name.lower(), member.display_name.lower()):
+                return member
+        if found:
+            return found[0]
+
+    return discord.utils.find(lambda u: u.name.lower() == name, bot.users)
+
+async def resolve_lookup(ctx, query):
+    """Work out who a query refers to, on either side of a link.
+
+    Returns (roblox_id, roblox_name, discord_user, source) where source
+    names how the query was read.
+    """
+    linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
+    linked = linked if isinstance(linked, dict) else {}
+
+    # Linked maps Discord account -> Roblox user, so invert it for the
+    # other direction.
+    by_roblox = {}
+    for account_id, user_id in linked.items():
+        try:
+            by_roblox[int(user_id)] = int(account_id)
+        except (TypeError, ValueError):
+            continue
+
+    cleaned = query.strip()
+    roblox_id = roblox_name = None
+    account_id = None
+    source = None
+
+    if cleaned.isdigit():
+        number = int(cleaned)
+        if cleaned in linked:
+            account_id, source = number, "Discord ID"
+            roblox_id = int(linked[cleaned])
+        elif number in by_roblox:
+            roblox_id, source = number, "Roblox ID"
+            account_id = by_roblox[number]
+        else:
+            # Unlinked: decide which side it is by asking Roblox first.
+            roblox_name = await fetch_username(number)
+            if roblox_name:
+                roblox_id, source = number, "Roblox ID"
+            else:
+                account_id, source = number, "Discord ID"
+    else:
+        roblox_id, roblox_name = await fetch_user_id(cleaned.lstrip("@"))
+        if roblox_id is not None:
+            source = "Roblox username"
+            account_id = by_roblox.get(int(roblox_id))
+        else:
+            discord_user = await find_discord_user(ctx, cleaned)
+            if discord_user is None:
+                return None, None, None, None
+            account_id, source = discord_user.id, "Discord username"
+            raw = linked.get(str(discord_user.id))
+            roblox_id = int(raw) if raw is not None else None
+
+    if roblox_id is not None and not roblox_name:
+        roblox_name = await fetch_username(roblox_id)
+
+    discord_user = None
+    if account_id is not None:
+        discord_user = bot.get_user(account_id)
+        if discord_user is None:
+            try:
+                discord_user = await bot.fetch_user(account_id)
+            except discord.HTTPException:
+                discord_user = None
+
+    return roblox_id, roblox_name, discord_user or account_id, source
+
+@bot.command(name="lookup", hidden=True)
+@is_admin()
+async def admin_lookup(ctx, *, query: str):
+    """Find the linked Roblox and Discord accounts behind any ID or username."""
+    async with ctx.typing():
+        roblox_id, roblox_name, discord_side, source = await resolve_lookup(ctx, query)
+
+        if roblox_id is None and discord_side is None:
+            await ctx.send(f"Couldn't find anyone matching `{query.strip()}`.")
+            return
+
+        headshot = None
+        if roblox_id is not None:
+            headshot = (await fetch_headshots([roblox_id])).get(roblox_id)
+
+    if isinstance(discord_side, int):
+        discord_line = f"`{discord_side}`\n-# account not reachable"
+        account_id = discord_side
+    elif discord_side is not None:
+        discord_line = f"{discord_side.mention} · **{discord_side}**\n-# `{discord_side.id}`"
+        account_id = discord_side.id
+    else:
+        discord_line = "-# not linked"
+        account_id = None
+
+    if roblox_id is not None:
+        roblox_line = f"**{roblox_name or 'Unknown'}**\n-# `{roblox_id}`"
+    else:
+        roblox_line = "-# not linked"
+
+    linked_both = roblox_id is not None and account_id is not None
+    heading = ("## 🔗 Linked accounts" if linked_both
+               else "## 🔎 Lookup\n-# these accounts are not linked")
+
+    container = discord.ui.Container(
+        accent_colour=PROFILE_COLOR if linked_both else discord.Color.greyple()
+    )
+    body = discord.ui.TextDisplay(
+        f"{heading}\n\n"
+        f"🎮 **Roblox**\n{roblox_line}\n\n"
+        f"💬 **Discord**\n{discord_line}"
+    )
+    if headshot:
+        container.add_item(discord.ui.Section(
+            body, accessory=discord.ui.Thumbnail(media=headshot)
+        ))
+    else:
+        container.add_item(body)
+
+    container.add_item(discord.ui.TextDisplay(f"-# matched by {source}"))
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await ctx.send(view=view)
+
 @bot.command(name="testcup", hidden=True)
 @commands.is_owner()
 async def test_cup_announcement(ctx):
