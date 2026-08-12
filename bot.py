@@ -334,6 +334,35 @@ def parse_cup_date(text):
     except (ValueError, AttributeError):
         return None
 
+async def get_cup_map_id(index, todays_map):
+    """Resolve a cup index to its map, anchored to the current rotation."""
+    current_index = todays_map.get("Index") if isinstance(todays_map, dict) else None
+    current_id = todays_map.get("Id") if isinstance(todays_map, dict) else None
+    if index == current_index and current_id is not None:
+        return current_id
+
+    submissions = await fetch_entry("Submissions")
+    if not isinstance(submissions, list):
+        return None
+
+    accepted = [
+        submission for submission in submissions
+        if isinstance(submission, dict)
+        and submission.get("Status") == "Accepted"
+        and submission.get("Id") is not None
+    ]
+    if not accepted:
+        return None
+
+    accepted.sort(key=lambda submission: submission.get("Timestamp", 0))
+    map_ids = [submission["Id"] for submission in accepted]
+
+    if isinstance(current_index, int) and current_id in map_ids:
+        current_position = map_ids.index(current_id)
+        return map_ids[(current_position + index - current_index) % len(map_ids)]
+
+    return map_ids[index % len(map_ids)]
+
 def format_time(time_value):
     minutes = (time_value / 60) % 60
     seconds = time_value % 60
@@ -1147,9 +1176,12 @@ async def on_command_error(ctx, error):
     else:
         await ctx.send(message)
 
-async def send_cup_leaderboard(ctx, index, date_text):
+async def send_cup_leaderboard(ctx, index, date_text, *, todays_map=None):
     """Post one cup's leaderboard, or explain why it isn't there."""
-    leaderboard = await fetch_entry(f"DailyCup_{index}", datastore="Leaderboards")
+    leaderboard, map_id = await asyncio.gather(
+        fetch_entry(f"DailyCup_{index}", datastore="Leaderboards"),
+        get_cup_map_id(index, todays_map or {}),
+    )
     if not leaderboard:
         await ctx.send(f"No leaderboard found for `DailyCup_{index}` ({date_text}).")
         return
@@ -1164,6 +1196,13 @@ async def send_cup_leaderboard(ctx, index, date_text):
     if embed is None:
         await ctx.send("The leaderboard came back empty.")
         return
+
+    if map_id is not None:
+        entry_count = embed.footer.text
+        map_footer = f"Map ID: {map_id}"
+        embed.set_footer(
+            text=f"{entry_count}  ·  {map_footer}" if entry_count else map_footer
+        )
 
     await ctx.send(embed=embed)
 
@@ -1204,7 +1243,9 @@ async def cup(ctx, date: str = None, index: int = None):
         else:
             date_text = f"Index {index}"
 
-        await send_cup_leaderboard(ctx, index, date_text)
+        await send_cup_leaderboard(
+            ctx, index, date_text, todays_map=todays_map
+        )
         return
 
     if date is not None:
@@ -1230,14 +1271,18 @@ async def cup(ctx, date: str = None, index: int = None):
             )
             return
 
-        await send_cup_leaderboard(ctx, index, f"{target:%d/%m/%Y}")
+        await send_cup_leaderboard(
+            ctx, index, f"{target:%d/%m/%Y}", todays_map=todays_map
+        )
         return
 
     if current_index is None:
         await ctx.send("No daily cup index set, so there's no leaderboard to show.")
         return
 
-    await send_cup_leaderboard(ctx, current_index, get_todays_date())
+    await send_cup_leaderboard(
+        ctx, current_index, get_todays_date(), todays_map=todays_map
+    )
 
 @bot.hybrid_command(name="maps", description="Show a player's public community maps")
 @app_commands.describe(username="Roblox username")
