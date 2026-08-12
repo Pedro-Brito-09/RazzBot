@@ -145,6 +145,22 @@ def dev_universe_note():
     if not on_dev_universe():
         return None
     return f"-# 🧪 test universe `{current_universe()}` — not the live game"
+
+def keeps_universe(method):
+    """Restore the view's universe for the duration of a component callback.
+
+    A button runs in its own task long after the command returned, by which
+    point the ContextVar has reset -- so without this, the buttons on a
+    !dev_ card would quietly query the live universe.
+    """
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        token = _active_universe.set(getattr(self, "universe", None))
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            _active_universe.reset(token)
+    return wrapper
 _account_link_lock = asyncio.Lock()
 _link_code_expirations = {}
 _link_code_tasks = {}
@@ -1183,6 +1199,7 @@ class ProfileView(discord.ui.LayoutView):
     def __init__(self, entry, *, user_id, username, headshot=None, wins=None,
                  restriction=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
+        self.universe = current_universe()
         self.user_id = user_id
         self.username = username
         self.message = None
@@ -1301,6 +1318,7 @@ class ProfileView(discord.ui.LayoutView):
 
         self.add_item(container)
 
+    @keeps_universe
     async def show_badges(self, interaction):
         await interaction.response.defer(thinking=True)
 
@@ -1313,6 +1331,7 @@ class ProfileView(discord.ui.LayoutView):
 
         await interaction.followup.send(view=view)
 
+    @keeps_universe
     async def show_created_maps(self, interaction):
         await interaction.response.defer(thinking=True)
 
@@ -1350,8 +1369,12 @@ async def build_badges_view(user_id, username):
         f"## 🎖️ Badges — {username}\n-# {len(owned)} of {len(badges)} earned"
     ))
 
+    dev_note = dev_universe_note()
+
     if not owned:
         container.add_item(discord.ui.TextDisplay("-# No badges earned yet."))
+        if dev_note:
+            container.add_item(discord.ui.TextDisplay(dev_note))
         view.add_item(container)
         return view
 
@@ -1398,6 +1421,9 @@ async def build_badges_view(user_id, username):
             "\n".join(f"✅ **{badge_name(b)}**" for b in owned)
         ))
 
+    if dev_note:
+        container.add_item(discord.ui.TextDisplay(dev_note))
+
     view.add_item(container)
     return view
 
@@ -1439,6 +1465,10 @@ async def build_created_maps_view(user_id, username, limit=10):
             f"-# and {len(owned) - limit} more"
         ))
 
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
     view.add_item(container)
     return view
 
@@ -1468,6 +1498,7 @@ class MapView(discord.ui.LayoutView):
                  play_url_template=PLAY_URL_TEMPLATE,
                  show_leaderboard=True, show_creator=True):
         super().__init__(timeout=timeout)
+        self.universe = current_universe()
         self.entry = entry
         self.message = None
         self.creator_id = creator_id
@@ -1555,6 +1586,7 @@ class MapView(discord.ui.LayoutView):
 
         self.add_item(container)
 
+    @keeps_universe
     async def show_leaderboard(self, interaction):
         await interaction.response.defer(thinking=True)
 
@@ -1573,6 +1605,7 @@ class MapView(discord.ui.LayoutView):
         # it came from is Components V2.
         await interaction.followup.send(embed=embed)
 
+    @keeps_universe
     async def show_creator_profile(self, interaction):
         await interaction.response.defer(thinking=True)
 
@@ -1979,6 +2012,7 @@ async def send_cup_leaderboard(ctx, index, date_text, *, todays_map=None):
 class AccountLinkView(discord.ui.View):
     def __init__(self, account_id, code, expires_at):
         super().__init__(timeout=900)
+        self.universe = current_universe()
         self.account_id = account_id
         self.code = code
         self.expires_at = expires_at
@@ -1995,6 +2029,7 @@ class AccountLinkView(discord.ui.View):
         style=discord.ButtonStyle.success,
         emoji="✅",
     )
+    @keeps_universe
     async def confirm(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
