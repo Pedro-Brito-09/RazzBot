@@ -69,9 +69,10 @@ EMPTY_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
 # and the summary shown when more badges were earned.
 MAX_BADGE_GALLERIES = 3
 
-# Roblox client deep link for challenge mode on a community map.
+# Roblox game URL for challenge mode on a community map.
 PLAY_URL_TEMPLATE = (
-    "roblox://experiences/start?placeId=86832525327994&launchData=Map%2F{id}"
+    "https://www.roblox.com/games/86832525327994/Party-Chaos"
+    "?start=true&launchData=Map%2F{id}"
 )
 # A community map's leaderboard is keyed by the map ID on its own.
 MAP_LEADERBOARD_KEY = "{id}"
