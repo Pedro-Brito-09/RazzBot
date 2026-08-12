@@ -300,26 +300,38 @@ async def request_json(url, headers=None, label="", json_body=None, method=None)
             await asyncio.sleep(2 * attempt)
     return None
 
-def decode_buffer(value):
-    compressed = base64.b64decode(value)
+def decode_buffer(value, *, compressed=True):
+    decoded_bytes = base64.b64decode(value)
+    if not compressed:
+        try:
+            return json.loads(decoded_bytes)
+        except Exception:
+            return decoded_bytes
+
     dctx = zstd.ZstdDecompressor()
     try:
-        decoded_bytes = dctx.decompress(compressed)
+        decoded_bytes = dctx.decompress(decoded_bytes)
     except zstd.ZstdError:
         # Frames written without the content size in the header can't be
         # decompressed one-shot; stream them instead.
-        decoded_bytes = dctx.stream_reader(io.BytesIO(compressed)).read()
+        decoded_bytes = dctx.stream_reader(io.BytesIO(decoded_bytes)).read()
     try:
         return json.loads(decoded_bytes)
     except Exception:
         return decoded_bytes
 
+def buffer_encoding_field(value):
+    """Return Roblox's raw or compressed buffer payload field."""
+    if not isinstance(value, dict):
+        return None
+    if isinstance(value.get("zbase64"), str):
+        return "zbase64"
+    if isinstance(value.get("base64"), str):
+        return "base64"
+    return None
+
 def is_buffer_value(value):
-    """Recognize Roblox's buffer envelope regardless of its type marker."""
-    return (
-        isinstance(value, dict)
-        and isinstance(value.get("zbase64"), str)
-    )
+    return buffer_encoding_field(value) is not None
 
 async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
     # Datastore names contain spaces ("Daily Cup Submissions"), so encode
@@ -554,27 +566,34 @@ async def update_entry_resource(
         return "error"
 
 def decode_entry_value(value):
-    if is_buffer_value(value):
-        return decode_buffer(value["zbase64"])
+    encoding_field = buffer_encoding_field(value)
+    if encoding_field is not None:
+        return decode_buffer(
+            value[encoding_field], compressed=encoding_field == "zbase64"
+        )
     return value
 
 def encode_entry_value(original, new_value):
     """Re-encode a value in whatever envelope the entry already used.
 
-    Community Maps and the leaderboards are stored as zstd-compressed
-    buffers, so writing plain JSON back would make them unreadable.
+    Roblox may return buffers as raw `base64` or compressed `zbase64`.
+    Preserve that choice so in-game buffer.tostring keeps working.
     """
-    if is_buffer_value(original):
+    encoding_field = buffer_encoding_field(original)
+    if encoding_field is not None:
         raw = json.dumps(new_value, separators=(",", ":"),
                          ensure_ascii=False).encode("utf-8")
-        compressed = zstd.ZstdCompressor().compress(raw)
+        encoded = (
+            zstd.ZstdCompressor().compress(raw)
+            if encoding_field == "zbase64" else raw
+        )
         # Keep Roblox's exact discriminator and any non-null metadata. Its
         # buffer type marker is not consistently the literal string "buffer".
         envelope = {
             key: value for key, value in original.items()
-            if key != "zbase64" and value is not None
+            if key not in ("base64", "zbase64") and value is not None
         }
-        envelope["zbase64"] = base64.b64encode(compressed).decode("ascii")
+        envelope[encoding_field] = base64.b64encode(encoded).decode("ascii")
         return envelope
     return new_value
 
