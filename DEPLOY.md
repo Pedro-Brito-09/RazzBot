@@ -69,7 +69,7 @@ sudo -u razzbot /opt/razzbot/.venv/bin/pip install --no-cache-dir -r /opt/razzbo
 sudo tee /etc/razzbot.env >/dev/null <<'EOF'
 TOKEN=your_discord_bot_token_here
 API_KEY=your_roblox_open_cloud_api_key_here
-VERIFICATION_GAME_URL=https://www.roblox.com/games/your_verification_place_id
+VERIFICATION_GAME_URL=https://www.roblox.com/games/start?placeId=120140749641241
 EOF
 sudo chown root:razzbot /etc/razzbot.env
 sudo chmod 640 /etc/razzbot.env

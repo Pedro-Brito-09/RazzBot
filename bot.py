@@ -88,7 +88,10 @@ ACCOUNT_LINK_DATASTORE = "AccountLinking"
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
-VERIFICATION_GAME_URL = os.getenv("VERIFICATION_GAME_URL")
+VERIFICATION_GAME_URL = os.getenv(
+    "VERIFICATION_GAME_URL",
+    "https://www.roblox.com/games/start?placeId=120140749641241",
+)
 # Optional: also sync a guild-only test copy so changes appear instantly there.
 # Global commands are always synced because user installs only support them.
 GUILD_ID = os.getenv("GUILD_ID")
