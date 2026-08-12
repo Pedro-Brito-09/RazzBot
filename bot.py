@@ -84,6 +84,7 @@ MAP_VIEW_TIMEOUT = 900
 MAX_NAME_WIDTH = 18
 LINK_CODE_LENGTH = 8
 LINK_CODE_ALPHABET = string.ascii_uppercase + string.digits
+LINK_CODE_TTL = 5 * 60
 ACCOUNT_LINK_DATASTORE = "AccountLinking"
 
 TOKEN = os.getenv("TOKEN")
@@ -110,6 +111,8 @@ bot = commands.Bot(
 _synced = False
 _session = None
 _account_link_lock = asyncio.Lock()
+_link_code_expirations = {}
+_link_code_tasks = {}
 
 async def get_session():
     """One shared session for the process, built lazily on the running loop."""
@@ -273,15 +276,73 @@ def find_account_code(codes, account_id):
             return code
     return None
 
+async def delete_link_code(code, account_id):
+    """Delete a code only if it still maps to the expected Discord account."""
+    async with _account_link_lock:
+        for _ in range(MAX_ATTEMPTS):
+            fetch_status, resource = await fetch_entry_resource(
+                "Codes", ACCOUNT_LINK_DATASTORE
+            )
+            if fetch_status == "missing":
+                return "absent"
+            if fetch_status == "error":
+                return "error"
+
+            codes = decode_entry_value(resource.get("value"))
+            if not isinstance(codes, dict):
+                return "absent"
+            if str(codes.get(code)) != str(account_id):
+                return "absent"
+
+            del codes[code]
+            result = await update_entry_resource(
+                "Codes", ACCOUNT_LINK_DATASTORE, codes,
+                etag=resource.get("etag"),
+            )
+            if result == "ok":
+                return "deleted"
+            if result != "conflict":
+                return "error"
+
+        return "error"
+
+async def expire_link_code(code, account_id, expires_at):
+    delay = max(0, expires_at - time.time())
+    await asyncio.sleep(delay)
+
+    # Keep retrying temporary Open Cloud failures after expiry. The guarded
+    # delete cannot remove a replacement code or another user's code.
+    while True:
+        result = await delete_link_code(code, account_id)
+        if result in ("deleted", "absent"):
+            break
+        await asyncio.sleep(30)
+
+    _link_code_expirations.pop(code, None)
+    _link_code_tasks.pop(code, None)
+
+def ensure_link_code_expiry(code, account_id, expires_at=None):
+    """Return a code's Unix expiry and ensure its cleanup task is running."""
+    existing_expiry = _link_code_expirations.get(code)
+    if existing_expiry is not None:
+        return existing_expiry
+
+    expires_at = int(expires_at or (time.time() + LINK_CODE_TTL))
+    _link_code_expirations[code] = expires_at
+    _link_code_tasks[code] = asyncio.create_task(
+        expire_link_code(code, account_id, expires_at)
+    )
+    return expires_at
+
 async def create_link_code(account_id, *, previous_code=None):
-    """Atomically-ish add a code using entry ETags; returns (status, code)."""
+    """Add or reuse a code; returns (status, code, Unix expiry)."""
     async with _account_link_lock:
         for _ in range(MAX_ATTEMPTS):
             fetch_status, resource = await fetch_entry_resource(
                 "Codes", ACCOUNT_LINK_DATASTORE
             )
             if fetch_status == "error":
-                return "error", None
+                return "error", None, None
 
             resource = resource or {}
             codes = decode_entry_value(resource.get("value"))
@@ -291,11 +352,16 @@ async def create_link_code(account_id, *, previous_code=None):
             active_code = find_account_code(codes, account_id)
             if previous_code is not None:
                 if previous_code in codes:
-                    return "pending", previous_code
+                    expires_at = ensure_link_code_expiry(
+                        previous_code, account_id
+                    )
+                    return "pending", previous_code, expires_at
                 if active_code is not None:
-                    return "active", active_code
+                    expires_at = ensure_link_code_expiry(active_code, account_id)
+                    return "active", active_code, expires_at
             elif active_code is not None:
-                return "active", active_code
+                expires_at = ensure_link_code_expiry(active_code, account_id)
+                return "active", active_code, expires_at
 
             code = "".join(
                 secrets.choice(LINK_CODE_ALPHABET) for _ in range(LINK_CODE_LENGTH)
@@ -313,11 +379,12 @@ async def create_link_code(account_id, *, previous_code=None):
                 allow_missing=fetch_status == "missing",
             )
             if result == "ok":
-                return "created", code
+                expires_at = ensure_link_code_expiry(code, account_id)
+                return "created", code, expires_at
             if result != "conflict":
-                return "error", None
+                return "error", None, None
 
-        return "error", None
+        return "error", None, None
 
 async def fetch_linked_user_id(account_id):
     linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
@@ -1379,10 +1446,11 @@ async def send_cup_leaderboard(ctx, index, date_text, *, todays_map=None):
     await ctx.send(embed=embed)
 
 class AccountLinkView(discord.ui.View):
-    def __init__(self, account_id, code):
+    def __init__(self, account_id, code, expires_at):
         super().__init__(timeout=900)
         self.account_id = account_id
         self.code = code
+        self.expires_at = expires_at
 
         self.add_item(discord.ui.Button(
             label="Join Verification Game",
@@ -1407,7 +1475,7 @@ class AccountLinkView(discord.ui.View):
             return
 
         await interaction.response.defer()
-        status, code = await create_link_code(
+        status, code, expires_at = await create_link_code(
             self.account_id, previous_code=self.code
         )
         if status == "pending":
@@ -1417,7 +1485,11 @@ class AccountLinkView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        if status not in ("created", "active") or code is None:
+        if (
+            status not in ("created", "active")
+            or code is None
+            or expires_at is None
+        ):
             await interaction.followup.send(
                 "Couldn't generate a new code. Try again in a moment.",
                 ephemeral=True,
@@ -1425,16 +1497,18 @@ class AccountLinkView(discord.ui.View):
             return
 
         self.code = code
+        self.expires_at = expires_at
         await interaction.edit_original_response(
-            content=link_code_message(code), view=self
+            content=link_code_message(code, expires_at), view=self
         )
 
-def link_code_message(code):
+def link_code_message(code, expires_at):
     return (
         "## Link your Roblox account\n"
         "Join the verification game and enter this code:\n\n"
         f"# `{code}`\n\n"
-        "The code can only be regenerated after the game consumes it."
+        f"Expires <t:{expires_at}:R> (<t:{expires_at}:T>).\n"
+        "The code can only be regenerated after it is consumed or expires."
     )
 
 @bot.hybrid_command(name="link", description="Link your Discord and Roblox accounts")
@@ -1450,14 +1524,18 @@ async def link_command(ctx):
         await ctx.defer(ephemeral=True)
     else:
         await ctx.defer()
-    status, code = await create_link_code(ctx.author.id)
-    if status not in ("created", "active") or code is None:
+    status, code, expires_at = await create_link_code(ctx.author.id)
+    if (
+        status not in ("created", "active")
+        or code is None
+        or expires_at is None
+    ):
         await ctx.send("Couldn't generate a link code. Try again in a moment.")
         return
 
     await ctx.send(
-        link_code_message(code),
-        view=AccountLinkView(ctx.author.id, code),
+        link_code_message(code, expires_at),
+        view=AccountLinkView(ctx.author.id, code, expires_at),
         ephemeral=ctx.interaction is not None,
     )
 
