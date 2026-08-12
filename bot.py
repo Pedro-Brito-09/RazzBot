@@ -3748,42 +3748,110 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
     lines.extend((f"**Role:** {role_text}", f"**Requirement:** {condition}"))
     return "\n".join(lines)
 
-def build_role_rules_view(
-    rules, guild, *, admin=False, badge_names=None, player=None
-):
-    """Render public role rewards, with management details only for admin."""
-    player_name = (
-        discord.utils.escape_markdown(player.display_name) if player else None
-    )
-    if not rules:
-        if player:
-            text = f"**{player_name}** has no configured reward roles."
+class PlayerAchievementsView(CardView):
+    """Toggle between a member's earned and missing achievement roles."""
+
+    def __init__(self, rules, guild, player, *, owner_id=None):
+        super().__init__()
+        self.owner_id = owner_id
+        self.player_name = discord.utils.escape_markdown(player.display_name)
+
+        held_role_ids = {role.id for role in player.roles}
+        configured_roles = []
+        seen_role_ids = set()
+        for rule in rules:
+            role_id = rule_role_id(rule)
+            role = guild.get_role(role_id) if role_id is not None else None
+            if role is None or role_id in seen_role_ids:
+                continue
+            seen_role_ids.add(role_id)
+            configured_roles.append(role)
+
+        self.achieved_roles = [
+            role for role in configured_roles if role.id in held_role_ids
+        ]
+        self.missing_roles = [
+            role for role in configured_roles if role.id not in held_role_ids
+        ]
+        self.showing_missing = False
+        self.render()
+
+    def render(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+
+        if self.showing_missing:
+            title = f"## ❌ {self.player_name}'s Missing Achievements"
+            roles = self.missing_roles
+            body = "\n".join(f"❌ {role.mention}" for role in roles)
+            body = body or "✅ This player is not missing any achievements."
         else:
-            text = "No role rewards are configured yet."
-        if admin and player is None:
+            title = f"## 🎭 {self.player_name}'s Achievements"
+            roles = self.achieved_roles
+            body = "\n".join(f"✅ {role.mention}" for role in roles)
+            body = body or "This player has no achievements yet."
+
+        container.add_item(discord.ui.TextDisplay(
+            f"{title}\n-# {len(roles)} achievement{'s' if len(roles) != 1 else ''}"
+        ))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(body))
+
+        row = discord.ui.ActionRow()
+        if self.showing_missing:
+            button = discord.ui.Button(
+                label="Achievements",
+                style=discord.ButtonStyle.success,
+                emoji="✅",
+            )
+            button.callback = self.show_achievements
+        else:
+            button = discord.ui.Button(
+                label="Missing",
+                style=discord.ButtonStyle.danger,
+                emoji="❌",
+            )
+            button.callback = self.show_missing
+        row.add_item(button)
+        container.add_item(row)
+        self.add_item(container)
+
+    async def show_missing(self, interaction):
+        self.showing_missing = True
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    async def show_achievements(self, interaction):
+        self.showing_missing = False
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+
+def build_role_rules_view(
+    rules, guild, *, admin=False, badge_names=None, player=None, owner_id=None
+):
+    """Render achievement roles or a member's compact achievement checklist."""
+    if player is not None:
+        return PlayerAchievementsView(
+            rules, guild, player, owner_id=owner_id
+        )
+
+    if not rules:
+        text = "No achievement roles are configured yet."
+        if admin:
             text += (
                 "\n-# Add: `!roles add @Role map <map ID>` or "
                 "`!roles add @Role badge <badge ID>`"
             )
         return simple_card(
             text,
-            heading=(
-                f"🎭 {player_name}'s role rewards"
-                if player else "🎭 Role rewards"
-            ),
+            heading="🎭 Achievement Roles",
             colour=discord.Color.greyple(),
         )
 
     container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-    if player:
-        heading = (
-            f"## 🎭 {player_name}'s role rewards\n"
-            f"-# {len(rules)} currently assigned"
-        )
-    else:
-        heading = f"## 🎭 Role rewards\n-# {len(rules)} available"
     container.add_item(discord.ui.TextDisplay(
-        heading
+        f"## 🎭 Achievement Roles\n-# {len(rules)} available"
     ))
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(
@@ -3797,14 +3865,12 @@ def build_role_rules_view(
     container.add_item(discord.ui.Separator(
         visible=False, spacing=discord.SeparatorSpacing.small
     ))
-    if admin and player is None:
+    if admin:
         footer = (
             "-# Remove: `!roles remove <rule ID>`\n"
             "-# Add: `!roles add @Role map <map ID>` or "
             "`!roles add @Role badge <badge ID>`"
         )
-    elif player:
-        footer = "-# Configured reward roles currently assigned to this member."
     else:
         footer = "-# Use `/sync` to update your roles."
     container.add_item(discord.ui.TextDisplay(footer))
@@ -3817,8 +3883,8 @@ def build_role_rules_view(
     view.add_item(container)
     return view
 
-@bot.tree.command(name="roles", description="View the server's Roblox role rewards")
-@app_commands.describe(player="Only show reward roles assigned to this member")
+@bot.tree.command(name="roles", description="View the server's achievement roles")
+@app_commands.describe(player="Show this member's earned and missing achievements")
 async def roles_slash_command(
     interaction: discord.Interaction, player: discord.Member = None
 ):
@@ -3830,37 +3896,26 @@ async def roles_slash_command(
 
     await interaction.response.defer()
     rules = await fetch_role_rules(interaction.guild.id)
-    if player is not None:
-        held_role_ids = {role.id for role in player.roles}
-        rules = [
-            rule for rule in rules
-            if rule_role_id(rule) in held_role_ids
-        ]
-    badge_names = await role_rule_badge_names(rules)
+    badge_names = await role_rule_badge_names(rules) if player is None else {}
     view = build_role_rules_view(
         rules,
         interaction.guild,
         admin=interaction.user.id == ADMIN_USER_ID,
         badge_names=badge_names,
         player=player,
+        owner_id=interaction.user.id,
     )
     await interaction.followup.send(view=view, allowed_mentions=SILENT)
 
 @bot.group(name="roles", hidden=True, invoke_without_command=True)
 async def admin_roles(ctx, player: discord.Member = None):
-    """View role rewards, optionally filtered to a server member."""
+    """View achievement roles, optionally filtered to a server member."""
     if ctx.guild is None:
         await ctx.send("This command only works inside a server.")
         return
     async with ctx.typing():
         rules = await fetch_role_rules(ctx.guild.id)
-        if player is not None:
-            held_role_ids = {role.id for role in player.roles}
-            rules = [
-                rule for rule in rules
-                if rule_role_id(rule) in held_role_ids
-            ]
-        badge_names = await role_rule_badge_names(rules)
+        badge_names = await role_rule_badge_names(rules) if player is None else {}
     admin = ctx.author.id == ADMIN_USER_ID
     await ctx.send(
         view=build_role_rules_view(
@@ -3869,6 +3924,7 @@ async def admin_roles(ctx, player: discord.Member = None):
             admin=admin,
             badge_names=badge_names,
             player=player,
+            owner_id=ctx.author.id,
         ),
         allowed_mentions=SILENT,
     )
