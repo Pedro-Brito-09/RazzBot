@@ -967,7 +967,7 @@ class MapView(discord.ui.LayoutView):
 
         row = discord.ui.ActionRow()
         row.add_item(discord.ui.Button(
-            label="Play",
+            label="Play in Challenge Mode",
             style=discord.ButtonStyle.link,
             url=PLAY_URL_TEMPLATE.format(id=map_id),
             emoji="▶️",
