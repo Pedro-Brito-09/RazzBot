@@ -3684,6 +3684,28 @@ async def role_rule_badge_names(rules):
         )
     return names
 
+def badge_link_parts(name):
+    """Keep emoji beside, but outside, a Components V2 Markdown link."""
+    name = " ".join(str(name).split())
+    label, emoji = [], []
+    for character in name:
+        codepoint = ord(character)
+        is_emoji = (
+            0x1F000 <= codepoint <= 0x1FAFF
+            or 0x2600 <= codepoint <= 0x27BF
+            or codepoint in (0x200D, 0x20E3, 0xFE0E, 0xFE0F)
+        )
+        (emoji if is_emoji else label).append(character)
+
+    label_text = " ".join("".join(label).split()) or "View badge"
+    label_text = (
+        label_text.replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+    emoji_text = "".join(emoji).strip()
+    return label_text, emoji_text
+
 def describe_rule(rule, guild, *, admin=False, badge_names=None):
     role_id = rule_role_id(rule)
     role = guild.get_role(role_id) if guild and role_id is not None else None
@@ -3708,10 +3730,12 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
             badge_id = None
         badge_name = (badge_names or {}).get(badge_id)
         if badge_name and badge_id is not None:
-            link_text = " ".join(str(badge_name).split())
-            link_text = link_text.replace("\\", "\\\\").replace("]", "\\]")
+            link_text, emoji_text = badge_link_parts(badge_name)
             badge_url = f"https://www.roblox.com/badges/{badge_id}/Badge"
-            condition = f"Own badge **[{link_text}]({badge_url})**"
+            emoji_suffix = f" {emoji_text}" if emoji_text else ""
+            condition = (
+                f"Own badge **[{link_text}]({badge_url}){emoji_suffix}**"
+            )
         else:
             condition = "Own badge **Unknown badge**"
     elif rule.get("type") == "map":
