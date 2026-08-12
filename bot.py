@@ -103,6 +103,7 @@ LINK_CODE_LENGTH = 8
 LINK_CODE_ALPHABET = string.ascii_uppercase + string.digits
 LINK_CODE_TTL = 5 * 60
 ACCOUNT_LINK_DATASTORE = "AccountLinking"
+LINK_CODE_EXPIRATIONS_KEY = "CodeExpirations"
 # Discord role rules live here, keyed by guild.
 ROLES_DATASTORE = "Roles"
 ROLE_CONDITIONS = ("badge", "map")
@@ -249,6 +250,8 @@ class CardView(OwnedView, discord.ui.LayoutView):
 _account_link_lock = asyncio.Lock()
 _link_code_expirations = {}
 _link_code_tasks = {}
+_link_expirations_restored = False
+_link_expiration_restore_task = None
 
 async def get_session():
     """One shared session for the process, built lazily on the running loop."""
@@ -685,14 +688,15 @@ async def delete_link_code(code, account_id):
     async with _account_link_lock:
         for _ in range(MAX_ATTEMPTS):
             fetch_status, resource = await fetch_entry_resource(
-                "Codes", ACCOUNT_LINK_DATASTORE
+                "Codes", ACCOUNT_LINK_DATASTORE, fresh=True
             )
             if fetch_status == "missing":
                 return "absent"
             if fetch_status == "error":
                 return "error"
 
-            codes = decode_entry_value(resource.get("value"))
+            raw_codes = resource.get("value")
+            codes = decode_entry_value(raw_codes)
             if not isinstance(codes, dict):
                 return "absent"
             if str(codes.get(code)) != str(account_id):
@@ -700,7 +704,9 @@ async def delete_link_code(code, account_id):
 
             del codes[code]
             result = await update_entry_resource(
-                "Codes", ACCOUNT_LINK_DATASTORE, codes,
+                "Codes",
+                ACCOUNT_LINK_DATASTORE,
+                encode_entry_value(raw_codes, codes),
                 etag=resource.get("etag"),
             )
             if result == "ok":
@@ -710,68 +716,238 @@ async def delete_link_code(code, account_id):
 
         return "error"
 
+
+def link_code_expiry_record(account_id, expires_at):
+    return {
+        "AccountId": str(account_id),
+        "ExpiresAt": int(expires_at),
+    }
+
+
+def parse_link_code_expiry(record, account_id):
+    if not isinstance(record, dict):
+        return None
+    if str(record.get("AccountId")) != str(account_id):
+        return None
+    try:
+        return int(record.get("ExpiresAt"))
+    except (TypeError, ValueError):
+        return None
+
+
+async def save_link_code_expiry(code, account_id, expires_at):
+    """Persist a timer separately so Codes remains {code: DiscordUserId}."""
+    def transform(stored):
+        stored = dict(stored) if isinstance(stored, dict) else {}
+        stored[code] = link_code_expiry_record(account_id, expires_at)
+        return stored
+
+    return await update_entry_with_retry(
+        LINK_CODE_EXPIRATIONS_KEY,
+        ACCOUNT_LINK_DATASTORE,
+        transform,
+        default={},
+    )
+
+
+async def remove_link_code_expiry(code):
+    def transform(stored):
+        if not isinstance(stored, dict) or code not in stored:
+            return None
+        stored = dict(stored)
+        del stored[code]
+        return stored
+
+    return await update_entry_with_retry(
+        LINK_CODE_EXPIRATIONS_KEY,
+        ACCOUNT_LINK_DATASTORE,
+        transform,
+        default={},
+    )
+
+
 async def expire_link_code(code, account_id, expires_at):
-    delay = max(0, expires_at - time.time())
-    await asyncio.sleep(delay)
+    try:
+        delay = max(0, expires_at - time.time())
+        await asyncio.sleep(delay)
 
-    # Keep retrying temporary Open Cloud failures after expiry. The guarded
-    # delete cannot remove a replacement code or another user's code.
-    while True:
-        result = await delete_link_code(code, account_id)
-        if result in ("deleted", "absent"):
-            break
-        await asyncio.sleep(30)
+        # Keep retrying temporary Open Cloud failures after expiry. The guarded
+        # delete cannot remove a replacement code or another user's code.
+        while True:
+            try:
+                result = await delete_link_code(code, account_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(
+                    f"Link code {code} expiration failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+                result = "error"
+            if result in ("deleted", "absent"):
+                await remove_link_code_expiry(code)
+                print(f"Expired account-link code {code}: {result}")
+                break
+            print(f"Link code {code} expiration will retry in 30 seconds")
+            await asyncio.sleep(30)
+    finally:
+        current_task = asyncio.current_task()
+        if _link_code_tasks.get(code) is current_task:
+            _link_code_expirations.pop(code, None)
+            _link_code_tasks.pop(code, None)
 
-    _link_code_expirations.pop(code, None)
-    _link_code_tasks.pop(code, None)
 
-def ensure_link_code_expiry(code, account_id, expires_at=None):
-    """Return a code's Unix expiry and ensure its cleanup task is running."""
+def schedule_link_code_expiry(code, account_id, expires_at):
+    """Start one in-process cleanup task for a persisted expiration."""
     existing_expiry = _link_code_expirations.get(code)
     if existing_expiry is not None:
         return existing_expiry
 
-    expires_at = int(expires_at or (time.time() + LINK_CODE_TTL))
+    expires_at = int(expires_at)
     _link_code_expirations[code] = expires_at
     _link_code_tasks[code] = asyncio.create_task(
         expire_link_code(code, account_id, expires_at)
     )
     return expires_at
 
-def cancel_link_code_expiry(code):
+
+async def ensure_link_code_expiry(code, account_id, expires_at=None):
+    """Persist and schedule a code's five-minute cleanup."""
+    existing_expiry = _link_code_expirations.get(code)
+    if existing_expiry is not None:
+        return existing_expiry
+
+    expires_at = int(expires_at or (time.time() + LINK_CODE_TTL))
+    result = await save_link_code_expiry(code, account_id, expires_at)
+    if result not in ("ok", "skipped"):
+        print(
+            f"Couldn't persist expiration for link code {code}: {result}; "
+            "the in-process timer will still run"
+        )
+    return schedule_link_code_expiry(code, account_id, expires_at)
+
+
+async def cancel_link_code_expiry(code):
     """Cancel and forget a code's scheduled cleanup after verification."""
     _link_code_expirations.pop(code, None)
     task = _link_code_tasks.pop(code, None)
     if task is not None and not task.done():
         task.cancel()
+    await remove_link_code_expiry(code)
+
+
+async def restore_link_code_expirations():
+    """Restore pending five-minute timers after a process or server restart."""
+    async with _account_link_lock:
+        codes_status, codes_resource = await fetch_entry_resource(
+            "Codes", ACCOUNT_LINK_DATASTORE, fresh=True
+        )
+        if codes_status == "missing":
+            codes = {}
+        elif codes_status == "ok":
+            codes = decode_entry_value(codes_resource.get("value"))
+            codes = codes if isinstance(codes, dict) else {}
+        else:
+            return "error"
+
+        expiry_status, expiry_resource = await fetch_entry_resource(
+            LINK_CODE_EXPIRATIONS_KEY, ACCOUNT_LINK_DATASTORE, fresh=True
+        )
+        if expiry_status == "ok":
+            persisted = decode_entry_value(expiry_resource.get("value"))
+            persisted = persisted if isinstance(persisted, dict) else {}
+        elif expiry_status == "missing":
+            persisted = {}
+        else:
+            return "error"
+
+        # Legacy codes have no creation time, so expire them immediately. New
+        # codes persist their deadline and retain the remainder across restarts.
+        now = int(time.time())
+        restored = {}
+        timers = []
+        for code, account_id in codes.items():
+            expires_at = parse_link_code_expiry(
+                persisted.get(code), account_id
+            )
+            if expires_at is None:
+                expires_at = now
+            restored[code] = link_code_expiry_record(account_id, expires_at)
+            timers.append((code, account_id, expires_at))
+
+        def replace_expirations(_stored):
+            return restored
+
+        save_status = await update_entry_with_retry(
+            LINK_CODE_EXPIRATIONS_KEY,
+            ACCOUNT_LINK_DATASTORE,
+            replace_expirations,
+            default={},
+        )
+        if save_status != "ok":
+            return save_status
+
+        for code, account_id, expires_at in timers:
+            schedule_link_code_expiry(code, account_id, expires_at)
+        print(f"Restored {len(timers)} account-link expiration timer(s)")
+        return "ok"
+
+
+async def restore_link_code_expirations_until_ready():
+    """Retry restoration until Open Cloud is reachable."""
+    global _link_expirations_restored
+    while not _link_expirations_restored:
+        try:
+            status = await restore_link_code_expirations()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(
+                "Account-link expiration restoration crashed: "
+                f"{type(error).__name__}: {error}"
+            )
+            status = "error"
+        if status == "ok":
+            _link_expirations_restored = True
+            return
+        print(
+            "Account-link expiration restoration failed: "
+            f"{status}; retrying in 30 seconds"
+        )
+        await asyncio.sleep(30)
 
 async def create_link_code(account_id, *, previous_code=None):
     """Add or reuse a code; returns (status, code, Unix expiry)."""
     async with _account_link_lock:
         for _ in range(MAX_ATTEMPTS):
             fetch_status, resource = await fetch_entry_resource(
-                "Codes", ACCOUNT_LINK_DATASTORE
+                "Codes", ACCOUNT_LINK_DATASTORE, fresh=True
             )
             if fetch_status == "error":
                 return "error", None, None
 
             resource = resource or {}
-            codes = decode_entry_value(resource.get("value"))
+            raw_codes = resource.get("value")
+            codes = decode_entry_value(raw_codes)
             if not isinstance(codes, dict):
                 codes = {}
 
             active_code = find_account_code(codes, account_id)
             if previous_code is not None:
                 if previous_code in codes:
-                    expires_at = ensure_link_code_expiry(
+                    expires_at = await ensure_link_code_expiry(
                         previous_code, account_id
                     )
                     return "pending", previous_code, expires_at
                 if active_code is not None:
-                    expires_at = ensure_link_code_expiry(active_code, account_id)
+                    expires_at = await ensure_link_code_expiry(
+                        active_code, account_id
+                    )
                     return "active", active_code, expires_at
             elif active_code is not None:
-                expires_at = ensure_link_code_expiry(active_code, account_id)
+                expires_at = await ensure_link_code_expiry(
+                    active_code, account_id
+                )
                 return "active", active_code, expires_at
 
             code = "".join(
@@ -785,12 +961,14 @@ async def create_link_code(account_id, *, previous_code=None):
 
             codes[code] = str(account_id)
             result = await update_entry_resource(
-                "Codes", ACCOUNT_LINK_DATASTORE, codes,
+                "Codes",
+                ACCOUNT_LINK_DATASTORE,
+                encode_entry_value(raw_codes, codes),
                 etag=resource.get("etag"),
                 allow_missing=fetch_status == "missing",
             )
             if result == "ok":
-                expires_at = ensure_link_code_expiry(code, account_id)
+                expires_at = await ensure_link_code_expiry(code, account_id)
                 return "created", code, expires_at
             if result != "conflict":
                 return "error", None, None
@@ -2382,8 +2560,19 @@ async def remember_invoker(ctx):
 
 @bot.event
 async def on_ready():
-    global _synced
+    global _synced, _link_expiration_restore_task
     print(f"Logged in as {bot.user}")
+
+    if (
+        not _link_expirations_restored
+        and (
+            _link_expiration_restore_task is None
+            or _link_expiration_restore_task.done()
+        )
+    ):
+        _link_expiration_restore_task = asyncio.create_task(
+            restore_link_code_expirations_until_ready()
+        )
 
     if DAILY_CUP_CHANNEL_ID and not daily_cup_announcement.is_running():
         daily_cup_announcement.start()
@@ -2518,7 +2707,7 @@ class AccountLinkView(OwnedView, discord.ui.View):
             )
             return
 
-        cancel_link_code_expiry(self.code)
+        await cancel_link_code_expiry(self.code)
         username = await fetch_username(user_id)
         account = f"**{username}**" if username else f"Roblox user `{user_id}`"
         self.clear_items()
@@ -2568,7 +2757,7 @@ class AccountLinkView(OwnedView, discord.ui.View):
         self.code = code
         self.expires_at = expires_at
         if old_code != code:
-            cancel_link_code_expiry(old_code)
+            await cancel_link_code_expiry(old_code)
         await interaction.edit_original_response(
             content=link_code_message(code, expires_at), view=self
         )
@@ -3802,14 +3991,14 @@ class PlayerAchievementsView(CardView):
             button = discord.ui.Button(
                 label="Achievements",
                 style=discord.ButtonStyle.success,
-                emoji="✅",
+                emoji="✔️",
             )
             button.callback = self.show_achievements
         else:
             button = discord.ui.Button(
                 label="Missing",
                 style=discord.ButtonStyle.danger,
-                emoji="❌",
+                emoji="✖️",
             )
             button.callback = self.show_missing
         row.add_item(button)
