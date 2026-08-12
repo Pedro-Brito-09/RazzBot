@@ -71,6 +71,7 @@ TOKEN=your_discord_bot_token_here
 API_KEY=your_roblox_open_cloud_api_key_here
 VERIFICATION_GAME_URL=https://www.roblox.com/games/start?placeId=120140749641241
 DAILY_CUP_CHANNEL_ID=your_discord_channel_id_here
+DAILY_CUP_ROLE_ID=your_daily_cup_notification_role_id_here
 EOF
 sudo chown root:razzbot /etc/razzbot.env
 sudo chmod 640 /etc/razzbot.env
@@ -83,6 +84,9 @@ leaderboard and the new Daily Cup map card at **09:00 UTC** each day. Enable
 Discord Developer Mode, right-click the destination channel, and choose
 **Copy Channel ID**. The bot needs View Channel, Send Messages, Embed Links,
 and Use External Emojis permissions there.
+
+`DAILY_CUP_ROLE_ID` is the ID of the role pinged with the new map card. If it
+is omitted, the bot falls back to a role named exactly `Daily Cup Notification`.
 
 The Open Cloud API key needs read, create, and update access to the
 `AccountLinking` data store in addition to the bot's existing data-store access.

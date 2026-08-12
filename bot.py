@@ -32,6 +32,7 @@ MAX_ATTEMPTS = 3
 # Twemoji's trophy gold, so the bar matches the 🏆 in the title.
 LEADERBOARD_COLOR = discord.Color(0xFFCC4D)
 MAP_COLOR = discord.Color.blurple()
+DAILY_CUP_COLOR = discord.Color(0xF1C40F)
 PROFILE_COLOR = discord.Color(0x9B59B6)
 MAX_LEADERBOARD_ROWS = 10
 GLOBAL_LEADERBOARDS = {
@@ -104,6 +105,7 @@ GUILD_ID = os.getenv("GUILD_ID")
 # Channel that receives the previous leaderboard and new map every day at the
 # Daily Cup rollover (09:00 UTC, matching cup_day_today()).
 DAILY_CUP_CHANNEL_ID = os.getenv("DAILY_CUP_CHANNEL_ID")
+DAILY_CUP_ROLE_ID = os.getenv("DAILY_CUP_ROLE_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1299,6 +1301,19 @@ class MapView(discord.ui.LayoutView):
             except discord.HTTPException:
                 pass
 
+class DailyCupMapView(discord.ui.View):
+    """The Daily Cup card's single experience Play action."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.message = None
+        self.add_item(discord.ui.Button(
+            label="Play",
+            style=discord.ButtonStyle.link,
+            url=DAILY_CUP_PLAY_URL_TEMPLATE,
+            emoji="▶️",
+        ))
+
 async def build_leaderboard_embed(
     leaderboard,
     *,
@@ -1413,6 +1428,70 @@ async def build_map_card(entry, **view_options):
         **view_options,
     )
 
+async def build_daily_cup_map_card(entry, cup_index):
+    """Build the Daily Cup-specific embed and its one-button view."""
+    creator_id = entry.get("Creator")
+    creator = await fetch_username(creator_id) if creator_id else None
+    if creator:
+        creator_text = f"@{creator}"
+    elif creator_id:
+        creator_text = f"User {creator_id}"
+    else:
+        creator_text = "Unknown"
+
+    headshot = None
+    if creator_id:
+        headshot = (await fetch_headshots([creator_id])).get(creator_id)
+
+    map_id = entry.get("Id")
+    name = entry.get("Name") or "Unnamed Map"
+    playstyle = (entry.get("Playstyle") or "Unknown").upper()
+    plays = entry.get("Plays") or 0
+    favorites = entry.get("Favorites") or 0
+
+    embed = discord.Embed(
+        title=f"🏆 {name}",
+        description=(
+            f"### Daily Cup #{cup_index} is live!\n"
+            "Compete now and set your best time before the next Daily Cup."
+        ),
+        color=DAILY_CUP_COLOR,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name="TODAY'S DAILY CUP")
+    embed.add_field(name="Creator", value=creator_text, inline=True)
+    embed.add_field(name="Playstyle", value=f"🎮 {playstyle}", inline=True)
+    embed.add_field(
+        name="Community",
+        value=f"▶️ {plays:,} plays\n⭐ {favorites:,} favourites",
+        inline=True,
+    )
+    embed.set_footer(text=f"Daily Cup #{cup_index}  ·  Map ID {map_id}")
+    if headshot:
+        embed.set_thumbnail(url=headshot)
+
+    return embed, DailyCupMapView()
+
+def daily_cup_role_mention(destination):
+    """Resolve the configured notification role, falling back to its name."""
+    try:
+        role_id = int(DAILY_CUP_ROLE_ID)
+    except (TypeError, ValueError):
+        role_id = None
+
+    guild = getattr(destination, "guild", None)
+    if role_id is not None:
+        role = guild.get_role(role_id) if guild is not None else None
+        return role.mention if role is not None else f"<@&{role_id}>"
+
+    if guild is not None:
+        role = discord.utils.get(guild.roles, name="Daily Cup Notification")
+        if role is not None:
+            return role.mention
+
+    print("Daily Cup notification role was not found")
+    return None
+
 async def publish_daily_cup_announcement(destination=None):
     """Post yesterday's cup leaderboard, followed by today's map card."""
     if destination is None:
@@ -1478,17 +1557,25 @@ async def publish_daily_cup_announcement(destination=None):
         print(f"Daily Cup announcement skipped: map {map_id} was not found")
         return False
 
-    map_view = await build_map_card(
-        entry,
-        play_label="Play",
-        play_url_template=DAILY_CUP_PLAY_URL_TEMPLATE,
-        show_leaderboard=False,
-        show_creator=False,
-    )
+    map_embed, map_view = await build_daily_cup_map_card(entry, current_index)
+    role_mention = daily_cup_role_mention(destination)
 
     # Preserve the requested order: completed cup first, new cup second.
-    await destination.send(embed=leaderboard_embed)
-    map_view.message = await destination.send(view=map_view)
+    await destination.send(
+        content="# Yesterday's Results",
+        embed=leaderboard_embed,
+    )
+    map_view.message = await destination.send(
+        content=role_mention,
+        embed=map_embed,
+        view=map_view,
+        allowed_mentions=discord.AllowedMentions(
+            everyone=False,
+            users=False,
+            roles=True,
+            replied_user=False,
+        ),
+    )
     print(
         f"Posted Daily Cup #{previous_index} results and "
         f"Daily Cup #{current_index} map {map_id} to channel {channel_id}"
