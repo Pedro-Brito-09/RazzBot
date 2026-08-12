@@ -103,6 +103,9 @@ LINK_CODE_LENGTH = 8
 LINK_CODE_ALPHABET = string.ascii_uppercase + string.digits
 LINK_CODE_TTL = 5 * 60
 ACCOUNT_LINK_DATASTORE = "AccountLinking"
+# Discord role rules live here, keyed by guild.
+ROLES_DATASTORE = "Roles"
+ROLE_CONDITIONS = ("badge", "map")
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
@@ -569,20 +572,25 @@ def encode_entry_value(original, new_value):
     return new_value
 
 async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4,
-                                  universe_id=None, api_key=None):
+                                  universe_id=None, api_key=None, default=None):
     """Read-modify-write guarded by the ETag -- Open Cloud's UpdateAsync.
 
     transform(decoded_value) returns the new value, or None to leave the
-    entry alone. Returns "ok", "skipped", "conflict", "missing" or "error".
+    entry alone. Pass default to create the entry when it doesn't exist yet.
+    Returns "ok", "skipped", "conflict", "missing" or "error".
     """
     for attempt in range(1, attempts + 1):
         status, resource = await fetch_entry_resource(
             entry_key, datastore, universe_id=universe_id, api_key=api_key
         )
-        if status != "ok":
+        if status == "missing" and default is not None:
+            raw_value, etag, allow_missing = default, None, True
+        elif status != "ok":
             return status
+        else:
+            raw_value = resource.get("value")
+            etag, allow_missing = resource.get("etag"), False
 
-        raw_value = resource.get("value")
         new_value = transform(decode_entry_value(raw_value))
         if new_value is None:
             return "skipped"
@@ -590,7 +598,7 @@ async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4
         result = await update_entry_resource(
             entry_key, datastore,
             encode_entry_value(raw_value, new_value),
-            etag=resource.get("etag"),
+            etag=etag, allow_missing=allow_missing,
             universe_id=universe_id, api_key=api_key,
         )
         if result != "conflict":
@@ -747,6 +755,104 @@ async def create_link_code(account_id, *, previous_code=None):
                 return "error", None, None
 
         return "error", None, None
+
+async def fetch_role_rules(guild_id):
+    """The role rules for one guild, as a list."""
+    rules = await fetch_entry("Rules", datastore=ROLES_DATASTORE)
+    if not isinstance(rules, dict):
+        return []
+    guild_rules = rules.get(str(guild_id))
+    return guild_rules if isinstance(guild_rules, list) else []
+
+async def save_role_rules(guild_id, mutate):
+    """Read-modify-write one guild's rules. mutate(list) returns the new list."""
+    def transform(stored):
+        stored = stored if isinstance(stored, dict) else {}
+        current = stored.get(str(guild_id))
+        current = current if isinstance(current, list) else []
+        updated = mutate(list(current))
+        if updated is None:
+            return None
+        stored[str(guild_id)] = updated
+        return stored
+
+    return await update_entry_with_retry(
+        "Rules", ROLES_DATASTORE, transform, default={},
+    )
+
+async def map_finishers(map_id, cache):
+    """Roblox IDs on a map's leaderboard, fetched once per sync."""
+    if map_id in cache:
+        return cache[map_id]
+    board = await fetch_entry(
+        MAP_LEADERBOARD_KEY.format(id=map_id), datastore="Leaderboards"
+    )
+    finishers = set()
+    if isinstance(board, list):
+        for row in board:
+            if isinstance(row, dict) and row.get("UserId") is not None:
+                try:
+                    finishers.add(int(row["UserId"]))
+                except (TypeError, ValueError):
+                    continue
+    cache[map_id] = finishers
+    return finishers
+
+async def qualifying_roles(rules, roblox_id, *, map_cache):
+    """Which of the rules' roles this player currently earns."""
+    badge_ids = [r["value"] for r in rules if r.get("type") == "badge"]
+    owned_badges = (
+        await fetch_owned_badge_ids(roblox_id, badge_ids) if badge_ids else set()
+    )
+
+    earned = set()
+    for rule in rules:
+        kind, value = rule.get("type"), rule.get("value")
+        if kind == "badge" and value in owned_badges:
+            earned.add(rule["role"])
+        elif kind == "map" and roblox_id in await map_finishers(value, map_cache):
+            earned.add(rule["role"])
+    return earned
+
+def manageable_role(guild, role_id):
+    """The role, when the bot is actually allowed to grant or take it."""
+    role = guild.get_role(role_id)
+    if role is None or role.managed or role.is_default():
+        return None
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        return None
+    return role if role < me.top_role else None
+
+async def sync_member_roles(member, roblox_id, rules, *, map_cache):
+    """Bring one member's roles in line with the rules.
+
+    Only roles named by a rule are ever touched, so unrelated roles are
+    left alone. Returns (added, removed, blocked) as role lists.
+    """
+    earned = await qualifying_roles(rules, roblox_id, map_cache=map_cache)
+    governed = {rule["role"] for rule in rules}
+    held = {role.id for role in member.roles}
+
+    blocked = []
+    add, remove = [], []
+    for role_id in governed:
+        role = manageable_role(member.guild, role_id)
+        if role is None:
+            # Missing, or above the bot in the hierarchy.
+            if (role_id in earned) != (role_id in held):
+                blocked.append(role_id)
+            continue
+        if role_id in earned and role_id not in held:
+            add.append(role)
+        elif role_id not in earned and role_id in held:
+            remove.append(role)
+
+    if add:
+        await member.add_roles(*add, reason="RazzBot role sync")
+    if remove:
+        await member.remove_roles(*remove, reason="RazzBot role sync")
+    return add, remove, blocked
 
 async def fetch_linked_user_id(account_id):
     linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
@@ -2686,6 +2792,99 @@ async def help_command(ctx):
         # DMs closed; better in-channel than not at all.
         await ctx.send(view=admin_view)
 
+def summarize_sync(added, removed, blocked):
+    parts = []
+    if added:
+        parts.append("+ " + ", ".join(r.name for r in added))
+    if removed:
+        parts.append("− " + ", ".join(r.name for r in removed))
+    if not parts:
+        parts.append("already up to date")
+    if blocked:
+        parts.append(f"⚠️ {len(blocked)} role(s) I can't manage")
+    return "  ·  ".join(parts)
+
+@bot.hybrid_command(name="sync", description="Update your roles from your Roblox progress")
+@app_commands.describe(
+    target="Admin only: a member to sync, or `all` for everyone linked"
+)
+async def sync_command(ctx, *, target: str = None):
+    if ctx.guild is None:
+        await ctx.send("This only works inside a server.")
+        return
+
+    await ctx.defer()
+
+    is_admin_user = ctx.author.id == ADMIN_USER_ID
+    if target and not is_admin_user:
+        await ctx.send("Only an admin can sync someone else.")
+        return
+
+    rules = await fetch_role_rules(ctx.guild.id)
+    if not rules:
+        await ctx.send("No role rules are configured for this server.")
+        return
+
+    map_cache = {}
+
+    # Everyone linked, admin only.
+    if target and target.strip().lower() == "all":
+        linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
+        linked = linked if isinstance(linked, dict) else {}
+
+        synced = changed = skipped = 0
+        for account_id, roblox_id in linked.items():
+            member = ctx.guild.get_member(int(account_id))
+            if member is None:
+                skipped += 1
+                continue
+            try:
+                added, removed, _ = await sync_member_roles(
+                    member, int(roblox_id), rules, map_cache=map_cache
+                )
+            except discord.HTTPException:
+                skipped += 1
+                continue
+            synced += 1
+            if added or removed:
+                changed += 1
+
+        await ctx.send(
+            f"🔄 Synced **{synced}** member(s), **{changed}** changed."
+            + (f"\n-# {skipped} skipped — not in this server, or I couldn't "
+               f"edit their roles." if skipped else "")
+        )
+        return
+
+    if target:
+        member = await find_discord_user(ctx, target)
+        if member is None or ctx.guild.get_member(member.id) is None:
+            await ctx.send(f"Couldn't find `{target.strip()}` in this server.")
+            return
+        member = ctx.guild.get_member(member.id)
+    else:
+        member = ctx.guild.get_member(ctx.author.id) or ctx.author
+
+    roblox_id = await fetch_linked_user_id(member.id)
+    if roblox_id is None:
+        who = "You haven't" if member.id == ctx.author.id else f"**{member}** hasn't"
+        await ctx.send(f"{who} linked a Roblox account. Use `/link` first.")
+        return
+
+    try:
+        added, removed, blocked = await sync_member_roles(
+            member, roblox_id, rules, map_cache=map_cache
+        )
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to edit those roles.")
+        return
+
+    name = await fetch_username(roblox_id) or roblox_id
+    await ctx.send(
+        f"🔄 Synced **{member}** (Roblox: **{name}**)\n"
+        f"-# {summarize_sync(added, removed, blocked)}"
+    )
+
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
     await ctx.send("hello fuckers")
@@ -3196,6 +3395,110 @@ async def admin_lookup(ctx, *, query: str):
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
     await ctx.send(view=view)
+
+def describe_rule(rule, guild):
+    role = guild.get_role(rule["role"]) if guild else None
+    role_text = role.mention if role else f"`{rule['role']}` (deleted?)"
+    if rule["type"] == "badge":
+        condition = f"owns badge `{rule['value']}`"
+    else:
+        condition = f"finished map `{rule['value']}`"
+    return f"`{rule['id']}` · {role_text} — {condition}"
+
+@bot.group(name="roles", hidden=True, invoke_without_command=True)
+@is_admin()
+async def admin_roles(ctx):
+    """Manage the role rules /sync applies."""
+    rules = await fetch_role_rules(ctx.guild.id)
+    if not rules:
+        await ctx.send(
+            "No role rules yet.\n"
+            "-# `!roles add <@role> badge <badge_id>` or "
+            "`!roles add <@role> map <map_id>`"
+        )
+        return
+
+    lines = "\n".join(describe_rule(rule, ctx.guild) for rule in rules)
+    await ctx.send(
+        f"**Role rules** ({len(rules)})\n{lines}\n"
+        f"-# `!roles remove <id>` to delete one",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+@admin_roles.command(name="add")
+async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
+    """!roles add <@role> <badge|map> <id>"""
+    kind = condition.strip().lower()
+    if kind not in ROLE_CONDITIONS:
+        await ctx.send(f"Condition must be one of: {', '.join(ROLE_CONDITIONS)}.")
+        return
+
+    if manageable_role(ctx.guild, role.id) is None:
+        await ctx.send(
+            f"I can't manage {role.mention} — it's above me in the role list, "
+            f"or I'm missing Manage Roles.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    state = {"duplicate": False, "rule": None}
+
+    def mutate(rules):
+        for existing in rules:
+            if (existing.get("role") == role.id
+                    and existing.get("type") == kind
+                    and existing.get("value") == value):
+                state["duplicate"] = True
+                return None
+        rule = {
+            "id": secrets.token_hex(3),
+            "role": role.id,
+            "type": kind,
+            "value": value,
+        }
+        state["rule"] = rule
+        return rules + [rule]
+
+    async with ctx.typing():
+        result = await save_role_rules(ctx.guild.id, mutate)
+
+    if state["duplicate"]:
+        await ctx.send("That exact rule already exists.")
+        return
+    if result != "ok":
+        await ctx.send(f"Couldn't save the rule ({result}). Check the logs.")
+        return
+    await ctx.send(
+        f"✅ Added {describe_rule(state['rule'], ctx.guild)}",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+@admin_roles.command(name="remove")
+async def admin_roles_remove(ctx, rule_id: str):
+    """!roles remove <rule_id>"""
+    wanted = rule_id.strip().lower()
+    state = {"rule": None}
+
+    def mutate(rules):
+        for rule in rules:
+            if rule.get("id") == wanted:
+                state["rule"] = rule
+                return [r for r in rules if r.get("id") != wanted]
+        return None
+
+    async with ctx.typing():
+        result = await save_role_rules(ctx.guild.id, mutate)
+
+    if state["rule"] is None:
+        await ctx.send(f"No rule with ID `{wanted}`.")
+        return
+    if result != "ok":
+        await ctx.send(f"Couldn't save the change ({result}). Check the logs.")
+        return
+    await ctx.send(
+        f"🗑️ Removed {describe_rule(state['rule'], ctx.guild)}",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 @bot.command(name="testcup", hidden=True)
 @commands.is_owner()

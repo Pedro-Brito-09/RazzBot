@@ -95,6 +95,12 @@ The admin commands need more: `universe.user-restriction:write` for `!ban` and
 `!unban`, plus delete access on the `Community Maps` data store and the ordered
 data stores for `!deletemap` and permanent bans.
 
+`/sync` and `!roles` store their rules in a `Roles` data store, which the key
+needs read, create, and update access to. The bot also needs the **Manage
+Roles** permission in Discord, and its own role must sit **above** every role
+it hands out — Discord refuses otherwise, and `/sync` reports those as roles it
+can't manage.
+
 Every command also has a prefix-only `!dev_` twin that runs against the test
 universe in `DEV_UNIVERSE_ID` (`!dev_map`, `!dev_cup`, `!dev_deletemap`, ...).
 The same Open Cloud key must list both universes.
