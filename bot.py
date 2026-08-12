@@ -321,32 +321,6 @@ async def fetch_ordered_leaderboard(datastore="Data", scope="Wins", limit=10):
         })
     return leaderboard
 
-def compute_maps(submissions, todays_map):
-    accepted = [
-        s for s in submissions
-        if isinstance(s, dict) and s.get("Status") == "Accepted" and s.get("Id") is not None
-    ]
-    if not accepted:
-        return None, None
-    accepted.sort(key=lambda x: x.get("Timestamp", 0))
-    ids = [s["Id"] for s in accepted]
-
-    current_id = todays_map.get("Id") if todays_map else None
-    if current_id is None:
-        current_id = ids[-1]
-    current_map = {"Id": current_id}
-
-    if current_id in ids:
-        # TodaysMap carries its own Index; fall back to the map's position in the
-        # rotation when it's missing, so a partial entry can't crash the command.
-        current_index = todays_map.get("Index")
-        if not isinstance(current_index, int):
-            current_index = ids.index(current_id)
-        next_map = {"Id": ids[(current_index + 1) % len(ids)]}
-    else:
-        next_map = {"Id": ids[0]}
-    return current_map, next_map
-
 def cup_day_today():
     """The cup's current day. Its rollover is 9 hours behind UTC."""
     return (datetime.now(timezone.utc) - timedelta(hours=9)).date()
@@ -427,7 +401,7 @@ async def fetch_username(user_id):
     return data.get("name") if data else None
 
 def format_position(pos):
-    return f"`#{pos + 1}`"
+    return f"`{f'#{pos + 1}':>3}`"
 
 def resolve_medal(entry, pos):
     """The medal for a row. Single place to change when the rule changes.
@@ -1153,7 +1127,7 @@ async def send_cup_leaderboard(ctx, index, date_text):
 
     await ctx.send(embed=embed)
 
-@bot.hybrid_command(description="Show the current and next daily cup map, plus today's leaderboard")
+@bot.hybrid_command(description="Show a daily cup leaderboard")
 @app_commands.describe(date="Cup date as DD/MM/YYYY. Defaults to today.")
 async def cup(ctx, date: str = None):
     # The Roblox lookups take longer than the 3s interaction deadline.
@@ -1187,21 +1161,6 @@ async def cup(ctx, date: str = None):
 
         await send_cup_leaderboard(ctx, index, f"{target:%d/%m/%Y}")
         return
-
-    submissions = await fetch_entry("Submissions")
-    if not submissions:
-        await ctx.send("Failed to fetch submissions from Roblox cloud.")
-        return
-
-    current_map, next_map = compute_maps(submissions, todays_map)
-    if not current_map or not next_map:
-        await ctx.send("No accepted maps found.")
-        return
-
-    await ctx.send(
-        f"Current map ID: {current_map['Id']}\n"
-        f"Next map ID: {next_map['Id']}"
-    )
 
     if current_index is None:
         await ctx.send("No daily cup index set, so there's no leaderboard to show.")
