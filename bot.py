@@ -334,6 +334,13 @@ def ensure_link_code_expiry(code, account_id, expires_at=None):
     )
     return expires_at
 
+def cancel_link_code_expiry(code):
+    """Cancel and forget a code's scheduled cleanup after verification."""
+    _link_code_expirations.pop(code, None)
+    task = _link_code_tasks.pop(code, None)
+    if task is not None and not task.done():
+        task.cancel()
+
 async def create_link_code(account_id, *, previous_code=None):
     """Add or reuse a code; returns (status, code, Unix expiry)."""
     async with _account_link_lock:
@@ -1460,6 +1467,40 @@ class AccountLinkView(discord.ui.View):
         ))
 
     @discord.ui.button(
+        label="Confirm Verification",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+    )
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if interaction.user.id != self.account_id:
+            await interaction.response.send_message(
+                "Only the user who created this code can confirm it.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        user_id = await fetch_linked_user_id(self.account_id)
+        if user_id is None:
+            await interaction.followup.send(
+                "Verification has not completed yet. Enter the code in the "
+                "verification game, then try again.",
+                ephemeral=True,
+            )
+            return
+
+        cancel_link_code_expiry(self.code)
+        username = await fetch_username(user_id)
+        account = f"**{username}**" if username else f"Roblox user `{user_id}`"
+        self.clear_items()
+        await interaction.edit_original_response(
+            content=f"✅ Account linked successfully to {account}.",
+            view=self,
+        )
+
+    @discord.ui.button(
         label="Regenerate Code",
         style=discord.ButtonStyle.secondary,
         emoji="🔄",
@@ -1496,8 +1537,11 @@ class AccountLinkView(discord.ui.View):
             )
             return
 
+        old_code = self.code
         self.code = code
         self.expires_at = expires_at
+        if old_code != code:
+            cancel_link_code_expiry(old_code)
         await interaction.edit_original_response(
             content=link_code_message(code, expires_at), view=self
         )
