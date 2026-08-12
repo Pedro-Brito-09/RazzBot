@@ -38,6 +38,8 @@ MAP_COLOR = discord.Color.blurple()
 DAILY_CUP_COLOR = discord.Color(0xF1C40F)
 PROFILE_COLOR = discord.Color(0x9B59B6)
 MAX_LEADERBOARD_ROWS = 10
+# Maps shown per page in a search result or a player's map list.
+MAPS_PER_PAGE = 10
 # Admin commands are prefix-only and answer to this account alone, so they
 # never appear in anyone's slash command list.
 ADMIN_USER_ID = 541010558653169667
@@ -1068,6 +1070,27 @@ async def fetch_user_id(username):
     # Roblox matches case-insensitively; take the name it considers canonical.
     return users[0].get("id"), users[0].get("name")
 
+async def fetch_usernames(user_ids):
+    """Resolve many user IDs to names in one request per 100."""
+    unique = [uid for uid in dict.fromkeys(user_ids) if uid is not None]
+    if not unique:
+        return {}
+
+    names = {}
+    for start in range(0, len(unique), 100):
+        chunk = unique[start:start + 100]
+        data = await request_json(
+            "https://users.roblox.com/v1/users",
+            label=f"fetch_usernames({len(chunk)})",
+            json_body={"userIds": chunk, "excludeBannedUsers": False},
+        )
+        if not data:
+            continue
+        for user in data.get("data") or []:
+            if user.get("id") is not None and user.get("name"):
+                names[user["id"]] = user["name"]
+    return names
+
 async def fetch_username(user_id):
     url = f"https://users.roblox.com/v1/users/{user_id}"
     data = await request_json(url, label=f"fetch_username({user_id})")
@@ -1510,7 +1533,7 @@ async def build_badges_view(user_id, username, parent=None):
     view.add_item(container)
     return view
 
-def search_public_maps(maps_by_id, query, limit=10):
+def search_public_maps(maps_by_id, query, limit=50):
     """Public maps whose name matches, best match first.
 
     Only Privacy == "Public" qualifies, which leaves out both Private and
@@ -1539,37 +1562,105 @@ def search_public_maps(maps_by_id, query, limit=10):
     scored.sort(key=lambda item: (item[0], item[1]))
     return [entry for _, _, entry in scored[:limit]]
 
-def build_map_search_view(query, matches, parent=None):
-    """A pick-list of maps matching a name search."""
-    view = MapsCardView(parent=parent)
-    container = discord.ui.Container(accent_colour=MAP_COLOR)
-    container.add_item(discord.ui.TextDisplay(
-        f"## 🔎 Maps matching “{query}”\n"
-        f"-# {len(matches)} result{'s' if len(matches) != 1 else ''}"
-        f" · use `/map <id>` to open one"
-    ))
-    container.add_item(discord.ui.Separator())
+class MapListView(CardView):
+    """A paginated list of maps, shared by search results and a player's maps."""
 
-    lines = []
-    for entry in matches:
+    def __init__(self, entries, *, title, subtitle, creators=None, parent=None):
+        super().__init__(parent=parent)
+        self.entries = entries
+        self.title = title
+        self.subtitle = subtitle
+        self.creators = creators or {}
+        self.page = 0
+        self.render()
+
+    @property
+    def page_count(self):
+        return max(1, -(-len(self.entries) // MAPS_PER_PAGE))
+
+    def describe(self, entry):
         name = entry.get("Name") or "Unnamed Map"
         star = " 🌟" if entry.get("Featured") else ""
-        lines.append(
+        creator_id = entry.get("Creator")
+        creator = self.creators.get(creator_id)
+        by = f"  ·  👤 {creator}" if creator else (
+            f"  ·  👤 User {creator_id}" if creator_id else "")
+        return (
             f"`#{entry.get('Id')}` **{name}**{star}\n"
             f"-# ▶️ {format_number(entry.get('Plays') or 0)} plays"
-            f"  ·  ⭐ {format_number(entry.get('Favorites') or 0)}"
+            f"  ·  ⭐ {format_number(entry.get('Favorites') or 0)}{by}"
         )
-    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
 
-    note = dev_universe_note()
-    if note:
-        container.add_item(discord.ui.TextDisplay(note))
+    def render(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=MAP_COLOR)
 
-    view.attach_back_button(container)
-    view.add_item(container)
-    return view
+        heading = f"## {self.title}\n-# {self.subtitle}"
+        if self.page_count > 1:
+            heading += f" · page {self.page + 1}/{self.page_count}"
+        container.add_item(discord.ui.TextDisplay(heading))
+        container.add_item(discord.ui.Separator())
 
-async def build_created_maps_view(user_id, username, limit=10, parent=None):
+        start = self.page * MAPS_PER_PAGE
+        page_entries = self.entries[start:start + MAPS_PER_PAGE]
+        container.add_item(discord.ui.TextDisplay(
+            "\n".join(self.describe(entry) for entry in page_entries)
+        ))
+
+        note = dev_universe_note()
+        if note:
+            container.add_item(discord.ui.TextDisplay(note))
+
+        row = discord.ui.ActionRow()
+        if self.page_count > 1:
+            previous = discord.ui.Button(
+                label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️",
+                disabled=self.page == 0,
+            )
+            previous.callback = self.previous_page
+            row.add_item(previous)
+
+            following = discord.ui.Button(
+                label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
+                disabled=self.page >= self.page_count - 1,
+            )
+            following.callback = self.next_page
+            row.add_item(following)
+
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+        if row.children:
+            container.add_item(row)
+
+        self.add_item(container)
+
+    async def show_page(self, interaction, page):
+        self.page = max(0, min(page, self.page_count - 1))
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    @keeps_context
+    async def previous_page(self, interaction):
+        await self.show_page(interaction, self.page - 1)
+
+    @keeps_context
+    async def next_page(self, interaction):
+        await self.show_page(interaction, self.page + 1)
+
+async def build_map_search_view(query, matches, parent=None):
+    """A pick-list of maps matching a name search."""
+    creators = await fetch_usernames([m.get("Creator") for m in matches])
+    return MapListView(
+        matches,
+        title=f"🔎 Maps matching “{query}”",
+        subtitle=(f"{len(matches)} result{'s' if len(matches) != 1 else ''}"
+                  f" · use `/map <id>` to open one"),
+        creators=creators,
+        parent=parent,
+    )
+
+async def build_created_maps_view(user_id, username, parent=None):
     """List the community maps a player has created, most played first."""
     maps_by_id = await get_community_maps()
     if not maps_by_id:
@@ -1583,37 +1674,14 @@ async def build_created_maps_view(user_id, username, limit=10, parent=None):
         return None
     owned.sort(key=lambda m: m.get("Plays") or 0, reverse=True)
 
-    view = MapsCardView(parent=parent)
-    container = discord.ui.Container(accent_colour=MAP_COLOR)
-    container.add_item(discord.ui.TextDisplay(
-        f"## 🗺️ Maps by {username}\n"
-        f"-# {len(owned)} public map{'s' if len(owned) != 1 else ''}"
-    ))
-    container.add_item(discord.ui.Separator())
-
-    lines = []
-    for m in owned[:limit]:
-        name = m.get("Name") or "Unnamed Map"
-        star = " 🌟" if m.get("Featured") else ""
-        lines.append(
-            f"`#{m.get('Id')}` **{name}**{star}\n"
-            f"-# ▶️ {format_number(m.get('Plays') or 0)} plays"
-            f"  ·  ⭐ {format_number(m.get('Favorites') or 0)}"
-        )
-    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
-
-    if len(owned) > limit:
-        container.add_item(discord.ui.TextDisplay(
-            f"-# and {len(owned) - limit} more"
-        ))
-
-    note = dev_universe_note()
-    if note:
-        container.add_item(discord.ui.TextDisplay(note))
-
-    view.attach_back_button(container)
-    view.add_item(container)
-    return view
+    creators = await fetch_usernames([user_id])
+    return MapListView(
+        owned,
+        title=f"🗺️ Maps by {username}",
+        subtitle=f"{len(owned)} public map{'s' if len(owned) != 1 else ''}",
+        creators=creators,
+        parent=parent,
+    )
 
 async def build_profile_view(user_id, username, parent=None):
     """Assemble a profile card, or None when the player has no saved data."""
@@ -2509,7 +2577,7 @@ async def map_command(ctx, *, query: str):
         view.message = await ctx.send(view=view)
         return
 
-    view = build_map_search_view(cleaned, matches)
+    view = await build_map_search_view(cleaned, matches)
     view.message = await ctx.send(view=view)
 
 @bot.hybrid_command(name="profile", description="Show a player's profile")
