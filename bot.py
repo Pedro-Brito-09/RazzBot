@@ -123,6 +123,8 @@ intents.message_content = True
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
+    # Replaced by the /help below, which can hide the admin commands.
+    help_command=None,
     allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
     allowed_contexts=app_commands.AppCommandContext(
         guild=True, dm_channel=True, private_channel=True
@@ -2596,6 +2598,62 @@ async def profile_command(ctx, username: str = None):
 
     view.message = await ctx.send(view=view)
 
+def describe_command(command, prefix):
+    usage = f"{prefix}{command.qualified_name}"
+    if command.signature:
+        usage += f" {command.signature}"
+    summary = command.description or command.short_doc or ""
+    line = f"`{usage}`"
+    if summary:
+        line += f"\n-# {summary}"
+    return line
+
+def visible_commands(include_admin):
+    """Everything worth listing, split into player and admin commands.
+
+    The !dev_ twins are left out entirely -- they mirror commands already
+    listed and only differ in which universe they hit.
+    """
+    players, admin = [], []
+    for command in bot.commands:
+        if command.name.startswith("dev_"):
+            continue
+        # Every admin command is registered hidden.
+        (admin if command.hidden else players).append(command)
+
+    players.sort(key=lambda c: c.qualified_name)
+    admin.sort(key=lambda c: c.qualified_name)
+    return players, (admin if include_admin else [])
+
+@bot.hybrid_command(name="help", description="List everything this bot can do")
+async def help_command(ctx):
+    is_admin_user = ctx.author.id == ADMIN_USER_ID
+    players, admin = visible_commands(is_admin_user)
+
+    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## 📖 Commands\n-# {len(players) + len(admin)} available to you"
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        "\n".join(describe_command(c, "/") for c in players)
+    ))
+
+    if admin:
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            "**🔧 Admin**\n-# prefix only, and only you can run them\n\n"
+            + "\n".join(describe_command(c, "!") for c in admin)
+        ))
+
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    await ctx.send(view=view)
+
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
     await ctx.send("hello fuckers")
@@ -2623,7 +2681,7 @@ async def resolve_admin_target(ctx, player):
 @bot.command(name="ban", hidden=True)
 @is_admin()
 async def admin_ban(ctx, player: str, duration: str = "perm", *, reason: str = ""):
-    """!ban <player> [duration] [reason] -- duration like 7d, 12h, or perm."""
+    """Ban a player. A permanent ban also clears their leaderboard entries."""
     async with ctx.typing():
         user_id, name = await resolve_admin_target(ctx, player)
         if user_id is None:
@@ -2669,7 +2727,7 @@ async def admin_ban(ctx, player: str, duration: str = "perm", *, reason: str = "
 @bot.command(name="unban", hidden=True)
 @is_admin()
 async def admin_unban(ctx, player: str):
-    """!unban <player>"""
+    """Lift a player's ban."""
     async with ctx.typing():
         user_id, name = await resolve_admin_target(ctx, player)
         if user_id is None:
@@ -2726,19 +2784,19 @@ async def set_map_featured(ctx, map_id, featured):
 @bot.command(name="feature", hidden=True)
 @is_admin()
 async def admin_feature(ctx, map_id: int):
-    """!feature <map_id>"""
+    """Mark a community map as featured."""
     await set_map_featured(ctx, map_id, True)
 
 @bot.command(name="unfeature", hidden=True)
 @is_admin()
 async def admin_unfeature(ctx, map_id: int):
-    """!unfeature <map_id>"""
+    """Take the featured mark off a community map."""
     await set_map_featured(ctx, map_id, False)
 
 @bot.command(name="deletemap", hidden=True)
 @is_admin()
 async def admin_delete_map(ctx, map_id: int, confirm: str = ""):
-    """!deletemap <map_id> confirm -- removes it from the index and its key."""
+    """Remove a map from the index and delete its entry. Irreversible."""
     if confirm.strip().lower() != "confirm":
         await ctx.send(
             f"This permanently removes map `{map_id}` from the index of "
