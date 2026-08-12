@@ -484,10 +484,13 @@ def data_store_entry_url(entry_key, datastore, universe_id=None):
     )
 
 async def fetch_entry_resource(entry_key, datastore, *, universe_id=None,
-                               api_key=None):
+                               api_key=None, fresh=False):
     """Fetch the full Open Cloud entry, including its concurrency ETag."""
     url = data_store_entry_url(entry_key, datastore, universe_id)
     headers = {"x-api-key": api_key or API_KEY, "Accept": "application/json"}
+    if fresh:
+        headers["Cache-Control"] = "no-cache, no-store, max-age=0"
+        headers["Pragma"] = "no-cache"
     session = await get_session()
     try:
         async with session.get(url, headers=headers) as resp:
@@ -631,6 +634,21 @@ async def delete_entry_resource(entry_key, datastore, *, universe_id=None,
 
 def invalidate_maps_cache():
     _maps_cache.pop(current_universe(), None)
+
+def decode_json_value(value):
+    """Decode JSON stored in a Roblox buffer, byte string, or JSON string."""
+    value = decode_entry_value(value)
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
 
 def find_account_code(codes, account_id):
     account_id = str(account_id)
@@ -855,14 +873,71 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
     return add, remove, blocked
 
 async def fetch_linked_user_id(account_id):
-    linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
-    if not isinstance(linked, dict):
-        return None
-    user_id = linked.get(str(account_id))
-    try:
-        return int(user_id)
-    except (TypeError, ValueError):
-        return None
+    _, user_id = await fetch_linked_account(account_id)
+    return user_id
+
+def normalize_discord_id(value):
+    """Normalize datastore keys to the digits in a Discord snowflake."""
+    return "".join(
+        character for character in str(value)
+        if character.isascii() and character.isdigit()
+    )
+
+async def fetch_linked_account(account_id, *, attempts=1):
+    """Return (status, Roblox user ID) for a Discord account link."""
+    expected_id = normalize_discord_id(account_id)
+    last_status = "error"
+
+    for attempt in range(attempts):
+        fetch_status, resource = await fetch_entry_resource(
+            "Linked", ACCOUNT_LINK_DATASTORE, fresh=True
+        )
+        if fetch_status == "ok":
+            try:
+                linked = decode_json_value(resource.get("value"))
+            except Exception as error:
+                print(
+                    "AccountLinking/Linked decode failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+                last_status = "error"
+            else:
+                if not isinstance(linked, dict):
+                    print(
+                        "AccountLinking/Linked has unexpected type: "
+                        f"{type(linked).__name__}"
+                    )
+                    last_status = "error"
+                else:
+                    last_status = "missing"
+                    for stored_account_id, stored_user_id in linked.items():
+                        if normalize_discord_id(stored_account_id) != expected_id:
+                            continue
+                        try:
+                            return "linked", int(stored_user_id)
+                        except (TypeError, ValueError):
+                            print(
+                                "AccountLinking/Linked contains an invalid Roblox "
+                                f"user ID for Discord account {expected_id}"
+                            )
+                            return "error", None
+
+                    visible_keys = [
+                        normalize_discord_id(key) for key in linked.keys()
+                    ]
+                    print(
+                        f"AccountLinking/Linked has no key for {expected_id}; "
+                        f"stored Discord IDs: {visible_keys}"
+                    )
+        elif fetch_status == "missing":
+            last_status = "missing"
+        else:
+            last_status = "error"
+
+        if attempt + 1 < attempts:
+            await asyncio.sleep(1)
+
+    return last_status, None
 
 _owned_badges_cache = {}
 
@@ -2379,11 +2454,23 @@ class AccountLinkView(OwnedView, discord.ui.View):
             return
 
         await interaction.response.defer()
-        user_id = await fetch_linked_user_id(self.account_id)
+        link_status, user_id = await fetch_linked_account(
+            self.account_id, attempts=3
+        )
         if user_id is None:
+            if link_status == "error":
+                message = (
+                    "Couldn't read the linked-account datastore right now. "
+                    "Please try again in a moment."
+                )
+            else:
+                message = (
+                    "Verification has not completed for your Discord account "
+                    f"(`{self.account_id}`) yet. Enter the code in the "
+                    "verification game, then try again."
+                )
             await interaction.followup.send(
-                "Verification has not completed yet. Enter the code in the "
-                "verification game, then try again.",
+                message,
                 ephemeral=True,
             )
             return
