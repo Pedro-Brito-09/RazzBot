@@ -839,6 +839,20 @@ async def map_finishers(map_id, cache):
     cache[map_id] = finishers
     return finishers
 
+def rule_role_id(rule):
+    """Return an exact Discord role snowflake, rejecting damaged floats."""
+    raw_role_id = rule.get("role") if isinstance(rule, dict) else None
+    if isinstance(raw_role_id, bool) or isinstance(raw_role_id, float):
+        # Discord snowflakes exceed JSON's safe integer range. Once Roblox
+        # returns one as a float, its original digits cannot be recovered.
+        return None
+    if isinstance(raw_role_id, int):
+        return raw_role_id if raw_role_id > 0 else None
+    if isinstance(raw_role_id, str) and raw_role_id.isascii() and raw_role_id.isdigit():
+        role_id = int(raw_role_id)
+        return role_id if role_id > 0 else None
+    return None
+
 async def qualifying_roles(rules, roblox_id, *, map_cache):
     """Which of the rules' roles this player currently earns."""
     badge_ids = [r["value"] for r in rules if r.get("type") == "badge"]
@@ -849,10 +863,13 @@ async def qualifying_roles(rules, roblox_id, *, map_cache):
     earned = set()
     for rule in rules:
         kind, value = rule.get("type"), rule.get("value")
+        role_id = rule_role_id(rule)
+        if role_id is None:
+            continue
         if kind == "badge" and value in owned_badges:
-            earned.add(rule["role"])
+            earned.add(role_id)
         elif kind == "map" and roblox_id in await map_finishers(value, map_cache):
-            earned.add(rule["role"])
+            earned.add(role_id)
     return earned
 
 def manageable_role(guild, role_id):
@@ -872,7 +889,10 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
     left alone. Returns (added, removed, blocked) as role lists.
     """
     earned = await qualifying_roles(rules, roblox_id, map_cache=map_cache)
-    governed = {rule["role"] for rule in rules}
+    governed = {
+        role_id for rule in rules
+        if (role_id := rule_role_id(rule)) is not None
+    }
     held = {role.id for role in member.roles}
 
     blocked = []
@@ -3639,13 +3659,31 @@ def simple_card(text, *, colour=PROFILE_COLOR, heading=None):
 SILENT = discord.AllowedMentions.none()
 
 def describe_rule(rule, guild):
-    role = guild.get_role(rule["role"]) if guild else None
-    role_text = role.mention if role else f"`{rule['role']}` (deleted?)"
-    if rule["type"] == "badge":
-        condition = f"owns badge `{rule['value']}`"
+    role_id = rule_role_id(rule)
+    role = guild.get_role(role_id) if guild and role_id is not None else None
+    if role is not None:
+        role_text = f"{role.mention} (**{role.name}**)"
+    elif role_id is not None:
+        role_text = (
+            f"⚠️ **Role no longer exists in this server** (`{role_id}`)"
+        )
     else:
-        condition = f"finished map `{rule['value']}`"
-    return f"`{rule['id']}` · {role_text} — {condition}"
+        role_text = (
+            "⚠️ **Unknown role** — its ID was saved using the old number "
+            "format and lost precision. Remove and recreate this rule."
+        )
+
+    if rule.get("type") == "badge":
+        condition = f"Own badge **#{rule.get('value', '?')}**"
+    elif rule.get("type") == "map":
+        condition = f"Complete map **#{rule.get('value', '?')}**"
+    else:
+        condition = "⚠️ Unknown requirement"
+    return (
+        f"**Rule `{rule.get('id', '?')}`**\n"
+        f"**Role:** {role_text}\n"
+        f"**Requirement:** {condition}"
+    )
 
 @bot.group(name="roles", hidden=True, invoke_without_command=True)
 @is_admin()
@@ -3668,13 +3706,15 @@ async def admin_roles(ctx):
     ))
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(
-        "\n".join(describe_rule(rule, ctx.guild) for rule in rules)
+        "\n\n".join(describe_rule(rule, ctx.guild) for rule in rules)
     ))
     container.add_item(discord.ui.Separator(
         visible=False, spacing=discord.SeparatorSpacing.small
     ))
     container.add_item(discord.ui.TextDisplay(
-        "-# `!roles remove <id>` to delete one"
+        "-# Remove: `!roles remove <rule ID>`\n"
+        "-# Add: `!roles add @Role map <map ID>` or "
+        "`!roles add @Role badge <badge ID>`"
     ))
 
     note = dev_universe_note()
@@ -3708,14 +3748,16 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
 
     def mutate(rules):
         for existing in rules:
-            if (existing.get("role") == role.id
+            if (rule_role_id(existing) == role.id
                     and existing.get("type") == kind
                     and existing.get("value") == value):
                 state["duplicate"] = True
                 return None
         rule = {
             "id": secrets.token_hex(3),
-            "role": role.id,
+            # Snowflakes must be strings: JSON numbers cannot represent all
+            # 19 digits exactly and Roblox otherwise returns scientific notation.
+            "role": str(role.id),
             "type": kind,
             "value": value,
         }
