@@ -79,7 +79,7 @@ PLAY_URL_TEMPLATE = (
 # Daily Cup announcements use the cup experience rather than Challenge Mode.
 DAILY_CUP_PLAY_URL_TEMPLATE = (
     "https://www.roblox.com/games/start"
-    "?placeId=133478407190616&launchData=Map%2F{id}"
+    "?placeId=133478407190616"
 )
 # A community map's leaderboard is keyed by the map ID on its own.
 MAP_LEADERBOARD_KEY = "{id}"
@@ -1163,12 +1163,13 @@ async def build_profile_view(user_id, username):
     )
 
 class MapView(discord.ui.LayoutView):
-    """Components V2 map card: details, creator headshot, and two buttons."""
+    """Components V2 map card with configurable action buttons."""
 
     def __init__(self, entry, *, headshot=None, creator_text="Unknown",
                  creator_id=None, creator_name=None, timeout=MAP_VIEW_TIMEOUT,
                  play_label="Play in Challenge Mode",
-                 play_url_template=PLAY_URL_TEMPLATE):
+                 play_url_template=PLAY_URL_TEMPLATE,
+                 show_leaderboard=True, show_creator=True):
         super().__init__(timeout=timeout)
         self.entry = entry
         self.message = None
@@ -1221,6 +1222,7 @@ class MapView(discord.ui.LayoutView):
         ))
 
         row = discord.ui.ActionRow()
+        has_actions = False
         if privacy != "Private":
             row.add_item(discord.ui.Button(
                 label=play_label,
@@ -1228,16 +1230,19 @@ class MapView(discord.ui.LayoutView):
                 url=play_url_template.format(id=map_id),
                 emoji="▶️",
             ))
-        leaderboard_button = discord.ui.Button(
-            label="Leaderboard",
-            style=discord.ButtonStyle.secondary,
-            emoji="🏆",
-        )
-        leaderboard_button.callback = self.show_leaderboard
-        row.add_item(leaderboard_button)
+            has_actions = True
+        if show_leaderboard:
+            leaderboard_button = discord.ui.Button(
+                label="Leaderboard",
+                style=discord.ButtonStyle.secondary,
+                emoji="🏆",
+            )
+            leaderboard_button.callback = self.show_leaderboard
+            row.add_item(leaderboard_button)
+            has_actions = True
 
         # Text can't trigger a bot action, so the creator gets a button.
-        if creator_id:
+        if show_creator and creator_id:
             label = creator_name or str(creator_id)
             creator_button = discord.ui.Button(
                 label=label[:78],
@@ -1246,8 +1251,10 @@ class MapView(discord.ui.LayoutView):
             )
             creator_button.callback = self.show_creator_profile
             row.add_item(creator_button)
+            has_actions = True
 
-        container.add_item(row)
+        if has_actions:
+            container.add_item(row)
 
         self.add_item(container)
 
@@ -1472,6 +1479,8 @@ async def publish_daily_cup_announcement():
         entry,
         play_label="Play",
         play_url_template=DAILY_CUP_PLAY_URL_TEMPLATE,
+        show_leaderboard=False,
+        show_creator=False,
     )
 
     # Preserve the requested order: completed cup first, new cup second.
