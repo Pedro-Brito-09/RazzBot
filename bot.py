@@ -3658,11 +3658,37 @@ def simple_card(text, *, colour=PROFILE_COLOR, heading=None):
 # Role mentions render inside a card, so keep them from pinging.
 SILENT = discord.AllowedMentions.none()
 
-def describe_rule(rule, guild, *, admin=False):
+async def role_rule_badge_names(rules):
+    """Resolve badge rule values to their Roblox display names."""
+    wanted = {
+        int(rule["value"])
+        for rule in rules
+        if rule.get("type") == "badge"
+        and str(rule.get("value", "")).isdigit()
+    }
+    if not wanted:
+        return {}
+
+    badges = await fetch_universe_badges()
+    names = {}
+    for badge in badges:
+        badge_id = badge.get("id") if isinstance(badge, dict) else None
+        try:
+            badge_id = int(badge_id)
+        except (TypeError, ValueError):
+            continue
+        if badge_id not in wanted:
+            continue
+        names[badge_id] = (
+            badge.get("displayName") or badge.get("name") or "Unknown badge"
+        )
+    return names
+
+def describe_rule(rule, guild, *, admin=False, badge_names=None):
     role_id = rule_role_id(rule)
     role = guild.get_role(role_id) if guild and role_id is not None else None
     if role is not None:
-        role_text = f"{role.mention} (**{role.name}**)"
+        role_text = role.mention
     elif role_id is not None:
         role_text = "⚠️ **Role unavailable**"
         if admin:
@@ -3676,7 +3702,12 @@ def describe_rule(rule, guild, *, admin=False):
             )
 
     if rule.get("type") == "badge":
-        condition = f"Own badge **#{rule.get('value', '?')}**"
+        try:
+            badge_id = int(rule.get("value"))
+        except (TypeError, ValueError):
+            badge_id = None
+        badge_name = (badge_names or {}).get(badge_id)
+        condition = f"Own badge **{badge_name or 'Unknown badge'}**"
     elif rule.get("type") == "map":
         condition = f"Complete map **#{rule.get('value', '?')}**"
     else:
@@ -3687,7 +3718,7 @@ def describe_rule(rule, guild, *, admin=False):
     lines.extend((f"**Role:** {role_text}", f"**Requirement:** {condition}"))
     return "\n".join(lines)
 
-def build_role_rules_view(rules, guild, *, admin=False):
+def build_role_rules_view(rules, guild, *, admin=False, badge_names=None):
     """Render public role rewards, with management details only for admin."""
     if not rules:
         text = "No role rewards are configured yet."
@@ -3709,7 +3740,10 @@ def build_role_rules_view(rules, guild, *, admin=False):
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(
         "\n\n".join(
-            describe_rule(rule, guild, admin=admin) for rule in rules
+            describe_rule(
+                rule, guild, admin=admin, badge_names=badge_names
+            )
+            for rule in rules
         )
     ))
     container.add_item(discord.ui.Separator(
@@ -3743,10 +3777,12 @@ async def roles_slash_command(interaction: discord.Interaction):
 
     await interaction.response.defer()
     rules = await fetch_role_rules(interaction.guild.id)
+    badge_names = await role_rule_badge_names(rules)
     view = build_role_rules_view(
         rules,
         interaction.guild,
         admin=interaction.user.id == ADMIN_USER_ID,
+        badge_names=badge_names,
     )
     await interaction.followup.send(view=view, allowed_mentions=SILENT)
 
@@ -3756,10 +3792,14 @@ async def admin_roles(ctx):
     if ctx.guild is None:
         await ctx.send("This command only works inside a server.")
         return
-    rules = await fetch_role_rules(ctx.guild.id)
+    async with ctx.typing():
+        rules = await fetch_role_rules(ctx.guild.id)
+        badge_names = await role_rule_badge_names(rules)
     admin = ctx.author.id == ADMIN_USER_ID
     await ctx.send(
-        view=build_role_rules_view(rules, ctx.guild, admin=admin),
+        view=build_role_rules_view(
+            rules, ctx.guild, admin=admin, badge_names=badge_names
+        ),
         allowed_mentions=SILENT,
     )
 
@@ -3816,8 +3856,11 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
             colour=discord.Color.red(),
         ))
         return
+    badge_names = await role_rule_badge_names([state["rule"]])
     await ctx.send(view=simple_card(
-        describe_rule(state["rule"], ctx.guild, admin=True),
+        describe_rule(
+            state["rule"], ctx.guild, admin=True, badge_names=badge_names
+        ),
         heading="✅ Rule added",
     ), allowed_mentions=SILENT)
 
@@ -3848,8 +3891,11 @@ async def admin_roles_remove(ctx, rule_id: str):
             colour=discord.Color.red(),
         ))
         return
+    badge_names = await role_rule_badge_names([state["rule"]])
     await ctx.send(view=simple_card(
-        describe_rule(state["rule"], ctx.guild, admin=True),
+        describe_rule(
+            state["rule"], ctx.guild, admin=True, badge_names=badge_names
+        ),
         heading="🗑️ Rule removed",
         colour=discord.Color.orange(),
     ), allowed_mentions=SILENT)
