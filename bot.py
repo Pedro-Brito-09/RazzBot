@@ -1445,7 +1445,6 @@ async def build_daily_cup_map_card(entry, cup_index):
 
     map_id = entry.get("Id")
     name = entry.get("Name") or "Unnamed Map"
-    playstyle = (entry.get("Playstyle") or "Unknown").upper()
     plays = entry.get("Plays") or 0
     favorites = entry.get("Favorites") or 0
 
@@ -1460,7 +1459,6 @@ async def build_daily_cup_map_card(entry, cup_index):
     )
     embed.set_author(name="TODAY'S DAILY CUP")
     embed.add_field(name="Creator", value=creator_text, inline=True)
-    embed.add_field(name="Playstyle", value=f"🎮 {playstyle}", inline=True)
     embed.add_field(
         name="Community",
         value=f"▶️ {plays:,} plays\n⭐ {favorites:,} favourites",
@@ -1566,7 +1564,10 @@ async def publish_daily_cup_announcement(destination=None):
         embed=leaderboard_embed,
     )
     map_view.message = await destination.send(
-        content=role_mention,
+        content=(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{role_mention or ''}"
+        ).rstrip(),
         embed=map_embed,
         view=map_view,
         allowed_mentions=discord.AllowedMentions(
