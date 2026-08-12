@@ -3928,7 +3928,12 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
         else:
             condition = "Own badge **Unknown badge**"
     elif rule.get("type") == "map":
-        condition = f"Complete map **#{rule.get('value', '?')}**"
+        map_id = rule.get("value")
+        if map_id is not None:
+            play_url = PLAY_URL_TEMPLATE.format(id=map_id)
+            condition = f"Complete **[map #{map_id}]({play_url})**"
+        else:
+            condition = "Complete **Unknown map**"
     else:
         condition = "⚠️ Unknown requirement"
     lines = []
