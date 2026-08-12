@@ -265,8 +265,8 @@ def decode_entry_value(value):
 
 def find_account_code(codes, account_id):
     account_id = str(account_id)
-    for code, record in codes.items():
-        if isinstance(record, dict) and str(record.get("AccountId")) == account_id:
+    for code, stored_account_id in codes.items():
+        if str(stored_account_id) == account_id:
             return code
     return None
 
@@ -303,7 +303,7 @@ async def create_link_code(account_id, *, previous_code=None):
                     for _ in range(LINK_CODE_LENGTH)
                 )
 
-            codes[code] = {"AccountId": str(account_id)}
+            codes[code] = str(account_id)
             result = await update_entry_resource(
                 "Codes", ACCOUNT_LINK_DATASTORE, codes,
                 etag=resource.get("etag"),
