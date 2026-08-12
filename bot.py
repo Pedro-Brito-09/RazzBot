@@ -2625,26 +2625,13 @@ def visible_commands(include_admin):
     admin.sort(key=lambda c: c.qualified_name)
     return players, (admin if include_admin else [])
 
-@bot.hybrid_command(name="help", description="List everything this bot can do")
-async def help_command(ctx):
-    is_admin_user = ctx.author.id == ADMIN_USER_ID
-    players, admin = visible_commands(is_admin_user)
-
+def build_help_view(heading, subtitle, commands_list, prefix):
     container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-    container.add_item(discord.ui.TextDisplay(
-        f"## 📖 Commands\n-# {len(players) + len(admin)} available to you"
-    ))
+    container.add_item(discord.ui.TextDisplay(f"## {heading}\n-# {subtitle}"))
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(
-        "\n".join(describe_command(c, "/") for c in players)
+        "\n".join(describe_command(c, prefix) for c in commands_list)
     ))
-
-    if admin:
-        container.add_item(discord.ui.Separator())
-        container.add_item(discord.ui.TextDisplay(
-            "**🔧 Admin**\n-# prefix only, and only you can run them\n\n"
-            + "\n".join(describe_command(c, "!") for c in admin)
-        ))
 
     note = dev_universe_note()
     if note:
@@ -2652,7 +2639,34 @@ async def help_command(ctx):
 
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
-    await ctx.send(view=view)
+    return view
+
+@bot.hybrid_command(name="help", description="List everything this bot can do")
+async def help_command(ctx):
+    players, admin = visible_commands(ctx.author.id == ADMIN_USER_ID)
+
+    await ctx.send(view=build_help_view(
+        "📖 Commands", f"{len(players)} available", players, "/",
+    ))
+
+    if not admin:
+        return
+
+    # The admin list goes out privately, so running /help in a public channel
+    # never advertises it.
+    admin_view = build_help_view(
+        "🔧 Admin commands",
+        "prefix only, and only you can run them",
+        admin, "!",
+    )
+    if ctx.interaction is not None:
+        await ctx.send(view=admin_view, ephemeral=True)
+        return
+    try:
+        await ctx.author.send(view=admin_view)
+    except discord.HTTPException:
+        # DMs closed; better in-channel than not at all.
+        await ctx.send(view=admin_view)
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
