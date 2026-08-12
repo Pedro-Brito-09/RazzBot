@@ -2825,12 +2825,19 @@ async def admin_unfeature(ctx, map_id: int):
     """Take the featured mark off a community map."""
     await set_map_featured(ctx, map_id, False)
 
+def map_delete_targets(map_id):
+    """Everything keyed to a map, as (label, datastore, key) for retrying."""
+    return [
+        ("map entry", "Community Maps", str(map_id)),
+        ("leaderboard", "Leaderboards", MAP_LEADERBOARD_KEY.format(id=map_id)),
+    ]
+
 async def perform_map_delete(map_id):
     """Drop a map from the index, then delete everything keyed to it.
 
-    Returns (status, name, leftovers) where leftovers names whatever could
-    not be deleted. The index write goes first, so a failure there can't
-    leave the map half-deleted.
+    Returns (status, name, leftovers), leftovers being the delete targets
+    that failed, so each can be retried on its own. The index write goes
+    first, so a failure there can't leave the map half-deleted.
     """
     state = {"name": None, "found": False}
 
@@ -2853,18 +2860,11 @@ async def perform_map_delete(map_id):
     invalidate_maps_cache()
 
     # The map's own entry and its leaderboard are both keyed by the map ID.
-    entry_deleted, leaderboard_deleted = await asyncio.gather(
-        delete_entry_resource(str(map_id), "Community Maps"),
-        delete_entry_resource(
-            MAP_LEADERBOARD_KEY.format(id=map_id), "Leaderboards"
-        ),
-    )
-
-    leftovers = []
-    if not entry_deleted:
-        leftovers.append("its map entry")
-    if not leaderboard_deleted:
-        leftovers.append("its leaderboard")
+    targets = map_delete_targets(map_id)
+    outcomes = await asyncio.gather(*(
+        delete_entry_resource(key, datastore) for _, datastore, key in targets
+    ))
+    leftovers = [t for t, deleted in zip(targets, outcomes) if not deleted]
     return "ok", state["name"], leftovers
 
 class DeleteMapView(CardView):
@@ -2874,6 +2874,7 @@ class DeleteMapView(CardView):
                  timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
         self.entry = entry
+        self.pending = []
 
         map_id = entry.get("Id")
         container = build_map_container(
@@ -2906,14 +2907,84 @@ class DeleteMapView(CardView):
 
         self.add_item(container)
 
-    def finish(self, text, colour):
+    def finish(self, text, colour, *, retries=None, retry_all=False):
+        """Replace the card with an outcome, plus buttons for what failed."""
         self.clear_items()
         container = discord.ui.Container(accent_colour=colour)
         container.add_item(discord.ui.TextDisplay(text))
+
+        row = discord.ui.ActionRow()
+        for target in retries or []:
+            button = discord.ui.Button(
+                label=f"Retry {target[0]}",
+                style=discord.ButtonStyle.danger,
+                emoji="🔁",
+            )
+            button.callback = self.make_retry(target)
+            row.add_item(button)
+        if retry_all:
+            button = discord.ui.Button(
+                label="Retry", style=discord.ButtonStyle.danger, emoji="🔁"
+            )
+            button.callback = self.confirm_delete
+            row.add_item(button)
+        if row.children:
+            container.add_item(row)
+        else:
+            # Nothing left to retry, so the view is done.
+            self.stop()
+
         note = dev_universe_note()
         if note:
             container.add_item(discord.ui.TextDisplay(note))
         self.add_item(container)
+
+    def report_partial(self, name, map_id, leftovers):
+        self.pending = leftovers
+        if not leftovers:
+            self.finish(
+                f"🗑️ Deleted **{name}** (`{map_id}`).\n"
+                f"-# Removed from the index, along with its entry and leaderboard.",
+                discord.Color.red(),
+            )
+            return
+        missed = " and ".join(f"its {label}" for label, _, _ in leftovers)
+        self.finish(
+            f"🗑️ Deleted **{name}** (`{map_id}`).\n"
+            f"-# ⚠️ Index updated, but couldn't delete {missed}.",
+            discord.Color.orange(),
+            retries=leftovers,
+        )
+
+    def make_retry(self, target):
+        """A callback retrying exactly one failed deletion."""
+        label, datastore, key = target
+
+        async def retry(interaction):
+            universe = _active_universe.set(self.universe)
+            invoker = _active_invoker.set(self.owner_id)
+            try:
+                await interaction.response.defer()
+                if await delete_entry_resource(key, datastore):
+                    self.pending = [t for t in self.pending if t != target]
+                    self.report_partial(
+                        self.entry.get("Name") or "Unnamed Map",
+                        self.entry.get("Id"), self.pending,
+                    )
+                else:
+                    missed = " and ".join(f"its {l}" for l, _, _ in self.pending)
+                    self.finish(
+                        f"🔁 Retrying **{label}** failed again.\n"
+                        f"-# Still undeleted: {missed}. Check the logs.",
+                        discord.Color.orange(),
+                        retries=self.pending,
+                    )
+                await interaction.edit_original_response(view=self)
+            finally:
+                _active_universe.reset(universe)
+                _active_invoker.reset(invoker)
+
+        return retry
 
     @keeps_context
     async def confirm_delete(self, interaction):
@@ -2929,20 +3000,12 @@ class DeleteMapView(CardView):
             self.finish(
                 f"Failed to remove **{name}** (`{map_id}`) from the index "
                 f"({status}). Nothing was deleted — check the logs.",
-                discord.Color.red(),
+                discord.Color.orange(),
+                retry_all=True,
             )
         else:
-            detail = (
-                f"-# ⚠️ Index updated, but couldn't delete {' or '.join(leftovers)}."
-                if leftovers else
-                "-# Removed from the index, along with its entry and leaderboard."
-            )
-            self.finish(
-                f"🗑️ Deleted **{deleted_name}** (`{map_id}`).\n{detail}",
-                discord.Color.red(),
-            )
+            self.report_partial(deleted_name, map_id, leftovers)
 
-        self.stop()
         await interaction.edit_original_response(view=self)
 
     @keeps_context
@@ -2951,7 +3014,6 @@ class DeleteMapView(CardView):
         name = self.entry.get("Name") or "Unnamed Map"
         self.finish(f"Cancelled. **{name}** was not touched.",
                     discord.Color.greyple())
-        self.stop()
         await interaction.edit_original_response(view=self)
 
 @bot.command(name="deletemap", hidden=True)
