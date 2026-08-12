@@ -1656,8 +1656,10 @@ class MapView(OwnedView, discord.ui.LayoutView):
         await interaction.edit_original_response(view=view)
 
     async def on_timeout(self):
-        for item in self.children:
-            if item.style is not discord.ButtonStyle.link:
+        # children are Containers on a LayoutView, so walk down to the
+        # buttons. Link buttons stay enabled -- Play should always work.
+        for item in self.walk_children():
+            if isinstance(item, discord.ui.Button) and item.style is not discord.ButtonStyle.link:
                 item.disabled = True
         if self.message is not None:
             try:
