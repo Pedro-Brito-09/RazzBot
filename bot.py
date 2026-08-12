@@ -3847,18 +3847,28 @@ async def roles_slash_command(
     await interaction.followup.send(view=view, allowed_mentions=SILENT)
 
 @bot.group(name="roles", hidden=True, invoke_without_command=True)
-async def admin_roles(ctx):
-    """View role rewards; admins also see management details."""
+async def admin_roles(ctx, player: discord.Member = None):
+    """View role rewards, optionally filtered to a server member."""
     if ctx.guild is None:
         await ctx.send("This command only works inside a server.")
         return
     async with ctx.typing():
         rules = await fetch_role_rules(ctx.guild.id)
+        if player is not None:
+            held_role_ids = {role.id for role in player.roles}
+            rules = [
+                rule for rule in rules
+                if rule_role_id(rule) in held_role_ids
+            ]
         badge_names = await role_rule_badge_names(rules)
     admin = ctx.author.id == ADMIN_USER_ID
     await ctx.send(
         view=build_role_rules_view(
-            rules, ctx.guild, admin=admin, badge_names=badge_names
+            rules,
+            ctx.guild,
+            admin=admin,
+            badge_names=badge_names,
+            player=player,
         ),
         allowed_mentions=SILENT,
     )
