@@ -2826,10 +2826,11 @@ async def admin_unfeature(ctx, map_id: int):
     await set_map_featured(ctx, map_id, False)
 
 async def perform_map_delete(map_id):
-    """Drop a map from the index, then delete its own entry.
+    """Drop a map from the index, then delete everything keyed to it.
 
-    Returns (status, name, key_deleted). The map's entry is only touched
-    once the index write succeeded, so a failure can't half-delete it.
+    Returns (status, name, leftovers) where leftovers names whatever could
+    not be deleted. The index write goes first, so a failure there can't
+    leave the map half-deleted.
     """
     state = {"name": None, "found": False}
 
@@ -2845,13 +2846,26 @@ async def perform_map_delete(map_id):
 
     result = await update_entry_with_retry("Ids", "Community Maps", transform)
     if not state["found"]:
-        return "missing", None, False
+        return "missing", None, []
     if result != "ok":
-        return result, state["name"], False
+        return result, state["name"], []
 
     invalidate_maps_cache()
-    key_deleted = await delete_entry_resource(str(map_id), "Community Maps")
-    return "ok", state["name"], key_deleted
+
+    # The map's own entry and its leaderboard are both keyed by the map ID.
+    entry_deleted, leaderboard_deleted = await asyncio.gather(
+        delete_entry_resource(str(map_id), "Community Maps"),
+        delete_entry_resource(
+            MAP_LEADERBOARD_KEY.format(id=map_id), "Leaderboards"
+        ),
+    )
+
+    leftovers = []
+    if not entry_deleted:
+        leftovers.append("its map entry")
+    if not leaderboard_deleted:
+        leftovers.append("its leaderboard")
+    return "ok", state["name"], leftovers
 
 class DeleteMapView(CardView):
     """The map about to be deleted, with the confirmation on it."""
@@ -2907,7 +2921,7 @@ class DeleteMapView(CardView):
         map_id = self.entry.get("Id")
         name = self.entry.get("Name") or "Unnamed Map"
 
-        status, deleted_name, key_deleted = await perform_map_delete(map_id)
+        status, deleted_name, leftovers = await perform_map_delete(map_id)
         if status == "missing":
             self.finish(f"No community map with ID `{map_id}`.",
                         discord.Color.red())
@@ -2918,11 +2932,15 @@ class DeleteMapView(CardView):
                 discord.Color.red(),
             )
         else:
-            text = (f"🗑️ Deleted **{deleted_name}** (`{map_id}`).\n"
-                    + ("-# Removed from the index and its entry deleted."
-                       if key_deleted else
-                       f"-# ⚠️ Index updated, but deleting key `{map_id}` failed."))
-            self.finish(text, discord.Color.red())
+            detail = (
+                f"-# ⚠️ Index updated, but couldn't delete {' or '.join(leftovers)}."
+                if leftovers else
+                "-# Removed from the index, along with its entry and leaderboard."
+            )
+            self.finish(
+                f"🗑️ Deleted **{deleted_name}** (`{map_id}`).\n{detail}",
+                discord.Color.red(),
+            )
 
         self.stop()
         await interaction.edit_original_response(view=self)
