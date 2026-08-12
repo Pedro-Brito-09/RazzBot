@@ -1264,7 +1264,7 @@ async def leaderboard_command(ctx, target: str):
                 leaderboard,
                 title=f"🏆 {value_name} Leaderboard",
                 subtitle=f"Data · {scope}",
-                show_medals=True,
+                show_medals=False,
                 show_country=False,
                 value_name=value_name,
                 value_formatter=format_number,
