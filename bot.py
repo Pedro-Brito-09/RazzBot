@@ -184,6 +184,65 @@ class OwnedView:
             ephemeral=True,
         )
         return False
+
+class CardView(OwnedView, discord.ui.LayoutView):
+    """A card that can navigate to others and offer a way back.
+
+    Cards replace each other in the same message, so the card you came from
+    is kept and restored rather than rebuilt -- no refetching to go back.
+    """
+
+    # How a button returning to this card is labelled.
+    card_label = "Back"
+    card_emoji = "↩️"
+
+    def __init__(self, *, parent=None, timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(timeout=timeout)
+        self.universe = current_universe()
+        self.bind_owner()
+        self.message = None
+        self.parent = parent
+
+    def make_back_button(self):
+        """A button returning to the card this one was opened from."""
+        if self.parent is None:
+            return None
+        button = discord.ui.Button(
+            label=self.parent.card_label,
+            style=discord.ButtonStyle.secondary,
+            emoji=self.parent.card_emoji,
+        )
+        button.callback = self.go_back
+        return button
+
+    def attach_back_button(self, container):
+        """Add the back button on its own row, for cards without one."""
+        button = self.make_back_button()
+        if button is None:
+            return
+        row = discord.ui.ActionRow()
+        row.add_item(button)
+        container.add_item(row)
+
+    @keeps_context
+    async def go_back(self, interaction):
+        await interaction.response.defer()
+        parent = self.parent
+        parent.message = interaction.message
+        await interaction.edit_original_response(view=parent)
+
+    async def on_timeout(self):
+        # children are Containers on a LayoutView, so walk down to the
+        # buttons. Link buttons stay enabled -- Play should always work.
+        for item in self.walk_children():
+            if (isinstance(item, discord.ui.Button)
+                    and item.style is not discord.ButtonStyle.link):
+                item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 _account_link_lock = asyncio.Lock()
 _link_code_expirations = {}
 _link_code_tasks = {}
@@ -1216,17 +1275,25 @@ async def get_community_maps():
     print(f"community maps indexed: {len(by_id)} entries (universe {universe})")
     return by_id
 
-class ProfileView(OwnedView, discord.ui.LayoutView):
+class BadgesCardView(CardView):
+    card_label = "Badges"
+    card_emoji = "🎖️"
+
+class MapsCardView(CardView):
+    card_label = "Maps"
+    card_emoji = "🗺️"
+
+class ProfileView(CardView):
     """Components V2 profile card built from a Main_Data entry."""
 
+    card_label = "Profile"
+    card_emoji = "👤"
+
     def __init__(self, entry, *, user_id, username, headshot=None, wins=None,
-                 restriction=None, timeout=MAP_VIEW_TIMEOUT):
-        super().__init__(timeout=timeout)
-        self.universe = current_universe()
-        self.bind_owner()
+                 restriction=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(parent=parent, timeout=timeout)
         self.user_id = user_id
         self.username = username
-        self.message = None
 
         data = entry.get("Data") if isinstance(entry, dict) else None
         data = data if isinstance(data, dict) else {}
@@ -1295,6 +1362,13 @@ class ProfileView(OwnedView, discord.ui.LayoutView):
         )
         badges_button.callback = self.show_badges
         row.add_item(badges_button)
+
+        # When this profile was opened from another card, offer the way back
+        # alongside its own actions rather than on a separate row.
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+
         container.add_item(row)
 
         container.add_item(discord.ui.Separator())
@@ -1348,7 +1422,7 @@ class ProfileView(OwnedView, discord.ui.LayoutView):
         # edit_original_response would then edit that, not the card.
         await interaction.response.defer()
 
-        view = await build_badges_view(self.user_id, self.username)
+        view = await build_badges_view(self.user_id, self.username, parent=self)
         if view is None:
             await interaction.followup.send(
                 "Couldn't fetch the game's badge list.", ephemeral=True
@@ -1364,7 +1438,7 @@ class ProfileView(OwnedView, discord.ui.LayoutView):
         # edit_original_response would then edit that, not the card.
         await interaction.response.defer()
 
-        view = await build_created_maps_view(self.user_id, self.username)
+        view = await build_created_maps_view(self.user_id, self.username, parent=self)
         if view is None:
             await interaction.followup.send(
                 f"**{self.username}** has no public maps...", ephemeral=True
@@ -1374,17 +1448,7 @@ class ProfileView(OwnedView, discord.ui.LayoutView):
         view.message = interaction.message
         await interaction.edit_original_response(view=view)
 
-    async def on_timeout(self):
-        for item in self.walk_children():
-            if isinstance(item, discord.ui.Button) and item.style is not discord.ButtonStyle.link:
-                item.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
-async def build_badges_view(user_id, username):
+async def build_badges_view(user_id, username, parent=None):
     """Every game badge, marked owned or not for this player."""
     badges = await fetch_universe_badges()
     if not badges:
@@ -1393,7 +1457,7 @@ async def build_badges_view(user_id, username):
     owned_ids = await fetch_owned_badge_ids(user_id, [b["id"] for b in badges])
     owned = [b for b in badges if b["id"] in owned_ids]
 
-    view = discord.ui.LayoutView(timeout=None)
+    view = BadgesCardView(parent=parent)
     container = discord.ui.Container(accent_colour=PROFILE_COLOR)
     container.add_item(discord.ui.TextDisplay(
         f"## 🎖️ Badges — {username}\n-# {len(owned)} of {len(badges)} earned"
@@ -1454,10 +1518,11 @@ async def build_badges_view(user_id, username):
     if dev_note:
         container.add_item(discord.ui.TextDisplay(dev_note))
 
+    view.attach_back_button(container)
     view.add_item(container)
     return view
 
-async def build_created_maps_view(user_id, username, limit=10):
+async def build_created_maps_view(user_id, username, limit=10, parent=None):
     """List the community maps a player has created, most played first."""
     maps_by_id = await get_community_maps()
     if not maps_by_id:
@@ -1471,7 +1536,7 @@ async def build_created_maps_view(user_id, username, limit=10):
         return None
     owned.sort(key=lambda m: m.get("Plays") or 0, reverse=True)
 
-    view = discord.ui.LayoutView(timeout=None)
+    view = MapsCardView(parent=parent)
     container = discord.ui.Container(accent_colour=MAP_COLOR)
     container.add_item(discord.ui.TextDisplay(
         f"## 🗺️ Maps by {username}\n"
@@ -1499,10 +1564,11 @@ async def build_created_maps_view(user_id, username, limit=10):
     if note:
         container.add_item(discord.ui.TextDisplay(note))
 
+    view.attach_back_button(container)
     view.add_item(container)
     return view
 
-async def build_profile_view(user_id, username):
+async def build_profile_view(user_id, username, parent=None):
     """Assemble a profile card, or None when the player has no saved data."""
     entry = await fetch_entry(str(user_id), datastore="Main_Data")
     if not entry:
@@ -1516,22 +1582,23 @@ async def build_profile_view(user_id, username):
     headshot = headshot_map.get(user_id)
     return ProfileView(
         entry, user_id=user_id, username=username,
-        headshot=headshot, wins=wins, restriction=restriction,
+        headshot=headshot, wins=wins, restriction=restriction, parent=parent,
     )
 
-class MapView(OwnedView, discord.ui.LayoutView):
+class MapView(CardView):
     """Components V2 map card with configurable action buttons."""
 
+    card_label = "Map"
+    card_emoji = "🗺️"
+
     def __init__(self, entry, *, headshot=None, creator_text="Unknown",
-                 creator_id=None, creator_name=None, timeout=MAP_VIEW_TIMEOUT,
+                 creator_id=None, creator_name=None, parent=None,
+                 timeout=MAP_VIEW_TIMEOUT,
                  play_label="Play in Challenge Mode",
                  play_url_template=PLAY_URL_TEMPLATE,
                  show_leaderboard=True, show_creator=True):
-        super().__init__(timeout=timeout)
-        self.universe = current_universe()
-        self.bind_owner()
+        super().__init__(parent=parent, timeout=timeout)
         self.entry = entry
-        self.message = None
         self.creator_id = creator_id
         self.creator_name = creator_name
 
@@ -1645,7 +1712,7 @@ class MapView(OwnedView, discord.ui.LayoutView):
         await interaction.response.defer()
 
         name = self.creator_name or str(self.creator_id)
-        view = await build_profile_view(self.creator_id, name)
+        view = await build_profile_view(self.creator_id, name, parent=self)
         if view is None:
             await interaction.followup.send(
                 f"No game data saved for **{name}**.", ephemeral=True
@@ -1654,18 +1721,6 @@ class MapView(OwnedView, discord.ui.LayoutView):
 
         view.message = interaction.message
         await interaction.edit_original_response(view=view)
-
-    async def on_timeout(self):
-        # children are Containers on a LayoutView, so walk down to the
-        # buttons. Link buttons stay enabled -- Play should always work.
-        for item in self.walk_children():
-            if isinstance(item, discord.ui.Button) and item.style is not discord.ButtonStyle.link:
-                item.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
 
 class DailyCupMapView(OwnedView, discord.ui.View):
     """The Daily Cup card's single experience Play action."""
