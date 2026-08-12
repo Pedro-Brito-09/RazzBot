@@ -1510,6 +1510,65 @@ async def build_badges_view(user_id, username, parent=None):
     view.add_item(container)
     return view
 
+def search_public_maps(maps_by_id, query, limit=10):
+    """Public maps whose name matches, best match first.
+
+    Only Privacy == "Public" qualifies, which leaves out both Private and
+    Unlisted maps.
+    """
+    needle = query.strip().lower()
+    if not needle:
+        return []
+
+    scored = []
+    for entry in maps_by_id.values():
+        if entry.get("Privacy") != "Public":
+            continue
+        name = (entry.get("Name") or "").lower()
+        if name == needle:
+            rank = 0
+        elif name.startswith(needle):
+            rank = 1
+        elif needle in name:
+            rank = 2
+        else:
+            continue
+        scored.append((rank, -(entry.get("Plays") or 0), entry))
+
+    # key= avoids falling through to comparing the dicts on a tie.
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [entry for _, _, entry in scored[:limit]]
+
+def build_map_search_view(query, matches, parent=None):
+    """A pick-list of maps matching a name search."""
+    view = MapsCardView(parent=parent)
+    container = discord.ui.Container(accent_colour=MAP_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## 🔎 Maps matching “{query}”\n"
+        f"-# {len(matches)} result{'s' if len(matches) != 1 else ''}"
+        f" · use `/map <id>` to open one"
+    ))
+    container.add_item(discord.ui.Separator())
+
+    lines = []
+    for entry in matches:
+        name = entry.get("Name") or "Unnamed Map"
+        star = " 🌟" if entry.get("Featured") else ""
+        lines.append(
+            f"`#{entry.get('Id')}` **{name}**{star}\n"
+            f"-# ▶️ {format_number(entry.get('Plays') or 0)} plays"
+            f"  ·  ⭐ {format_number(entry.get('Favorites') or 0)}"
+        )
+    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view.attach_back_button(container)
+    view.add_item(container)
+    return view
+
 async def build_created_maps_view(user_id, username, limit=10, parent=None):
     """List the community maps a player has created, most played first."""
     maps_by_id = await get_community_maps()
@@ -2396,21 +2455,8 @@ async def leaderboard_command(ctx, target: str):
 
     await ctx.send(embed=embed)
 
-@bot.hybrid_command(name="map", description="Show info about a community map by its ID")
-@app_commands.describe(map_id="The community map ID")
-async def map_command(ctx, map_id: int):
-    await ctx.defer()
-
-    maps_by_id = await get_community_maps()
-    if not maps_by_id:
-        await ctx.send("Failed to fetch the community map list.")
-        return
-
-    entry = maps_by_id.get(map_id)
-    if entry is None:
-        await ctx.send(f"No community map with ID `{map_id}`.")
-        return
-
+async def build_map_view(entry, parent=None):
+    """Resolve a map's creator and wrap it in a card."""
     creator_id = entry.get("Creator")
     creator = await fetch_username(creator_id) if creator_id else None
     if creator:
@@ -2424,10 +2470,46 @@ async def map_command(ctx, map_id: int):
     if creator_id:
         headshot = (await fetch_headshots([creator_id])).get(creator_id)
 
-    view = MapView(
+    return MapView(
         entry, headshot=headshot, creator_text=creator_text,
-        creator_id=creator_id, creator_name=creator,
+        creator_id=creator_id, creator_name=creator, parent=parent,
     )
+
+@bot.hybrid_command(
+    name="map",
+    description="Show a community map by ID, or search public maps by name",
+)
+@app_commands.describe(query="A map ID, or part of a map name")
+async def map_command(ctx, *, query: str):
+    await ctx.defer()
+
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        await ctx.send("Failed to fetch the community map list.")
+        return
+
+    cleaned = query.strip()
+
+    if cleaned.isdigit():
+        entry = maps_by_id.get(int(cleaned))
+        if entry is None:
+            await ctx.send(f"No community map with ID `{cleaned}`.")
+            return
+        view = await build_map_view(entry)
+        view.message = await ctx.send(view=view)
+        return
+
+    matches = search_public_maps(maps_by_id, cleaned)
+    if not matches:
+        await ctx.send(f"No public maps found for **{cleaned}**.")
+        return
+
+    if len(matches) == 1:
+        view = await build_map_view(matches[0])
+        view.message = await ctx.send(view=view)
+        return
+
+    view = build_map_search_view(cleaned, matches)
     view.message = await ctx.send(view=view)
 
 @bot.hybrid_command(name="profile", description="Show a player's profile")
