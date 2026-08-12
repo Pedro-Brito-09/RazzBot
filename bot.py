@@ -566,6 +566,53 @@ def parse_cup_date(text):
     except (ValueError, AttributeError):
         return None
 
+def parse_cup_stamp(value):
+    """Read TodaysMap's Date into a cup day, whatever shape it arrives in."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            moment = datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return (moment - timedelta(hours=9)).date()
+    if isinstance(value, str):
+        text = value.strip()
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+async def resolve_current_cup(todays_map):
+    """Today's cup index and map ID, allowing for a stale TodaysMap.
+
+    The entry is only written when a player joins, so after the 09:00 UTC
+    rollover it can still hold yesterday's cup. When its Date isn't today's
+    cup day, the live cup is the next one in the queue -- the game advances
+    a single cup per join regardless of how long it sat idle.
+    """
+    index = todays_map.get("Index") if isinstance(todays_map, dict) else None
+    map_id = todays_map.get("Id") if isinstance(todays_map, dict) else None
+    if not isinstance(index, int):
+        return None, None
+
+    raw_date = todays_map.get("Date")
+    stamp = parse_cup_stamp(raw_date)
+    if stamp is None:
+        print(f"TodaysMap Date unreadable ({raw_date!r}); "
+              f"using stored Daily Cup #{index}")
+        return index, map_id
+
+    if stamp == cup_day_today():
+        return index, map_id
+
+    next_index = index + 1
+    print(f"TodaysMap is stale (Date {stamp}, today {cup_day_today()}); "
+          f"advancing to Daily Cup #{next_index}")
+    return next_index, await get_cup_map_id(next_index, todays_map)
+
 async def get_cup_map_id(index, todays_map):
     """Resolve a cup index to its map, anchored to the current rotation."""
     current_index = todays_map.get("Index") if isinstance(todays_map, dict) else None
@@ -1508,9 +1555,10 @@ async def publish_daily_cup_announcement(destination=None):
         channel_id = destination.id
 
     todays_map = await fetch_entry("TodaysMap") or {}
-    current_index = todays_map.get("Index")
-    map_id = todays_map.get("Id")
-    if not isinstance(current_index, int) or map_id is None:
+    # TodaysMap only updates when a player joins, so at 09:00 UTC it can still
+    # hold yesterday's cup. resolve_current_cup advances past a stale entry.
+    current_index, map_id = await resolve_current_cup(todays_map)
+    if current_index is None or map_id is None:
         print("Daily Cup announcement skipped: TodaysMap has no Index or Id")
         return False
 
