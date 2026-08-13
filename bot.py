@@ -2074,6 +2074,10 @@ def render_leaderboard_table(
 
     return "```\n" + "\n".join(lines) + "\n```"
 
+def emphasise_name(name):
+    """Bold a plain name; leave a mention alone, since a pill is already loud."""
+    return name if MENTION_PATTERN.fullmatch(name) else f"**{name}**"
+
 def render_leaderboard_fields(
     rows, *, show_country=True, show_medals=True, value_name="Time"
 ):
@@ -2089,7 +2093,7 @@ def render_leaderboard_fields(
             flag = country_code_to_emoji(r["country"])
             if flag:
                 parts.append(flag)
-        parts.append(f"**{r['name']}**")
+        parts.append(emphasise_name(r["name"]))
         players.append(" ".join(parts))
 
         medal = r["medal"] if show_medals else ""
@@ -2111,7 +2115,7 @@ def render_leaderboard_list(
             flag = country_code_to_emoji(r["country"])
             if flag:
                 parts.append(flag)
-        parts.append(f"**{r['name']}**")
+        parts.append(emphasise_name(r["name"]))
 
         medal = r["medal"] if show_medals else ""
         tail = f"{medal} `{r['value']}`" if medal else f"`{r['value']}`"
@@ -3924,7 +3928,12 @@ async def build_leaderboard_reply(target, guild=None):
         embed = await build_leaderboard_embed(
             rows,
             title="💎 Achievements Leaderboard",
-            subtitle=guild.name,
+            # One line per row rather than two inline fields: a mention pill
+            # renders the whole display name and can't be shortened, so a long
+            # one would wrap the Player column away from the values beside it.
+            # On one line a wrap keeps the count attached to its player.
+            style="list",
+            subtitle=f"{guild.name}  ·  Achievements",
             show_medals=False,
             show_country=False,
             value_name="Achievements",
