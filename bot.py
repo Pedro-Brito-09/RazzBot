@@ -5114,11 +5114,17 @@ async def admin_roles_remove(ctx, rule_id: str):
 
 @bot.command(name="testcup", hidden=True)
 @commands.is_owner()
-async def test_cup_announcement(ctx):
-    """Owner-only preview of the scheduled Daily Cup messages."""
+async def test_cup_announcement(ctx, publish: bool = False):
+    """Owner-only preview of the scheduled Daily Cup messages.
+
+    !testcup true also crossposts, to check publishing end to end. It only
+    does anything in an announcement channel, and it reaches every server
+    following that channel for real -- so it defaults to off.
+    """
     async with ctx.typing():
-        # A preview must never reach the servers following the real channel.
-        posted = await publish_daily_cup_announcement(ctx.channel, crosspost=False)
+        posted = await publish_daily_cup_announcement(
+            ctx.channel, crosspost=publish
+        )
     if not posted:
         await ctx.send(
             "Couldn't build the Daily Cup announcement. Check the bot logs "
