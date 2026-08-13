@@ -120,6 +120,9 @@ SYNC_CATEGORY_ROLE_IDS = {
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
+# Group endpoints refuse a normal Cloud API key ("Only OAuth tokens and User
+# API keys are supported"), so the group conditions need their own credential.
+GROUP_API_KEY = os.getenv("GROUP_API_KEY") or ""
 VERIFICATION_GAME_URL = os.getenv(
     "VERIFICATION_GAME_URL",
     "https://www.roblox.com/games/start?placeId=120140749641241",
@@ -1042,37 +1045,104 @@ def rule_role_id(rule):
     return None
 
 
-async def fetch_group_roles():
-    """Public role definitions for the configured Roblox group."""
-    data = await request_json(
-        f"https://groups.roblox.com/v1/groups/{ROBLOX_GROUP_ID}/roles",
-        label=f"fetch_group_roles({ROBLOX_GROUP_ID})",
-    )
-    roles = data.get("roles") if isinstance(data, dict) else None
-    return roles if isinstance(roles, list) else None
+GROUP_CLOUD_BASE = "https://apis.roblox.com/cloud/v2/groups"
 
+def group_cloud_headers():
+    return {"x-api-key": GROUP_API_KEY, "Accept": "application/json"}
+
+def first_list(payload, *preferred):
+    """The list in an Open Cloud page response, whatever it's called."""
+    if not isinstance(payload, dict):
+        return None
+    for name in preferred:
+        value = payload.get(name)
+        if isinstance(value, list):
+            return value
+    for value in payload.values():
+        if isinstance(value, list):
+            return value
+    return None
+
+def open_cloud_id(value):
+    """Open Cloud names resources by path ('groups/1/roles/2'), not bare IDs."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        tail = value.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            return int(tail)
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        for key in ("id", "path", "name"):
+            found = open_cloud_id(value.get(key))
+            if found is not None:
+                return found
+    return None
+
+def group_role_identity(role):
+    """(id, display name) for one group role."""
+    role_id = open_cloud_id(role.get("id"))
+    if role_id is None:
+        role_id = open_cloud_id(role.get("path"))
+    name = role.get("displayName") or role.get("name") or f"Role #{role_id}"
+    return role_id, str(name)
+
+async def fetch_group_roles():
+    """Every role in the configured group, via Open Cloud.
+
+    The legacy groups.roblox.com endpoints only list the old-style roles, so
+    the new ones are invisible there. Open Cloud sees them, but refuses a
+    normal Cloud API key -- this needs the User API key in GROUP_API_KEY.
+    """
+    if not GROUP_API_KEY:
+        print("fetch_group_roles: GROUP_API_KEY is not set")
+        return None
+
+    roles, page_token = [], None
+    while True:
+        url = f"{GROUP_CLOUD_BASE}/{ROBLOX_GROUP_ID}/roles?maxPageSize=100"
+        if page_token:
+            url += f"&pageToken={quote(page_token)}"
+        data = await request_json(
+            url, headers=group_cloud_headers(),
+            label=f"fetch_group_roles({ROBLOX_GROUP_ID})",
+        )
+        page = first_list(data, "groupRoles", "roles", "data")
+        if page is None:
+            return roles or None
+        roles.extend(r for r in page if isinstance(r, dict))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return roles or None
 
 async def fetch_user_group_role_id(user_id):
-    """Return (lookup_succeeded, exact role ID) in the configured group."""
-    data = await request_json(
-        f"https://groups.roblox.com/v2/users/{user_id}/groups/roles",
-        label=f"fetch_user_group_role({user_id}, {ROBLOX_GROUP_ID})",
-    )
-    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+    """Return (lookup_succeeded, role ID) for this user in the group."""
+    if not GROUP_API_KEY:
+        print("fetch_user_group_role_id: GROUP_API_KEY is not set")
         return False, None
 
-    for membership in data["data"]:
+    condition = quote(f"user == 'users/{user_id}'")
+    data = await request_json(
+        f"{GROUP_CLOUD_BASE}/{ROBLOX_GROUP_ID}/memberships"
+        f"?maxPageSize=10&filter={condition}",
+        headers=group_cloud_headers(),
+        label=f"fetch_user_group_role({user_id}, {ROBLOX_GROUP_ID})",
+    )
+    memberships = first_list(data, "groupMemberships", "memberships", "data")
+    if memberships is None:
+        return False, None
+
+    for membership in memberships:
         if not isinstance(membership, dict):
             continue
-        group = membership.get("group")
-        role = membership.get("role")
-        try:
-            group_id = int(group.get("id"))
-            role_id = int(role.get("id"))
-        except (AttributeError, TypeError, ValueError):
-            continue
-        if group_id == ROBLOX_GROUP_ID:
+        role_id = open_cloud_id(membership.get("role"))
+        if role_id is not None:
             return True, role_id
+    # Reached the group but the user isn't in it.
     return True, None
 
 
@@ -4227,24 +4297,28 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
         async with ctx.typing():
             group_roles = await fetch_group_roles()
         if group_roles is None:
-            await ctx.send(view=simple_card(
-                "Couldn't read the Roblox group's roles. Try again in a moment.",
-                colour=discord.Color.red(),
-            ))
+            hint = ("`GROUP_API_KEY` isn't set — group roles need a Roblox "
+                    "**User API key**, not the data store one."
+                    if not GROUP_API_KEY else
+                    "Couldn't read the Roblox group's roles. Try again in a moment.")
+            await ctx.send(view=simple_card(hint, colour=discord.Color.red()))
             return
 
-        group_role = next((
-            candidate for candidate in group_roles
-            if isinstance(candidate, dict)
-            and str(candidate.get("id")) == str(value)
-        ), None)
-        if group_role is None:
+        identities = [group_role_identity(r) for r in group_roles]
+        group_role_name = next(
+            (name for role_id, name in identities if role_id == value), None
+        )
+        if group_role_name is None:
+            available = "\n".join(
+                f"-# `{role_id}` · {discord.utils.escape_markdown(name)}"
+                for role_id, name in identities if role_id is not None
+            )
             await ctx.send(view=simple_card(
-                f"Group `{ROBLOX_GROUP_ID}` has no role with ID `{value}`.",
+                f"Group `{ROBLOX_GROUP_ID}` has no role with ID `{value}`.\n"
+                f"Available roles:\n{available}"[:3900],
                 colour=discord.Color.red(),
             ))
             return
-        group_role_name = str(group_role.get("name") or f"Role #{value}")
 
     state = {"duplicate": False, "rule": None}
 

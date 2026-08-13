@@ -96,7 +96,13 @@ The admin commands need more: `universe.user-restriction:write` for `!ban` and
 data stores for `!deletemap` and permanent bans.
 
 `/sync` and `!roles` store their rules in a `Roles` data store, which the key
-needs read, create, and update access to. The bot also needs the **Manage
+needs read, create, and update access to.
+
+Group role conditions need a **separate credential** in `GROUP_API_KEY`: the
+Open Cloud group endpoints reject a normal data store key (*"Only OAuth tokens
+and User API keys are supported"*), and the legacy `groups.roblox.com`
+endpoints only list the old-style roles. Generate a Roblox **User API key**
+with group read access. Without it, badge and map rules still work. The bot also needs the **Manage
 Roles** permission in Discord, and its own role must sit **above** every role
 it hands out — Discord refuses otherwise, and `/sync` reports those as roles it
 can't manage.
