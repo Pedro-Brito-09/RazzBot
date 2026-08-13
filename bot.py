@@ -1477,6 +1477,31 @@ async def fetch_linked_user_id(account_id):
     _, user_id = await fetch_linked_account(account_id)
     return user_id
 
+async def fetch_linked_discord_id(roblox_id):
+    """The Discord account linked to a Roblox user, or None.
+
+    The table is keyed by Discord ID, so going the other way is a scan --
+    fine for a single lookup behind a button press.
+    """
+    linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
+    if not isinstance(linked, dict):
+        return None
+    for account_id, linked_roblox in linked.items():
+        try:
+            if int(linked_roblox) == int(roblox_id):
+                return int(account_id)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def in_home_guild(guild):
+    """True in the one server /achievements is published to."""
+    return (
+        guild is not None
+        and HOME_GUILD is not None
+        and guild.id == HOME_GUILD.id
+    )
+
 def normalize_discord_id(value):
     """Normalize datastore keys to the digits in a Discord snowflake."""
     return "".join(
@@ -2266,10 +2291,14 @@ class ProfileView(CardView):
     """Components V2 profile card built from a Main_Data entry."""
 
     def __init__(self, entry, *, user_id, username, headshot=None, wins=None,
-                 restriction=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
+                 restriction=None, guild=None, parent=None,
+                 timeout=MAP_VIEW_TIMEOUT):
         super().__init__(parent=parent, timeout=timeout)
         self.user_id = user_id
         self.username = username
+        # Achievement roles are per-guild and only configured in the home
+        # server, so the button only appears where it can do something.
+        self.guild = guild
 
         data = entry.get("Data") if isinstance(entry, dict) else None
         data = data if isinstance(data, dict) else {}
@@ -2348,6 +2377,15 @@ class ProfileView(CardView):
         medals_button.callback = self.show_medals
         row.add_item(medals_button)
 
+        if in_home_guild(self.guild):
+            achievements_button = discord.ui.Button(
+                label="Achievements",
+                style=discord.ButtonStyle.secondary,
+                emoji="🎭",
+            )
+            achievements_button.callback = self.show_achievements
+            row.add_item(achievements_button)
+
         # When this profile was opened from another card, offer the way back
         # alongside its own actions rather than on a separate row.
         back = self.make_back_button()
@@ -2414,6 +2452,30 @@ class ProfileView(CardView):
             )
             return
 
+        view.message = interaction.message
+        await interaction.edit_original_response(view=view)
+
+    @keeps_context
+    async def show_achievements(self, interaction):
+        # thinking=True would post a new message and
+        # edit_original_response would then edit that, not the card.
+        await interaction.response.defer()
+
+        guild = interaction.guild
+        account_id = await fetch_linked_discord_id(self.user_id)
+        member = guild.get_member(account_id) if account_id and guild else None
+        if member is None:
+            await interaction.followup.send(
+                f"**{self.username}** isn't linked to anyone in this server, "
+                f"so there are no achievement roles to check.",
+                ephemeral=True,
+            )
+            return
+
+        rules = visible_achievement_rules(await fetch_role_rules(guild.id))
+        view = PlayerAchievementsView(
+            rules, guild, member, owner_id=self.owner_id, parent=self,
+        )
         view.message = interaction.message
         await interaction.edit_original_response(view=view)
 
@@ -2867,7 +2929,7 @@ async def build_created_maps_view(user_id, username, parent=None):
         parent=parent,
     )
 
-async def build_profile_view(user_id, username, parent=None):
+async def build_profile_view(user_id, username, parent=None, guild=None):
     """Assemble a profile card, or None when the player has no saved data."""
     entry = await fetch_entry(str(user_id), datastore="Main_Data")
     if not entry:
@@ -2881,7 +2943,8 @@ async def build_profile_view(user_id, username, parent=None):
     headshot = headshot_map.get(user_id)
     return ProfileView(
         entry, user_id=user_id, username=username,
-        headshot=headshot, wins=wins, restriction=restriction, parent=parent,
+        headshot=headshot, wins=wins, restriction=restriction,
+        guild=guild, parent=parent,
     )
 
 def build_map_container(entry, *, headshot=None, creator_text="Unknown",
@@ -3026,7 +3089,9 @@ class MapView(CardView):
         await interaction.response.defer()
 
         name = self.creator_name or str(self.creator_id)
-        view = await build_profile_view(self.creator_id, name, parent=self)
+        view = await build_profile_view(
+            self.creator_id, name, parent=self, guild=interaction.guild
+        )
         if view is None:
             await interaction.followup.send(
                 f"No game data saved for **{name}**.", ephemeral=True
@@ -3924,7 +3989,7 @@ async def profile_command(ctx, username: str = None):
     if user_id is None:
         return
 
-    view = await build_profile_view(user_id, canonical)
+    view = await build_profile_view(user_id, canonical, guild=ctx.guild)
     if view is None:
         await ctx.send(f"No game data saved for **{canonical}**.")
         return
@@ -5440,8 +5505,8 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
 class PlayerAchievementsView(CardView):
     """Toggle between a member's earned and missing achievement roles."""
 
-    def __init__(self, rules, guild, player, *, owner_id=None):
-        super().__init__()
+    def __init__(self, rules, guild, player, *, owner_id=None, parent=None):
+        super().__init__(parent=parent)
         self.owner_id = owner_id
         self.player_name = discord.utils.escape_markdown(player.display_name)
 
@@ -5502,6 +5567,10 @@ class PlayerAchievementsView(CardView):
             )
             button.callback = self.show_missing
         row.add_item(button)
+
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
         container.add_item(row)
         self.add_item(container)
 
