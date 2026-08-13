@@ -3833,11 +3833,13 @@ def render_changelog_lines(lines):
     coloured = []
     # Discord wants the real ESC byte, so the literals below are control
     # characters rather than a backslash-u escape. Keep them intact.
+    # The leading 1 is bold, which is what makes Discord render the bright
+    # variant of each colour -- its ansi support has no 90-97 bright range.
     for line in lines:
         colour = CHANGELOG_LINE_COLORS.get(line[:1], CHANGELOG_DEFAULT_COLOR)
         # A stray fence in the text would end the block early.
         safe = line.replace("```", "`​``")
-        coloured.append(f"[0;{colour}m{safe}[0m")
+        coloured.append(f"[1;{colour}m{safe}[0m")
     return "```ansi\n" + "\n".join(coloured) + "\n```"
 
 def changelog_blocks(date, sections, *, ping=False):
