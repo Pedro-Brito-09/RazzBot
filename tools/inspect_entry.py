@@ -84,6 +84,27 @@ def buffer_field(value):
     return None
 
 
+def unwrap(value, *, max_depth=6):
+    """Peel every buffer layer. Returns (decoded, layers, undecodable bytes).
+
+    An entry can be wrapped more than once -- a buffer whose contents are the
+    JSON of another buffer envelope -- so this keeps going until what comes
+    out is no longer one.
+    """
+    layers = []
+    current = value
+    for _ in range(max_depth):
+        field = buffer_field(current)
+        if field is None:
+            return current, layers, None
+        layers.append((field, current.get("t")))
+        decoded, raw_bytes = decode(current, field)
+        if decoded is None:
+            return None, layers, raw_bytes
+        current = decoded
+    return current, layers, None
+
+
 def decode(value, field):
     raw = base64.b64decode(value[field])
     if field == "zbase64":
@@ -125,19 +146,28 @@ def main():
         if entry.get(field):
             print(f"{field}: {entry[field]}")
 
-    field = buffer_field(value)
+    decoded, layers, raw_bytes = unwrap(value)
+
     print()
-    if field:
-        marker = value.get("t")
+    if layers:
+        field, marker = layers[0]
         print(f"VERDICT: stored as a Luau BUFFER "
               f"(t={marker!r}, payload in {field!r})")
         print("         the game can read this — leave it alone")
-        decoded, raw_bytes = decode(value, field)
     else:
         print("VERDICT: stored as a PLAIN TABLE, not a buffer")
         print("         if the game expects a buffer here it will fail on")
         print("         buffer.tostring — repair with !leaderboard restore")
-        decoded, raw_bytes = value, None
+
+    if len(layers) > 1:
+        print()
+        print(f"WARNING: {len(layers)} buffer layers, one inside the next:")
+        for depth, (field, marker) in enumerate(layers, 1):
+            print(f"         {depth}. t={marker!r} payload in {field!r}")
+        print("         the game unwraps one layer, so it sees the envelope")
+        print("         below rather than the rows — this entry is damaged")
+    elif layers:
+        print(f"         (one layer, decoded from {layers[0][0]!r})")
 
     print()
     if raw_bytes is not None:
