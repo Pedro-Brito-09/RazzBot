@@ -54,10 +54,12 @@ CHANGELOG_DEFAULT_COLOR = "37"
 # A Components V2 message caps at 4000 characters across its text displays.
 CHANGELOG_CHARACTER_BUDGET = 3900
 
+# scope -> (datastore scope, board title, column header). The last two differ
+# where the board is named for the achievement but scored in points.
 GLOBAL_LEADERBOARDS = {
-    "wins": ("Wins", "Wins"),
-    "medals": ("Medals", "Medals"),
-    "creators": ("Creator Points", "Creator Points"),
+    "wins": ("Wins", "Wins", "Wins"),
+    "medals": ("Medals", "Medals", "Points"),
+    "creators": ("Creator Points", "Creator Points", "Points"),
 }
 HEADSHOT_SIZE = "150x150"
 # Custom emoji cannot render inside a code block, so the table style needs
@@ -3910,7 +3912,7 @@ async def build_leaderboard_reply(target, guild=None):
 
     global_leaderboard = GLOBAL_LEADERBOARDS.get(selected)
     if global_leaderboard is not None:
-        scope, value_name = global_leaderboard
+        scope, title, value_name = global_leaderboard
         leaderboard = await fetch_ordered_leaderboard(
             datastore="Data", scope=scope, limit=MAX_LEADERBOARD_ROWS
         )
@@ -3918,7 +3920,7 @@ async def build_leaderboard_reply(target, guild=None):
         if leaderboard:
             embed = await build_leaderboard_embed(
                 leaderboard,
-                title=f"🏆 {value_name} Leaderboard",
+                title=f"🏆 {title} Leaderboard",
                 subtitle=f"Data · {scope}",
                 show_medals=False,
                 show_country=False,
@@ -3926,7 +3928,7 @@ async def build_leaderboard_reply(target, guild=None):
                 value_formatter=format_number,
             )
         if embed is None:
-            return None, f"No entries found for the **{value_name}** leaderboard."
+            return None, f"No entries found for the **{title}** leaderboard."
         return embed, None
 
     try:
@@ -4751,9 +4753,9 @@ async def resolve_removal_board(ctx, user_id, board, reference):
 
     global_board = GLOBAL_LEADERBOARDS.get(selected)
     if global_board is not None:
-        scope, value_name = global_board
+        scope, title, value_name = global_board
         return (
-            f"the {value_name} leaderboard",
+            f"the {title} leaderboard",
             functools.partial(
                 delete_ordered_entry, str(user_id), datastore="Data", scope=scope
             ),
