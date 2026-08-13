@@ -3154,14 +3154,15 @@ def link_code_message(code, expires_at):
 
 @bot.hybrid_command(name="link", description="Link your Discord and Roblox accounts")
 async def link_command(ctx):
+    slash = ctx.interaction is not None
     if not VERIFICATION_GAME_URL:
         await ctx.send(
             "The verification game URL has not been configured yet.",
-            ephemeral=ctx.interaction is not None,
+            ephemeral=slash,
         )
         return
 
-    if ctx.interaction is not None:
+    if slash:
         await ctx.defer(ephemeral=True)
     else:
         await ctx.defer()
@@ -3171,13 +3172,38 @@ async def link_command(ctx):
         or code is None
         or expires_at is None
     ):
-        await ctx.send("Couldn't generate a link code. Try again in a moment.")
+        await ctx.send(
+            "Couldn't generate a link code. Try again in a moment.",
+            ephemeral=slash,
+        )
+        return
+
+    message = link_code_message(code, expires_at)
+    view = AccountLinkView(ctx.author.id, code, expires_at)
+
+    # Only a slash reply can be ephemeral. Invoked as !link or "@Razz link"
+    # in a server, the code would be posted for everyone to see -- and anyone
+    # could redeem it -- so it goes to DMs instead. Already in a DM, the
+    # channel is private enough on its own.
+    if slash or ctx.guild is None:
+        await ctx.send(message, view=view, ephemeral=slash)
+        return
+
+    mention_author = discord.AllowedMentions(users=True)
+    try:
+        await ctx.author.send(message, view=view)
+    except discord.Forbidden:
+        await ctx.send(
+            f"{ctx.author.mention} I can't DM you. Turn on **Privacy "
+            "Settings → Direct Messages** for this server, or run `/link` "
+            "instead — that one replies privately.",
+            allowed_mentions=mention_author,
+        )
         return
 
     await ctx.send(
-        link_code_message(code, expires_at),
-        view=AccountLinkView(ctx.author.id, code, expires_at),
-        ephemeral=ctx.interaction is not None,
+        f"{ctx.author.mention} check your DMs for your link code.",
+        allowed_mentions=mention_author,
     )
 
 @bot.hybrid_command(description="Show a daily cup leaderboard by date or index")
