@@ -1119,11 +1119,15 @@ async def fetch_group_roles():
             break
     return roles or None
 
-async def fetch_user_group_role_id(user_id):
-    """Return (lookup_succeeded, role ID) for this user in the group."""
+async def fetch_user_group_role_ids(user_id):
+    """Return (lookup_succeeded, set of role IDs) for this user in the group.
+
+    The newer group system lets a member hold several roles at once, which
+    the membership carries as a `roles` list alongside the primary `role`.
+    """
     if not GROUP_API_KEY:
-        print("fetch_user_group_role_id: GROUP_API_KEY is not set")
-        return False, None
+        print("fetch_user_group_role_ids: GROUP_API_KEY is not set")
+        return False, set()
 
     condition = quote(f"user == 'users/{user_id}'")
     data = await request_json(
@@ -1134,16 +1138,21 @@ async def fetch_user_group_role_id(user_id):
     )
     memberships = first_list(data, "groupMemberships", "memberships", "data")
     if memberships is None:
-        return False, None
+        return False, set()
 
+    role_ids = set()
     for membership in memberships:
         if not isinstance(membership, dict):
             continue
-        role_id = open_cloud_id(membership.get("role"))
-        if role_id is not None:
-            return True, role_id
-    # Reached the group but the user isn't in it.
-    return True, None
+        held = membership.get("roles")
+        if not isinstance(held, list):
+            held = [membership.get("role")]
+        for entry in held:
+            role_id = open_cloud_id(entry)
+            if role_id is not None:
+                role_ids.add(role_id)
+    # Reached the group; an empty set just means they aren't a member.
+    return True, role_ids
 
 
 async def qualifying_roles(rules, roblox_id, *, map_cache):
@@ -1155,9 +1164,9 @@ async def qualifying_roles(rules, roblox_id, *, map_cache):
 
     group_rules = [r for r in rules if r.get("type") == "group"]
     if group_rules:
-        group_lookup_ok, group_role_id = await fetch_user_group_role_id(roblox_id)
+        group_lookup_ok, group_role_ids = await fetch_user_group_role_ids(roblox_id)
     else:
-        group_lookup_ok, group_role_id = True, None
+        group_lookup_ok, group_role_ids = True, set()
 
     earned = set()
     unresolved = set()
@@ -1178,7 +1187,7 @@ async def qualifying_roles(rules, roblox_id, *, map_cache):
                 required_group_role_id = int(value)
             except (TypeError, ValueError):
                 continue
-            if group_role_id == required_group_role_id:
+            if required_group_role_id in group_role_ids:
                 earned.add(role_id)
     return earned, unresolved
 
