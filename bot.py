@@ -16,6 +16,7 @@ import re
 import secrets
 import string
 import time
+from typing import Optional
 from urllib.parse import quote
 from datetime import datetime, time as datetime_time, timedelta, timezone
 
@@ -2886,7 +2887,9 @@ async def publish_daily_cup_announcement(destination=None, *, crosspost=True):
         f"Posted Daily Cup #{previous_index} results and "
         f"Daily Cup #{current_index} map {map_id} to channel {channel_id}"
     )
-    return True
+    # The channel it landed in, so a caller can say where it went. Still
+    # truthy, which is all the scheduled task and !testcup check.
+    return destination
 
 @tasks.loop(time=datetime_time(hour=9, minute=0, tzinfo=timezone.utc))
 async def daily_cup_announcement():
@@ -5114,22 +5117,27 @@ async def admin_roles_remove(ctx, rule_id: str):
 
 @bot.command(name="testcup", hidden=True)
 @commands.is_owner()
-async def test_cup_announcement(ctx, publish: bool = False):
-    """Owner-only preview of the scheduled Daily Cup messages.
+async def test_cup_announcement(
+    ctx, channel: Optional[discord.TextChannel] = None, publish: bool = False
+):
+    """Owner-only run of the scheduled Daily Cup messages.
 
-    !testcup true also crossposts, to check publishing end to end. It only
-    does anything in an announcement channel, and it reaches every server
-    following that channel for real -- so it defaults to off.
+    Goes to DAILY_CUP_CHANNEL_ID by default, so it exercises the real path.
+    Name a channel to post somewhere else: `!testcup #scratch`.
+    Pass true to crosspost as well: `!testcup true` -- that reaches every
+    server following an announcement channel for real, so it defaults to off.
     """
     async with ctx.typing():
-        posted = await publish_daily_cup_announcement(
-            ctx.channel, crosspost=publish
-        )
+        posted = await publish_daily_cup_announcement(channel, crosspost=publish)
     if not posted:
         await ctx.send(
             "Couldn't build the Daily Cup announcement. Check the bot logs "
-            "for the missing Roblox data."
+            "for the missing Roblox data or the configured channel."
         )
+        return
+
+    if posted.id != ctx.channel.id:
+        await ctx.send(f"Posted to {posted.mention}.", allowed_mentions=SILENT)
 
 def register_dev_variants():
     """Give every command a prefix-only !dev_ twin bound to DEV_UNIVERSE_ID.
