@@ -3998,8 +3998,11 @@ async def profile_command(ctx, username: str = None):
 
 def describe_command(command, prefix):
     usage = f"{prefix}{command.qualified_name}"
-    if command.signature:
-        usage += f" {command.signature}"
+    # usage="" hides arguments the slash form doesn't take, for commands whose
+    # prefix half accepts more than the app command does.
+    signature = command.usage if command.usage is not None else command.signature
+    if signature:
+        usage += f" {signature}"
     summary = command.description or command.short_doc or ""
     line = f"`{usage}`"
     if summary:
@@ -4079,11 +4082,84 @@ def summarize_sync(added, removed, blocked):
                      + ", ".join(f"`{r}`" for r in blocked))
     return "\n".join(lines)
 
-@bot.hybrid_command(name="sync", description="Update your roles from your Roblox progress")
-@app_commands.describe(
-    target="Admin only: a member to sync, or `all` for everyone linked"
+async def sync_member_card(member, viewer_id, rules, map_cache=None):
+    """Sync one member's roles and return the card describing the outcome."""
+    roblox_id = await fetch_linked_user_id(member.id)
+    if roblox_id is None:
+        who = "You haven't" if member.id == viewer_id else f"**{member}** hasn't"
+        return simple_card(
+            f"{who} linked a Roblox account. Use `/link` first.",
+            colour=discord.Color.greyple(),
+        )
+
+    try:
+        added, removed, blocked = await sync_member_roles(
+            member, roblox_id, rules,
+            map_cache=map_cache if map_cache is not None else {},
+        )
+    except discord.Forbidden:
+        return simple_card(
+            "I don't have permission to edit those roles.",
+            colour=discord.Color.red(),
+        )
+
+    name, headshots = await asyncio.gather(
+        fetch_username(roblox_id), fetch_headshots([roblox_id])
+    )
+    heading = (f"## 🔄 Roles synced\n"
+               f"{member.mention}  ·  🎮 **{name or roblox_id}**")
+
+    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+    headshot = headshots.get(roblox_id)
+    if headshot:
+        container.add_item(discord.ui.Section(
+            discord.ui.TextDisplay(heading),
+            accessory=discord.ui.Thumbnail(media=headshot),
+        ))
+    else:
+        container.add_item(discord.ui.TextDisplay(heading))
+
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        summarize_sync(added, removed, blocked)
+    ))
+
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+@bot.tree.command(
+    name="sync", description="Update your roles from your Roblox progress"
+)
+async def sync_slash_command(interaction: discord.Interaction):
+    """Always syncs the caller -- picking a target is prefix-only."""
+    if interaction.guild is None:
+        await interaction.response.send_message(view=simple_card(
+            "This only works inside a server.", colour=discord.Color.red(),
+        ))
+        return
+
+    await interaction.response.defer()
+    rules = await fetch_role_rules(interaction.guild.id)
+    member = (
+        interaction.guild.get_member(interaction.user.id) or interaction.user
+    )
+    view = await sync_member_card(member, interaction.user.id, rules)
+    await interaction.followup.send(view=view, allowed_mentions=SILENT)
+
+# Prefix-only, so the target stays available to admins without appearing as
+# an option on the slash command everyone sees.
+@bot.command(
+    name="sync",
+    description="Update your roles from your Roblox progress",
+    usage="",
 )
 async def sync_command(ctx, *, target: str = None):
+    """!sync [member|all] — a target is admin-only, except naming yourself."""
     if ctx.guild is None:
         await ctx.send(view=simple_card("This only works inside a server.",
                                         colour=discord.Color.red()))
@@ -4152,53 +4228,9 @@ async def sync_command(ctx, *, target: str = None):
     else:
         member = ctx.guild.get_member(ctx.author.id) or ctx.author
 
-    roblox_id = await fetch_linked_user_id(member.id)
-    if roblox_id is None:
-        who = "You haven't" if member.id == ctx.author.id else f"**{member}** hasn't"
-        await ctx.send(view=simple_card(
-            f"{who} linked a Roblox account. Use `/link` first.",
-            colour=discord.Color.greyple(),
-        ))
-        return
-
-    try:
-        added, removed, blocked = await sync_member_roles(
-            member, roblox_id, rules, map_cache=map_cache
-        )
-    except discord.Forbidden:
-        await ctx.send(view=simple_card(
-            "I don't have permission to edit those roles.",
-            colour=discord.Color.red(),
-        ))
-        return
-
-    name, headshots = await asyncio.gather(
-        fetch_username(roblox_id), fetch_headshots([roblox_id])
+    view = await sync_member_card(
+        member, ctx.author.id, rules, map_cache=map_cache
     )
-    heading = (f"## 🔄 Roles synced\n"
-               f"{member.mention}  ·  🎮 **{name or roblox_id}**")
-
-    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-    headshot = headshots.get(roblox_id)
-    if headshot:
-        container.add_item(discord.ui.Section(
-            discord.ui.TextDisplay(heading),
-            accessory=discord.ui.Thumbnail(media=headshot),
-        ))
-    else:
-        container.add_item(discord.ui.TextDisplay(heading))
-
-    container.add_item(discord.ui.Separator())
-    container.add_item(discord.ui.TextDisplay(
-        summarize_sync(added, removed, blocked)
-    ))
-
-    note = dev_universe_note()
-    if note:
-        container.add_item(discord.ui.TextDisplay(note))
-
-    view = discord.ui.LayoutView(timeout=None)
-    view.add_item(container)
     await ctx.send(view=view, allowed_mentions=SILENT)
 
 @bot.hybrid_command(description="Check that the bot is alive")
@@ -5855,7 +5887,7 @@ register_dev_variants()
 
 # Published to the home server alone. Both need a real member and this
 # server's own role rules, so there is nothing for them to do anywhere else.
-HOME_GUILD_COMMANDS = (achievements_slash_command, sync_command)
+HOME_GUILD_COMMANDS = (achievements_slash_command, sync_slash_command)
 
 def restrict_to_home_guild():
     """Move the home-guild commands off the global tree onto GUILD_ID.
