@@ -1886,7 +1886,9 @@ class BadgesCardView(CardView):
         self.owned_ids = owned_ids
         self.icons = icons
         self.username = username
-        self.checklist = False
+        # Opens as the checklist: it covers every badge, earned and missing,
+        # while the galleries stop at the first MAX_BADGE_GALLERIES rows.
+        self.checklist = True
         self.page = 0
         self.render()
 
