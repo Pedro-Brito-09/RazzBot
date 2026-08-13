@@ -106,8 +106,7 @@ ACCOUNT_LINK_DATASTORE = "AccountLinking"
 LINK_CODE_EXPIRATIONS_KEY = "CodeExpirations"
 # Discord role rules live here, keyed by guild.
 ROLES_DATASTORE = "Roles"
-ROLE_CONDITIONS = ("badge", "map", "group")
-ROBLOX_GROUP_ID = 34940057
+ROLE_CONDITIONS = ("badge", "map")
 # Always granted by /sync, but omitted from its change summary. These organize
 # achievement roles into Discord profile categories rather than representing
 # achievements themselves.
@@ -120,9 +119,6 @@ SYNC_CATEGORY_ROLE_IDS = {
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
-# Group endpoints refuse a normal Cloud API key ("Only OAuth tokens and User
-# API keys are supported"), so the group conditions need their own credential.
-GROUP_API_KEY = os.getenv("GROUP_API_KEY") or ""
 VERIFICATION_GAME_URL = os.getenv(
     "VERIFICATION_GAME_URL",
     "https://www.roblox.com/games/start?placeId=120140749641241",
@@ -1045,128 +1041,12 @@ def rule_role_id(rule):
     return None
 
 
-GROUP_CLOUD_BASE = "https://apis.roblox.com/cloud/v2/groups"
-
-def group_cloud_headers():
-    return {"x-api-key": GROUP_API_KEY, "Accept": "application/json"}
-
-def first_list(payload, *preferred):
-    """The list in an Open Cloud page response, whatever it's called."""
-    if not isinstance(payload, dict):
-        return None
-    for name in preferred:
-        value = payload.get(name)
-        if isinstance(value, list):
-            return value
-    for value in payload.values():
-        if isinstance(value, list):
-            return value
-    return None
-
-def open_cloud_id(value):
-    """Open Cloud names resources by path ('groups/1/roles/2'), not bare IDs."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        tail = value.rstrip("/").rsplit("/", 1)[-1]
-        try:
-            return int(tail)
-        except ValueError:
-            return None
-    if isinstance(value, dict):
-        for key in ("id", "path", "name"):
-            found = open_cloud_id(value.get(key))
-            if found is not None:
-                return found
-    return None
-
-def group_role_identity(role):
-    """(id, display name) for one group role."""
-    role_id = open_cloud_id(role.get("id"))
-    if role_id is None:
-        role_id = open_cloud_id(role.get("path"))
-    name = role.get("displayName") or role.get("name") or f"Role #{role_id}"
-    return role_id, str(name)
-
-async def fetch_group_roles():
-    """Every role in the configured group, via Open Cloud.
-
-    The legacy groups.roblox.com endpoints only list the old-style roles, so
-    the new ones are invisible there. Open Cloud sees them, but refuses a
-    normal Cloud API key -- this needs the User API key in GROUP_API_KEY.
-    """
-    if not GROUP_API_KEY:
-        print("fetch_group_roles: GROUP_API_KEY is not set")
-        return None
-
-    roles, page_token = [], None
-    while True:
-        url = f"{GROUP_CLOUD_BASE}/{ROBLOX_GROUP_ID}/roles?maxPageSize=100"
-        if page_token:
-            url += f"&pageToken={quote(page_token)}"
-        data = await request_json(
-            url, headers=group_cloud_headers(),
-            label=f"fetch_group_roles({ROBLOX_GROUP_ID})",
-        )
-        page = first_list(data, "groupRoles", "roles", "data")
-        if page is None:
-            return roles or None
-        roles.extend(r for r in page if isinstance(r, dict))
-        page_token = data.get("nextPageToken")
-        if not page_token:
-            break
-    return roles or None
-
-async def fetch_user_group_role_ids(user_id):
-    """Return (lookup_succeeded, set of role IDs) for this user in the group.
-
-    The newer group system lets a member hold several roles at once, which
-    the membership carries as a `roles` list alongside the primary `role`.
-    """
-    if not GROUP_API_KEY:
-        print("fetch_user_group_role_ids: GROUP_API_KEY is not set")
-        return False, set()
-
-    condition = quote(f"user == 'users/{user_id}'")
-    data = await request_json(
-        f"{GROUP_CLOUD_BASE}/{ROBLOX_GROUP_ID}/memberships"
-        f"?maxPageSize=10&filter={condition}",
-        headers=group_cloud_headers(),
-        label=f"fetch_user_group_role({user_id}, {ROBLOX_GROUP_ID})",
-    )
-    memberships = first_list(data, "groupMemberships", "memberships", "data")
-    if memberships is None:
-        return False, set()
-
-    role_ids = set()
-    for membership in memberships:
-        if not isinstance(membership, dict):
-            continue
-        held = membership.get("roles")
-        if not isinstance(held, list):
-            held = [membership.get("role")]
-        for entry in held:
-            role_id = open_cloud_id(entry)
-            if role_id is not None:
-                role_ids.add(role_id)
-    # Reached the group; an empty set just means they aren't a member.
-    return True, role_ids
-
-
 async def qualifying_roles(rules, roblox_id, *, map_cache):
     """Return (earned role IDs, role IDs skipped after lookup failures)."""
     badge_ids = [r["value"] for r in rules if r.get("type") == "badge"]
     owned_badges = (
         await fetch_owned_badge_ids(roblox_id, badge_ids) if badge_ids else set()
     )
-
-    group_rules = [r for r in rules if r.get("type") == "group"]
-    if group_rules:
-        group_lookup_ok, group_role_ids = await fetch_user_group_role_ids(roblox_id)
-    else:
-        group_lookup_ok, group_role_ids = True, set()
 
     earned = set()
     unresolved = set()
@@ -1179,16 +1059,6 @@ async def qualifying_roles(rules, roblox_id, *, map_cache):
             earned.add(role_id)
         elif kind == "map" and roblox_id in await map_finishers(value, map_cache):
             earned.add(role_id)
-        elif kind == "group":
-            if not group_lookup_ok:
-                unresolved.add(role_id)
-                continue
-            try:
-                required_group_role_id = int(value)
-            except (TypeError, ValueError):
-                continue
-            if required_group_role_id in group_role_ids:
-                earned.add(role_id)
     return earned, unresolved
 
 def manageable_role(guild, role_id):
@@ -1207,6 +1077,9 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
     Only roles named by a rule are ever touched, so unrelated roles are
     left alone. Returns (added, removed, blocked) as role lists.
     """
+    # A rule whose condition this build no longer understands is ignored
+    # outright -- treating it as unmet would strip the role from everyone.
+    rules = [rule for rule in rules if rule.get("type") in ROLE_CONDITIONS]
     earned, unresolved = await qualifying_roles(
         rules, roblox_id, map_cache=map_cache
     )
@@ -4019,8 +3892,8 @@ async def role_rule_badge_names(rules):
 
 
 def visible_achievement_rules(rules):
-    """Group-role mappings sync normally but never appear in achievement UI."""
-    return [rule for rule in rules if rule.get("type") != "group"]
+    """Only conditions this build knows how to describe."""
+    return [rule for rule in rules if rule.get("type") in ROLE_CONDITIONS]
 
 
 def badge_link_parts(name):
@@ -4084,14 +3957,6 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
             condition = f"Complete **[map #{map_id}]({play_url})**"
         else:
             condition = "Complete **Unknown map**"
-    elif rule.get("type") == "group":
-        group_role_name = discord.utils.escape_markdown(
-            str(rule.get("group_role_name") or f"Role #{rule.get('value', '?')}")
-        )
-        condition = (
-            f"Have Roblox group role **{group_role_name}** "
-            f"in group **{ROBLOX_GROUP_ID}**"
-        )
     else:
         condition = "⚠️ Unknown requirement"
     lines = []
@@ -4192,7 +4057,7 @@ def build_role_rules_view(
         text = "No achievement roles are configured yet."
         if admin:
             text += (
-                "\n-# Add: `!roles add @Role <map|badge|group> <ID>`"
+                "\n-# Add: `!roles add @Role <map|badge> <ID>`"
             )
         return simple_card(
             text,
@@ -4219,7 +4084,7 @@ def build_role_rules_view(
     if admin:
         footer = (
             "-# Remove: `!roles remove <rule ID>`\n"
-            "-# Add: `!roles add @Role <map|badge|group> <ID>`"
+            "-# Add: `!roles add @Role <map|badge> <ID>`"
         )
     else:
         footer = "-# Use `/sync` to update your roles."
@@ -4284,7 +4149,7 @@ async def admin_roles(ctx, player: discord.Member = None):
 @admin_roles.command(name="add")
 @is_admin()
 async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
-    """!roles add <@role> <badge|map|group> <id>"""
+    """!roles add <@role> <badge|map> <id>"""
     kind = condition.strip().lower()
     if kind not in ROLE_CONDITIONS:
         await ctx.send(view=simple_card(
@@ -4300,34 +4165,6 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
             colour=discord.Color.red(),
         ), allowed_mentions=SILENT)
         return
-
-    group_role_name = None
-    if kind == "group":
-        async with ctx.typing():
-            group_roles = await fetch_group_roles()
-        if group_roles is None:
-            hint = ("`GROUP_API_KEY` isn't set — group roles need a Roblox "
-                    "**User API key**, not the data store one."
-                    if not GROUP_API_KEY else
-                    "Couldn't read the Roblox group's roles. Try again in a moment.")
-            await ctx.send(view=simple_card(hint, colour=discord.Color.red()))
-            return
-
-        identities = [group_role_identity(r) for r in group_roles]
-        group_role_name = next(
-            (name for role_id, name in identities if role_id == value), None
-        )
-        if group_role_name is None:
-            available = "\n".join(
-                f"-# `{role_id}` · {discord.utils.escape_markdown(name)}"
-                for role_id, name in identities if role_id is not None
-            )
-            await ctx.send(view=simple_card(
-                f"Group `{ROBLOX_GROUP_ID}` has no role with ID `{value}`.\n"
-                f"Available roles:\n{available}"[:3900],
-                colour=discord.Color.red(),
-            ))
-            return
 
     state = {"duplicate": False, "rule": None}
 
@@ -4346,8 +4183,6 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
             "type": kind,
             "value": value,
         }
-        if group_role_name is not None:
-            rule["group_role_name"] = group_role_name
         state["rule"] = rule
         return rules + [rule]
 
