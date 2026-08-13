@@ -493,17 +493,69 @@ async def delete_ordered_entry(entry_key, datastore="Data", scope="Wins"):
               f"{type(error).__name__}: {error}")
         return False
 
-async def purge_player_from_leaderboards(user_id):
-    """Remove a player from the global ordered leaderboards.
+def same_roblox_id(value, user_id):
+    """Compare a stored UserId to a Roblox ID, whichever way it was written."""
+    try:
+        return int(value) == int(user_id)
+    except (TypeError, ValueError):
+        return False
 
-    Returns the names of the boards they were removed from. The Daily Cup
-    board is a list inside a regular entry and is handled separately.
+async def purge_player_from_cup(user_id, index):
+    """Drop a player's row from one Daily Cup leaderboard.
+
+    The board is a list inside a regular entry, so it takes a read-modify-write
+    rather than a delete. True once the board no longer lists them.
     """
-    removed = []
-    for scope in ("Wins", "Medals"):
-        if await delete_ordered_entry(str(user_id), datastore="Data", scope=scope):
-            removed.append(scope)
-    return removed
+    def transform(entries):
+        if not isinstance(entries, list):
+            return None
+        kept = [
+            entry for entry in entries
+            if not (isinstance(entry, dict)
+                    and same_roblox_id(entry.get("UserId"), user_id))
+        ]
+        # None leaves the entry alone, so an absent player costs no write.
+        return kept if len(kept) != len(entries) else None
+
+    status = await update_entry_with_retry(
+        f"DailyCup_{index}", "Leaderboards", transform
+    )
+    # "skipped" is the player not being on the board, "missing" is no board at
+    # all -- both are the state we wanted, same as a 404 on a delete.
+    return status in ("ok", "skipped", "missing")
+
+async def ban_purge_targets(user_id):
+    """Everything a permanent ban clears, as (label, action) pairs.
+
+    Each action stands alone so one that fails can be retried on its own
+    without redoing the rest.
+    """
+    targets = [
+        (scope, functools.partial(
+            delete_ordered_entry, str(user_id), datastore="Data", scope=scope
+        ))
+        for scope in ("Wins", "Medals")
+    ]
+
+    index, _ = await resolve_current_cup(await fetch_entry("TodaysMap") or {})
+    if index is not None:
+        targets.append((
+            f"Daily Cup #{index}",
+            functools.partial(purge_player_from_cup, user_id, index),
+        ))
+    return targets
+
+async def purge_player_from_leaderboards(user_id):
+    """Clear a player from the global boards and the live Daily Cup.
+
+    Returns (cleared labels, failed targets); a failed target carries the
+    action that produced it, ready to be retried from a button.
+    """
+    targets = await ban_purge_targets(user_id)
+    outcomes = await asyncio.gather(*(action() for _, action in targets))
+    cleared = [label for (label, _), ok in zip(targets, outcomes) if ok]
+    failed = [target for target, ok in zip(targets, outcomes) if not ok]
+    return cleared, failed
 
 def data_store_entry_url(entry_key, datastore, universe_id=None):
     return (
@@ -3280,6 +3332,72 @@ async def resolve_admin_target(ctx, player):
         return None, None
     return user_id, canonical
 
+class BanPurgeView(OwnedView, discord.ui.View):
+    """Retry buttons for the purges a permanent ban couldn't finish."""
+
+    def __init__(self, notice, cleared, pending, *, timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(timeout=timeout)
+        self.universe = current_universe()
+        self.bind_owner()
+        self.message = None
+        self.notice = notice
+        self.cleared = cleared
+        self.pending = pending
+        self.retry_failed = False
+        self.refresh()
+
+    def refresh(self):
+        """One button per purge still outstanding."""
+        self.clear_items()
+        for target in self.pending:
+            button = discord.ui.Button(
+                label=f"Retry {target[0]}",
+                style=discord.ButtonStyle.danger,
+                emoji="🔁",
+            )
+            button.callback = self.make_retry(target)
+            self.add_item(button)
+        if not self.pending:
+            # Nothing left to retry, so the view is done.
+            self.stop()
+
+    def render(self):
+        lines = list(self.notice)
+        lines.append(
+            "-# Removed from: "
+            + (", ".join(self.cleared) if self.cleared else "nothing")
+        )
+        if self.pending:
+            missed = ", ".join(label for label, _ in self.pending)
+            again = " — the retry failed again" if self.retry_failed else ""
+            lines.append(f"-# ⚠️ Couldn't clear: {missed}{again}. Check the logs.")
+        return "\n".join(lines)
+
+    def make_retry(self, target):
+        """A callback retrying exactly one failed purge."""
+        label, action = target
+
+        async def retry(interaction):
+            universe = _active_universe.set(self.universe)
+            invoker = _active_invoker.set(self.owner_id)
+            try:
+                await interaction.response.defer()
+                if await action():
+                    self.pending = [t for t in self.pending if t != target]
+                    self.cleared.append(label)
+                    self.retry_failed = False
+                else:
+                    self.retry_failed = True
+                self.refresh()
+                await interaction.edit_original_response(
+                    content=self.render(), view=self
+                )
+            finally:
+                _active_universe.reset(universe)
+                _active_invoker.reset(invoker)
+
+        return retry
+
 @bot.command(name="ban", hidden=True)
 @is_admin()
 async def admin_ban(ctx, player: str, duration: str = "perm", *, reason: str = ""):
@@ -3318,13 +3436,16 @@ async def admin_ban(ctx, player: str, duration: str = "perm", *, reason: str = "
         if reason:
             lines.append(f"-# {reason}")
 
-        if permanent:
-            removed = await purge_player_from_leaderboards(user_id)
-            lines.append(
-                "-# Removed from: " + (", ".join(removed) if removed else "nothing")
-            )
+        if not permanent:
+            await ctx.send("\n".join(lines))
+            return
 
-        await ctx.send("\n".join(lines))
+        cleared, failed = await purge_player_from_leaderboards(user_id)
+        view = BanPurgeView(lines, cleared, failed)
+        if failed:
+            view.message = await ctx.send(view.render(), view=view)
+        else:
+            await ctx.send(view.render())
 
 @bot.command(name="unban", hidden=True)
 @is_admin()
