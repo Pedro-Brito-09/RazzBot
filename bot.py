@@ -621,92 +621,72 @@ async def run_luau(script):
     results = (task.get("output") or {}).get("results") or []
     return "COMPLETE", results[0] if results else None
 
-# Reads whatever shape the entry is in, and always writes a buffer back --
-# so a board that was already flattened into a table gets repaired in place.
-LUAU_BOARD_REMOVE = """
+# Luau has no zstd, and a damaged board's inner layer is zstd-compressed, so
+# the decoding stays in Python and Luau only does the write. buffer.fromstring
+# is the whole point: a buffer written from Luau is a real buffer.
+LUAU_BOARD_WRITE = """
 local DataStoreService = game:GetService("DataStoreService")
-local HttpService = game:GetService("HttpService")
-
 local store = DataStoreService:GetDataStore("Leaderboards")
+
 local key = %s
-local userId = %s
+local payload = %s
 
-local value = store:GetAsync(key)
-if value == nil then
-    return { status = "missing" }
-end
+store:SetAsync(key, buffer.fromstring(payload))
 
-local text
-if typeof(value) == "buffer" then
-    text = buffer.tostring(value)
-elseif type(value) == "string" then
-    text = value
-else
-    text = HttpService:JSONEncode(value)
-end
-
-local ok, entries = pcall(function()
-    return HttpService:JSONDecode(text)
-end)
-if not ok or type(entries) ~= "table" then
-    return { status = "unreadable" }
-end
-
-local kept = {}
-local removed = 0
-for _, entry in ipairs(entries) do
-    if type(entry) == "table" and tonumber(entry.UserId) == userId then
-        removed += 1
-    else
-        table.insert(kept, entry)
-    end
-end
-
-if removed == 0 then
-    return { status = "absent" }
-end
-
-store:SetAsync(key, buffer.fromstring(HttpService:JSONEncode(kept)))
-return { status = "ok", removed = removed, remaining = #kept }
+-- Read back, so the reply reports what actually landed rather than assuming.
+local stored = store:GetAsync(key)
+return { status = "ok", stored = typeof(stored), bytes = #payload }
 """
 
-# Repairs a board the datastore API flattened into a plain table. The rows
-# survived that write intact, so this only puts the buffer wrapper back.
-LUAU_BOARD_RESTORE = """
-local DataStoreService = game:GetService("DataStoreService")
-local HttpService = game:GetService("HttpService")
+def lua_long_string(text):
+    """Wrap text in a Lua long-bracket literal, which needs no escaping.
 
-local store = DataStoreService:GetDataStore("Leaderboards")
-local key = %s
+    JSON escapes and Lua's do not agree -- \\uXXXX is valid in one and not the
+    other -- so quoting the payload is a trap. Long brackets take the bytes
+    verbatim; the level grows until the closer can't match early.
 
-local value = store:GetAsync(key)
-if value == nil then
-    return { status = "missing" }
-end
-if typeof(value) == "buffer" then
-    return { status = "already_buffer" }
-end
-
-local text
-if type(value) == "string" then
-    text = value
-else
-    text = HttpService:JSONEncode(value)
-end
-
-local ok, entries = pcall(function()
-    return HttpService:JSONDecode(text)
-end)
-if not ok or type(entries) ~= "table" then
-    return { status = "unreadable" }
-end
-
-store:SetAsync(key, buffer.fromstring(HttpService:JSONEncode(entries)))
-return { status = "ok", entries = #entries }
-"""
+    The test is against text plus closer, not text alone: JSON ends in "]",
+    which butts against a level-0 "]]" and would close the string one
+    character short.
+    """
+    level = 0
+    while True:
+        pad = "=" * level
+        closer = f"]{pad}]"
+        # A long string swallows one leading newline, so give it one.
+        body = f"\n{text}"
+        if (body + closer).index(closer) == len(body):
+            return f"[{pad}[{body}{closer}"
+        level += 1
 
 def luau_result_status(result):
     return result.get("status") if isinstance(result, dict) else None
+
+async def read_board_rows(key):
+    """A board's rows, unwrapped however deep. Returns (status, rows, layers)."""
+    status, resource = await fetch_entry_resource(key, "Leaderboards")
+    if status != "ok":
+        return status, None, 0
+    rows, layers = unwrap_entry_value(resource.get("value"))
+    if not isinstance(rows, list):
+        return "unreadable", None, layers
+    return "ok", rows, layers
+
+async def write_board_rows(key, rows):
+    """Write rows back as a single-layer buffer, through Luau."""
+    payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    state, result = await run_luau(LUAU_BOARD_WRITE % (
+        json.dumps(str(key)), lua_long_string(payload)
+    ))
+    if state != "COMPLETE":
+        print(f"write_board_rows({key}) {state}: {result}")
+        return False, result
+    if luau_result_status(result) != "ok":
+        return False, f"the task returned {result!r}"
+    stored = result.get("stored") if isinstance(result, dict) else None
+    if stored != "buffer":
+        return False, f"the entry came back as a {stored}, not a buffer"
+    return True, None
 
 def same_roblox_id(value, user_id):
     """Compare a stored UserId to a Roblox ID, whichever way it was written."""
@@ -723,20 +703,27 @@ async def purge_player_from_board(user_id, key):
     store one, so writing from here would leave a plain table the game fails
     to read back.
     """
-    state, result = await run_luau(
-        LUAU_BOARD_REMOVE % (json.dumps(str(key)), int(user_id))
-    )
-    if state != "COMPLETE":
-        print(f"purge_player_from_board({key}) {state}: {result}")
+    status, rows, _ = await read_board_rows(key)
+    # No board at all is the state we wanted, same as a 404 on a delete.
+    if status == "missing":
+        return True
+    if status != "ok":
+        print(f"purge_player_from_board({key}) couldn't read the board: {status}")
         return False
 
-    status = luau_result_status(result)
-    # "absent" is the player not being on the board, "missing" is no board at
-    # all -- both are the state we wanted, same as a 404 on a delete.
-    if status in ("ok", "absent", "missing"):
+    kept = [
+        row for row in rows
+        if not (isinstance(row, dict)
+                and same_roblox_id(row.get("UserId"), user_id))
+    ]
+    if len(kept) == len(rows):
+        # Not on the board, so nothing to write.
         return True
-    print(f"purge_player_from_board({key}) returned {status!r}")
-    return False
+
+    written, reason = await write_board_rows(key, kept)
+    if not written:
+        print(f"purge_player_from_board({key}) failed: {reason}")
+    return written
 
 def sort_board_entries(entries):
     """Order a time board fastest-first. The game stores it unsorted.
@@ -890,13 +877,25 @@ async def update_entry_resource(
         )
         return "error"
 
+def unwrap_entry_value(value, *, max_depth=6):
+    """Peel every buffer layer. Returns (decoded value, layers peeled).
+
+    A healthy entry is one layer. Writing a buffer envelope back through the
+    datastore API stored the envelope itself as the buffer's contents, which
+    leaves two -- the game unwraps one and finds an envelope where the rows
+    should be. tools/inspect_entry.py reports the layer count.
+    """
+    layers = 0
+    for _ in range(max_depth):
+        field = buffer_encoding_field(value)
+        if field is None:
+            break
+        value = decode_buffer(value[field], compressed=field == "zbase64")
+        layers += 1
+    return value, layers
+
 def decode_entry_value(value):
-    encoding_field = buffer_encoding_field(value)
-    if encoding_field is not None:
-        return decode_buffer(
-            value[encoding_field], compressed=encoding_field == "zbase64"
-        )
-    return value
+    return unwrap_entry_value(value)[0]
 
 def encode_entry_value(original, new_value):
     """Re-encode a value in whatever envelope the entry already used.
@@ -4582,30 +4581,44 @@ async def leaderboard_restore(ctx, board: str, reference: str = None):
         if target is None:
             return
         label, key = target
-        state, result = await run_luau(LUAU_BOARD_RESTORE % json.dumps(key))
+        status, rows, layers = await read_board_rows(key)
 
-    if state != "COMPLETE":
+        if status != "ok":
+            notes = {
+                "missing": f"There's no board stored for {label}.",
+                "unreadable": (
+                    f"Couldn't read {label} — what's stored doesn't decode to "
+                    f"a list of rows. Check it with tools/inspect_entry.py."
+                ),
+            }
+            await ctx.send(view=simple_card(
+                notes.get(status, f"Couldn't read {label} (`{status}`)."),
+                colour=discord.Color.red(),
+            ))
+            return
+
+        if layers == 1:
+            await ctx.send(view=simple_card(
+                f"{label} is already a single-layer buffer — "
+                f"{len(rows)} row(s), nothing to repair.",
+                colour=discord.Color.greyple(),
+            ))
+            return
+
+        written, reason = await write_board_rows(key, rows)
+
+    if not written:
         await ctx.send(view=simple_card(
-            f"Couldn't run the restore for {label} ({state}).\n-# {result}",
+            f"Couldn't rewrite {label}.\n-# {reason}",
             colour=discord.Color.red(),
         ))
         return
 
-    status = luau_result_status(result)
-    count = result.get("entries") if isinstance(result, dict) else None
-    notes = {
-        "ok": f"🔧 Rewrote {label} as a buffer — {count} row(s) intact.",
-        "already_buffer": f"{label} is already a buffer. Nothing to do.",
-        "missing": f"There's no board stored for {label}.",
-        "unreadable": (
-            f"Couldn't read {label} — the stored value isn't JSON. It needs "
-            f"restoring from DataStore version history instead."
-        ),
-    }
+    was = "a plain table" if layers == 0 else f"{layers} nested buffer layers"
     await ctx.send(view=simple_card(
-        notes.get(status, f"Unexpected result from the restore: `{status}`."),
-        colour=discord.Color.green() if status == "ok"
-        else discord.Color.orange(),
+        f"🔧 Rewrote {label} as a single-layer buffer — {len(rows)} row(s) "
+        f"intact.\n-# It was stored as {was}.",
+        colour=discord.Color.green(),
     ))
 
 @leaderboard_command.command(name="remove")
