@@ -5617,6 +5617,75 @@ class PlayerAchievementsView(CardView):
         await interaction.response.edit_message(view=self)
 
 
+async def build_condition_achievements_view(roblox_id, display_name):
+    """Achievements judged by Roblox progress rather than by Discord roles.
+
+    For use outside the home server, where those roles don't exist. The rules
+    describe real accomplishments either way, so this reports which of them
+    the account has actually met -- the same check /sync grants roles from.
+    """
+    home = bot.get_guild(HOME_GUILD.id) if HOME_GUILD is not None else None
+    if home is None:
+        return simple_card(
+            "Achievements aren't set up yet.",
+            heading="💎 Achievements",
+            colour=discord.Color.greyple(),
+        )
+
+    rules = visible_achievement_rules(await fetch_role_rules(home.id))
+    if not rules:
+        return simple_card(
+            "No achievements are configured yet.",
+            heading="💎 Achievements",
+            colour=discord.Color.greyple(),
+        )
+
+    earned, _ = await qualifying_roles(rules, roblox_id, map_cache={})
+
+    seen = set()
+    lines = []
+    achieved = 0
+    for rule in rules:
+        role_id = rule_role_id(rule)
+        role = home.get_role(role_id) if role_id is not None else None
+        if role is None or role_id in seen:
+            continue
+        seen.add(role_id)
+        # Plain names, not mentions: the role belongs to another server and
+        # would render as a broken pill anywhere else.
+        name = discord.utils.escape_markdown(role.name)
+        if role_id in earned:
+            achieved += 1
+            lines.append(f"✅ **{name}**")
+        else:
+            lines.append(f"⬜ {name}")
+
+    if not lines:
+        return simple_card(
+            "No achievements are configured yet.",
+            heading="💎 Achievements",
+            colour=discord.Color.greyple(),
+        )
+
+    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## 💎 {discord.utils.escape_markdown(display_name)}'s Achievements\n"
+        f"-# {achieved} of {len(lines)} earned"
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+    container.add_item(discord.ui.TextDisplay(
+        f"-# Earned in the game. Join {home.name} to get the roles."
+    ))
+
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
 def build_role_rules_view(
     rules, guild, *, admin=False, badge_names=None, player=None, owner_id=None
 ):
@@ -5672,29 +5741,60 @@ def build_role_rules_view(
     return view
 
 @bot.tree.command(
-    name="achievements", description="View the server's achievement roles"
+    name="achievements", description="See which achievements a player has earned"
 )
-@app_commands.describe(player="Show this member's earned and missing achievements")
+@app_commands.describe(player="Whose achievements to show. Defaults to you.")
 async def achievements_slash_command(
-    interaction: discord.Interaction, player: discord.Member = None
+    interaction: discord.Interaction, player: discord.User = None
 ):
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command only works inside a server.", ephemeral=True
+    """Roles in the home server, earned conditions everywhere else.
+
+    The roles only exist in one server, so anywhere else the same rules are
+    judged against the player's actual Roblox progress instead.
+    """
+    await interaction.response.defer()
+
+    if in_home_guild(interaction.guild):
+        member = (
+            interaction.guild.get_member(player.id) if player is not None
+            else None
         )
+        if player is None or member is not None:
+            rules = visible_achievement_rules(
+                await fetch_role_rules(interaction.guild.id)
+            )
+            badge_names = (
+                await role_rule_badge_names(rules) if member is None else {}
+            )
+            view = build_role_rules_view(
+                rules,
+                interaction.guild,
+                admin=interaction.user.id == ADMIN_USER_ID,
+                badge_names=badge_names,
+                player=member,
+                owner_id=interaction.user.id,
+            )
+            await interaction.followup.send(view=view, allowed_mentions=SILENT)
+            return
+        # Named someone who isn't in this server: fall through and judge them
+        # by what they've actually done instead.
+
+    target = player or interaction.user
+    roblox_id = await fetch_linked_user_id(target.id)
+    if roblox_id is None:
+        who = (
+            "You haven't" if target.id == interaction.user.id
+            else f"**{target}** hasn't"
+        )
+        await interaction.followup.send(view=simple_card(
+            f"{who} linked a Roblox account. Use `/link` first.",
+            colour=discord.Color.greyple(),
+        ))
         return
 
-    await interaction.response.defer()
-    rules = await fetch_role_rules(interaction.guild.id)
-    rules = visible_achievement_rules(rules)
-    badge_names = await role_rule_badge_names(rules) if player is None else {}
-    view = build_role_rules_view(
-        rules,
-        interaction.guild,
-        admin=interaction.user.id == ADMIN_USER_ID,
-        badge_names=badge_names,
-        player=player,
-        owner_id=interaction.user.id,
+    name = await fetch_username(roblox_id)
+    view = await build_condition_achievements_view(
+        roblox_id, name or str(roblox_id)
     )
     await interaction.followup.send(view=view, allowed_mentions=SILENT)
 
@@ -5885,9 +5985,10 @@ def register_dev_variants():
 
 register_dev_variants()
 
-# Published to the home server alone. Both need a real member and this
-# server's own role rules, so there is nothing for them to do anywhere else.
-HOME_GUILD_COMMANDS = (achievements_slash_command, sync_slash_command)
+# Published to the home server alone: /sync grants roles, which only exist
+# there. /achievements is global -- outside the home server it reports earned
+# conditions instead of roles, which works anywhere.
+HOME_GUILD_COMMANDS = (sync_slash_command,)
 
 def restrict_to_home_guild():
     """Move the home-guild commands off the global tree onto GUILD_ID.
@@ -5924,9 +6025,9 @@ def restrict_to_home_guild():
 
     if HOME_GUILD is None:
         print(
-            "GUILD_ID is not set; /achievements and /sync stay global, "
-            "but are no longer user-installable. Set GUILD_ID to scope them "
-            "to the home server."
+            "GUILD_ID is not set; /sync stays global, but is no longer "
+            "user-installable. Set GUILD_ID to scope it to the home server. "
+            "/achievements also needs it to find the configured roles."
         )
         return
 
