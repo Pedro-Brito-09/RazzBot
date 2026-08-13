@@ -3849,13 +3849,65 @@ async def badges_command(ctx, username: str = None):
 
     await ctx.send(view=view)
 
-async def build_leaderboard_reply(target):
+def achievement_leaderboard_rows(guild, rules):
+    """Members ranked by how many configured achievement roles they hold.
+
+    Counted from the roles rather than re-checked against Roblox: a badge
+    condition costs one request per badge per player, which a whole server
+    would multiply into thousands. /sync is what keeps the roles honest.
+    """
+    role_ids = {
+        role_id for rule in rules
+        if (role_id := rule_role_id(rule)) is not None
+        and guild.get_role(role_id) is not None
+    } - SYNC_CATEGORY_ROLE_IDS
+    if not role_ids:
+        return []
+
+    rows = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        earned = sum(1 for role in member.roles if role.id in role_ids)
+        if earned:
+            rows.append({
+                "Name": discord.utils.escape_markdown(member.display_name),
+                "Value": earned,
+            })
+    rows.sort(key=lambda row: (-row["Value"], row["Name"].lower()))
+    return rows
+
+async def build_leaderboard_reply(target, guild=None):
     """Resolve a leaderboard target to (embed, error text).
 
     Shared by the slash command and the prefix group so the two renderings
     of the same board can't drift apart.
     """
     selected = target.strip().lower()
+
+    if selected == "achievements":
+        # The roles it counts exist in one server, so the board does too.
+        if not in_home_guild(guild):
+            return None, "The achievements leaderboard only exists in the home server."
+
+        rules = visible_achievement_rules(await fetch_role_rules(guild.id))
+        rows = achievement_leaderboard_rows(guild, rules)
+        if not rows:
+            return None, "Nobody has earned an achievement role yet."
+
+        embed = await build_leaderboard_embed(
+            rows,
+            title="💎 Achievements Leaderboard",
+            subtitle=guild.name,
+            show_medals=False,
+            show_country=False,
+            value_name="Achievements",
+            value_formatter=format_number,
+        )
+        if embed is None:
+            return None, "Nobody has earned an achievement role yet."
+        return embed, None
+
     global_leaderboard = GLOBAL_LEADERBOARDS.get(selected)
     if global_leaderboard is not None:
         scope, value_name = global_leaderboard
@@ -3880,7 +3932,8 @@ async def build_leaderboard_reply(target):
     try:
         map_id = int(selected)
     except ValueError:
-        return None, "Choose a map ID, `wins`, `medals`, or `creators`."
+        return None, ("Choose a map ID, `wins`, `medals`, `creators`, "
+                      "or `achievements`.")
 
     maps_by_id = await get_community_maps()
     if not maps_by_id:
@@ -3900,12 +3953,14 @@ async def build_leaderboard_reply(target):
 
 @bot.tree.command(
     name="leaderboard",
-    description="Show a map, wins, medals, or creators leaderboard",
+    description="Show a map, wins, medals, creators or achievements leaderboard",
 )
-@app_commands.describe(target="Community map ID, wins, medals, or creators")
+@app_commands.describe(
+    target="Community map ID, wins, medals, creators, or achievements"
+)
 async def leaderboard_slash_command(interaction: discord.Interaction, target: str):
     await interaction.response.defer()
-    embed, error = await build_leaderboard_reply(target)
+    embed, error = await build_leaderboard_reply(target, interaction.guild)
     if error:
         await interaction.followup.send(error)
         return
@@ -3915,9 +3970,9 @@ async def leaderboard_slash_command(interaction: discord.Interaction, target: st
 # list. The slash command above stays a plain command, unchanged by the group.
 @bot.group(name="leaderboard", invoke_without_command=True)
 async def leaderboard_command(ctx, target: str):
-    """Show a map, wins, medals, or creators leaderboard."""
+    """Show a map, wins, medals, creators or achievements leaderboard."""
     async with ctx.typing():
-        embed, error = await build_leaderboard_reply(target)
+        embed, error = await build_leaderboard_reply(target, ctx.guild)
     if error:
         await ctx.send(error)
         return
