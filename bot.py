@@ -95,7 +95,7 @@ DAILY_CUP_PLAY_URL_TEMPLATE = (
 )
 # Handed out verbatim by /invite, /game and /group so Discord unfurls them.
 DISCORD_INVITE_URL = "https://discord.gg/ytbW6zMpdS"
-GAME_URL = "https://www.roblox.com/games/86832525327994/NEW-Party-Chaos"
+GAME_URL = "https://www.roblox.com/games/86832525327994/Party-Chaos"
 GROUP_URL = "https://www.roblox.com/communities/34940057/Chaotic-Inc#!/about"
 # A community map's leaderboard is keyed by the map ID on its own.
 MAP_LEADERBOARD_KEY = "{id}"
