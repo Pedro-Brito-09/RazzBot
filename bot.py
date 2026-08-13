@@ -1934,6 +1934,14 @@ class ProfileView(CardView):
         badges_button.callback = self.show_badges
         row.add_item(badges_button)
 
+        medals_button = discord.ui.Button(
+            label="Medals",
+            style=discord.ButtonStyle.secondary,
+            emoji="🏅",
+        )
+        medals_button.callback = self.show_medals
+        row.add_item(medals_button)
+
         # When this profile was opened from another card, offer the way back
         # alongside its own actions rather than on a separate row.
         back = self.make_back_button()
@@ -1997,6 +2005,23 @@ class ProfileView(CardView):
         if view is None:
             await interaction.followup.send(
                 "Couldn't fetch the game's badge list.", ephemeral=True
+            )
+            return
+
+        view.message = interaction.message
+        await interaction.edit_original_response(view=view)
+
+    @keeps_context
+    async def show_medals(self, interaction):
+        # thinking=True would post a new message and
+        # edit_original_response would then edit that, not the card.
+        await interaction.response.defer()
+
+        view = await build_medals_view(self.user_id, self.username, parent=self)
+        if view is None:
+            await interaction.followup.send(
+                f"**{self.username}** hasn't earned any daily cup medals.",
+                ephemeral=True,
             )
             return
 
