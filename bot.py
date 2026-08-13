@@ -3641,7 +3641,7 @@ async def sync_command(ctx, *, target: str = None):
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
-    await ctx.send("hello fuckers")
+    await ctx.send("i'm alive!!!!!!!!!!!")
 
 @bot.hybrid_command(description="Get the Discord server invite")
 async def invite(ctx):
