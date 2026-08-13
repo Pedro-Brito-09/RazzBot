@@ -186,6 +186,7 @@ If dependencies changed, re-run the `pip install` line from step 4 before restar
 | Symptom | Cause |
 |---|---|
 | `Improper token has been passed` | `TOKEN` in `/etc/razzbot.env` is wrong, or has quotes around it — systemd `EnvironmentFile` does not strip them |
-| `PrivilegedIntentsRequired` | Message Content Intent not enabled in the dev portal |
+| `PrivilegedIntentsRequired` | Message Content Intent **or** Server Members Intent not enabled in the dev portal |
+| `!linked` says everyone is "not in this server" | Server Members Intent is off, so the member cache is empty |
 | Service restarts in a loop | `journalctl -u razzbot -n 50` — usually a traceback from `!maps` |
 | `python3: command not found` in the unit | venv wasn't created at `/opt/razzbot/.venv` |
