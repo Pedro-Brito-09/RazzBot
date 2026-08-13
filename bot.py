@@ -106,7 +106,8 @@ ACCOUNT_LINK_DATASTORE = "AccountLinking"
 LINK_CODE_EXPIRATIONS_KEY = "CodeExpirations"
 # Discord role rules live here, keyed by guild.
 ROLES_DATASTORE = "Roles"
-ROLE_CONDITIONS = ("badge", "map")
+ROLE_CONDITIONS = ("badge", "map", "group")
+ROBLOX_GROUP_ID = 34940057
 # Always granted by /sync, but omitted from its change summary. These organize
 # achievement roles into Discord profile categories rather than representing
 # achievements themselves.
@@ -1040,14 +1041,56 @@ def rule_role_id(rule):
         return role_id if role_id > 0 else None
     return None
 
+
+async def fetch_group_roles():
+    """Public role definitions for the configured Roblox group."""
+    data = await request_json(
+        f"https://groups.roblox.com/v1/groups/{ROBLOX_GROUP_ID}/roles",
+        label=f"fetch_group_roles({ROBLOX_GROUP_ID})",
+    )
+    roles = data.get("roles") if isinstance(data, dict) else None
+    return roles if isinstance(roles, list) else None
+
+
+async def fetch_user_group_role_id(user_id):
+    """Return (lookup_succeeded, exact role ID) in the configured group."""
+    data = await request_json(
+        f"https://groups.roblox.com/v2/users/{user_id}/groups/roles",
+        label=f"fetch_user_group_role({user_id}, {ROBLOX_GROUP_ID})",
+    )
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        return False, None
+
+    for membership in data["data"]:
+        if not isinstance(membership, dict):
+            continue
+        group = membership.get("group")
+        role = membership.get("role")
+        try:
+            group_id = int(group.get("id"))
+            role_id = int(role.get("id"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if group_id == ROBLOX_GROUP_ID:
+            return True, role_id
+    return True, None
+
+
 async def qualifying_roles(rules, roblox_id, *, map_cache):
-    """Which of the rules' roles this player currently earns."""
+    """Return (earned role IDs, role IDs skipped after lookup failures)."""
     badge_ids = [r["value"] for r in rules if r.get("type") == "badge"]
     owned_badges = (
         await fetch_owned_badge_ids(roblox_id, badge_ids) if badge_ids else set()
     )
 
+    group_rules = [r for r in rules if r.get("type") == "group"]
+    if group_rules:
+        group_lookup_ok, group_role_id = await fetch_user_group_role_id(roblox_id)
+    else:
+        group_lookup_ok, group_role_id = True, None
+
     earned = set()
+    unresolved = set()
     for rule in rules:
         kind, value = rule.get("type"), rule.get("value")
         role_id = rule_role_id(rule)
@@ -1057,7 +1100,17 @@ async def qualifying_roles(rules, roblox_id, *, map_cache):
             earned.add(role_id)
         elif kind == "map" and roblox_id in await map_finishers(value, map_cache):
             earned.add(role_id)
-    return earned
+        elif kind == "group":
+            if not group_lookup_ok:
+                unresolved.add(role_id)
+                continue
+            try:
+                required_group_role_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if group_role_id == required_group_role_id:
+                earned.add(role_id)
+    return earned, unresolved
 
 def manageable_role(guild, role_id):
     """The role, when the bot is actually allowed to grant or take it."""
@@ -1075,11 +1128,13 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
     Only roles named by a rule are ever touched, so unrelated roles are
     left alone. Returns (added, removed, blocked) as role lists.
     """
-    earned = await qualifying_roles(rules, roblox_id, map_cache=map_cache)
+    earned, unresolved = await qualifying_roles(
+        rules, roblox_id, map_cache=map_cache
+    )
     governed = {
         role_id for rule in rules
         if (role_id := rule_role_id(rule)) is not None
-    } - SYNC_CATEGORY_ROLE_IDS
+    } - SYNC_CATEGORY_ROLE_IDS - unresolved
     held = {role.id for role in member.roles}
 
     blocked = []
@@ -3883,6 +3938,12 @@ async def role_rule_badge_names(rules):
         )
     return names
 
+
+def visible_achievement_rules(rules):
+    """Group-role mappings sync normally but never appear in achievement UI."""
+    return [rule for rule in rules if rule.get("type") != "group"]
+
+
 def badge_link_parts(name):
     """Keep emoji beside, but outside, a Components V2 Markdown link."""
     name = " ".join(str(name).split())
@@ -3944,6 +4005,14 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
             condition = f"Complete **[map #{map_id}]({play_url})**"
         else:
             condition = "Complete **Unknown map**"
+    elif rule.get("type") == "group":
+        group_role_name = discord.utils.escape_markdown(
+            str(rule.get("group_role_name") or f"Role #{rule.get('value', '?')}")
+        )
+        condition = (
+            f"Have Roblox group role **{group_role_name}** "
+            f"in group **{ROBLOX_GROUP_ID}**"
+        )
     else:
         condition = "⚠️ Unknown requirement"
     lines = []
@@ -4044,8 +4113,7 @@ def build_role_rules_view(
         text = "No achievement roles are configured yet."
         if admin:
             text += (
-                "\n-# Add: `!roles add @Role map <map ID>` or "
-                "`!roles add @Role badge <badge ID>`"
+                "\n-# Add: `!roles add @Role <map|badge|group> <ID>`"
             )
         return simple_card(
             text,
@@ -4072,8 +4140,7 @@ def build_role_rules_view(
     if admin:
         footer = (
             "-# Remove: `!roles remove <rule ID>`\n"
-            "-# Add: `!roles add @Role map <map ID>` or "
-            "`!roles add @Role badge <badge ID>`"
+            "-# Add: `!roles add @Role <map|badge|group> <ID>`"
         )
     else:
         footer = "-# Use `/sync` to update your roles."
@@ -4100,6 +4167,7 @@ async def roles_slash_command(
 
     await interaction.response.defer()
     rules = await fetch_role_rules(interaction.guild.id)
+    rules = visible_achievement_rules(rules)
     badge_names = await role_rule_badge_names(rules) if player is None else {}
     view = build_role_rules_view(
         rules,
@@ -4119,6 +4187,7 @@ async def admin_roles(ctx, player: discord.Member = None):
         return
     async with ctx.typing():
         rules = await fetch_role_rules(ctx.guild.id)
+        rules = visible_achievement_rules(rules)
         badge_names = await role_rule_badge_names(rules) if player is None else {}
     admin = ctx.author.id == ADMIN_USER_ID
     await ctx.send(
@@ -4136,7 +4205,7 @@ async def admin_roles(ctx, player: discord.Member = None):
 @admin_roles.command(name="add")
 @is_admin()
 async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
-    """!roles add <@role> <badge|map> <id>"""
+    """!roles add <@role> <badge|map|group> <id>"""
     kind = condition.strip().lower()
     if kind not in ROLE_CONDITIONS:
         await ctx.send(view=simple_card(
@@ -4152,6 +4221,30 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
             colour=discord.Color.red(),
         ), allowed_mentions=SILENT)
         return
+
+    group_role_name = None
+    if kind == "group":
+        async with ctx.typing():
+            group_roles = await fetch_group_roles()
+        if group_roles is None:
+            await ctx.send(view=simple_card(
+                "Couldn't read the Roblox group's roles. Try again in a moment.",
+                colour=discord.Color.red(),
+            ))
+            return
+
+        group_role = next((
+            candidate for candidate in group_roles
+            if isinstance(candidate, dict)
+            and str(candidate.get("id")) == str(value)
+        ), None)
+        if group_role is None:
+            await ctx.send(view=simple_card(
+                f"Group `{ROBLOX_GROUP_ID}` has no role with ID `{value}`.",
+                colour=discord.Color.red(),
+            ))
+            return
+        group_role_name = str(group_role.get("name") or f"Role #{value}")
 
     state = {"duplicate": False, "rule": None}
 
@@ -4170,6 +4263,8 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
             "type": kind,
             "value": value,
         }
+        if group_role_name is not None:
+            rule["group_role_name"] = group_role_name
         state["rule"] = rule
         return rules + [rule]
 
