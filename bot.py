@@ -1453,15 +1453,10 @@ def get_cup_medal_emoji(rank, total):
         diamond_slots + gold_slots + silver_slots + bronze_slots
     )
     if remaining > 0:
-        extra_diamond = (total * 5 // 100) - diamond_slots
-        extra_gold = (total * 25 // 100) - gold_slots
-        extra_silver = (total * 50 // 100) - silver_slots
-        extra_bronze = (total * 90 // 100) - bronze_slots
-
-        diamond_slots = max(diamond_slots, extra_diamond)
-        gold_slots = max(gold_slots, extra_gold)
-        silver_slots = max(silver_slots, extra_silver)
-        bronze_slots = max(bronze_slots, extra_bronze)
+        diamond_slots = max(diamond_slots, total * 5 // 100)
+        gold_slots = max(gold_slots, total * 25 // 100)
+        silver_slots = max(silver_slots, total * 50 // 100)
+        bronze_slots = max(bronze_slots, total * 90 // 100)
 
     cumulative = diamond_slots
     if rank <= cumulative:
