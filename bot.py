@@ -141,10 +141,10 @@ VERIFICATION_GAME_URL = os.getenv(
     "VERIFICATION_GAME_URL",
     "https://www.roblox.com/games/start?placeId=120140749641241",
 )
-# The home server. Also gets a guild-only copy of every global command, so
-# changes appear there instantly, and it is the only place /achievements and
-# /sync are published. Global commands are always synced too, because user
-# installs only support them.
+# The home server: the only place /achievements and /sync are published.
+# Nothing else is registered per-guild -- a guild copy of a global command
+# shows up next to the original, which reads as every command duplicated.
+# Everything else stays global, which is also all user installs support.
 GUILD_ID = os.getenv("GUILD_ID")
 try:
     HOME_GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
@@ -2947,23 +2947,23 @@ async def on_ready():
         traceback.print_exc()
         return
 
-    if GUILD_ID:
-        # Guild commands cannot carry user-install or context metadata. Remove
-        # the tree defaults only while publishing this optional test copy.
+    if HOME_GUILD is not None:
+        # Only the home-guild commands are published here. The globals are
+        # deliberately NOT copied across: a guild copy of a global command
+        # shows up alongside the original, so every command would appear
+        # twice in this one server.
+        #
+        # Guild commands cannot carry user-install or context metadata, so
+        # the tree defaults come off while this sync runs.
         global_contexts = bot.tree.allowed_contexts
         global_installs = bot.tree.allowed_installs
         bot.tree.allowed_contexts = app_commands.AppCommandContext()
         bot.tree.allowed_installs = app_commands.AppInstallationType()
         try:
-            guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild)
-            # copy_global_to replaces this guild's command list, which would
-            # drop the home-guild-only commands. Put them back before syncing.
-            restrict_to_home_guild()
-            guild_synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(guild_synced)} test command(s) to guild {GUILD_ID}")
+            guild_synced = await bot.tree.sync(guild=HOME_GUILD)
+            print(f"Synced {len(guild_synced)} command(s) to guild {GUILD_ID}")
         except Exception:
-            print(f"Test guild {GUILD_ID} command sync failed:")
+            print(f"Home guild {GUILD_ID} command sync failed:")
             traceback.print_exc()
         finally:
             bot.tree.allowed_contexts = global_contexts
@@ -5204,8 +5204,6 @@ def restrict_to_home_guild():
     carry guild context at all. The prefix halves are untouched:
     !achievements and !sync keep working in any server the bot is in.
 
-    Safe to call more than once -- copy_global_to replaces the guild's
-    command list, so this has to run again after it.
     """
     moved = []
     for target in HOME_GUILD_COMMANDS:
