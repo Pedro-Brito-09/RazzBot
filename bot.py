@@ -53,6 +53,10 @@ HEADSHOT_SIZE = "150x150"
 # Custom emoji cannot render inside a code block, so the table style needs
 # Unicode stand-ins for the medals.
 UNICODE_MEDALS = {0: "💎", 1: "🥇", 2: "🥈", 3: "🥉"}
+# Best first, so a tier's position is also its get_medal_emoji index.
+MEDAL_TIERS = ("Diamond", "Gold", "Silver", "Bronze")
+# Cups shown per page of /medals.
+MEDALS_PER_PAGE = 10
 
 # The Community Maps "Ids" entry holds ~85k records, so it is fetched once and
 # indexed rather than downloaded and decompressed on every lookup.
@@ -1469,34 +1473,63 @@ async def resolve_current_cup(todays_map):
           f"advancing to Daily Cup #{next_index}")
     return next_index, await get_cup_map_id(next_index, todays_map)
 
-async def get_cup_map_id(index, todays_map):
-    """Resolve a cup index to its map, anchored to the current rotation."""
+async def cup_map_rotation(todays_map):
+    """The accepted-submission rotation, as an index -> map ID function.
+
+    Built once and reused, so resolving a whole medal history costs a single
+    Submissions read rather than one per cup.
+    """
     current_index = todays_map.get("Index") if isinstance(todays_map, dict) else None
     current_id = todays_map.get("Id") if isinstance(todays_map, dict) else None
-    if index == current_index and current_id is not None:
-        return current_id
 
     submissions = await fetch_entry("Submissions")
-    if not isinstance(submissions, list):
-        return None
-
     accepted = [
         submission for submission in submissions
         if isinstance(submission, dict)
         and submission.get("Status") == "Accepted"
         and submission.get("Id") is not None
-    ]
-    if not accepted:
-        return None
-
+    ] if isinstance(submissions, list) else []
     accepted.sort(key=lambda submission: submission.get("Timestamp", 0))
     map_ids = [submission["Id"] for submission in accepted]
 
-    if isinstance(current_index, int) and current_id in map_ids:
-        current_position = map_ids.index(current_id)
-        return map_ids[(current_position + index - current_index) % len(map_ids)]
+    def resolve(index):
+        if index == current_index and current_id is not None:
+            return current_id
+        if not map_ids:
+            return None
+        if isinstance(current_index, int) and current_id in map_ids:
+            position = map_ids.index(current_id)
+            return map_ids[(position + index - current_index) % len(map_ids)]
+        return map_ids[index % len(map_ids)]
 
-    return map_ids[index % len(map_ids)]
+    return resolve
+
+async def get_cup_map_id(index, todays_map):
+    """Resolve a cup index to its map, anchored to the current rotation."""
+    current_index = todays_map.get("Index") if isinstance(todays_map, dict) else None
+    current_id = todays_map.get("Id") if isinstance(todays_map, dict) else None
+    # Answered without touching Submissions, which the live cup usually is.
+    if index == current_index and current_id is not None:
+        return current_id
+    return (await cup_map_rotation(todays_map))(index)
+
+def cup_date_for_index(index, current_index):
+    """The cup day an index fell on, counted back from the live cup."""
+    if not isinstance(index, int) or not isinstance(current_index, int):
+        return None
+    return cup_day_today() - timedelta(days=current_index - index)
+
+def coerce_cup_index(value):
+    """A stored cup index as an int, however Roblox serialised it."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
 
 def format_time(time_value):
     minutes = (time_value / 60) % 60
@@ -1852,10 +1885,11 @@ class ProfileView(CardView):
         all_time = format_number(dig(data, "Stats", "AllTimeStars", default=0))
         currency = f"⭐  **{stars}** Stars\n-# {all_time} earned all time"
 
-        # Medals are stored as lists of map IDs, so the count is the length.
+        # Medals are stored as the cup indexes they were won in, so the count
+        # is the length. /medals resolves those indexes back to cups.
         medal_counts = [
             (get_medal_emoji(i), len(dig(data, "Medals", tier, default=[]) or []))
-            for i, tier in enumerate(("Diamond", "Gold", "Silver", "Bronze"))
+            for i, tier in enumerate(MEDAL_TIERS)
         ]
         medals = "  ·  ".join(f"{emoji} **{count}**" for emoji, count in medal_counts)
 
@@ -2173,6 +2207,136 @@ class MapListView(CardView):
     @keeps_context
     async def next_page(self, interaction):
         await self.show_page(interaction, self.page + 1)
+
+class MedalListView(CardView):
+    """A paginated history of the daily cups a player medalled in."""
+
+    def __init__(self, medals, *, username, parent=None):
+        super().__init__(parent=parent)
+        self.medals = medals
+        self.username = username
+        self.page = 0
+        self.render()
+
+    @property
+    def page_count(self):
+        return max(1, -(-len(self.medals) // MEDALS_PER_PAGE))
+
+    def summary(self):
+        """The per-tier tally, in the same order as the profile card."""
+        counts = {}
+        for medal in self.medals:
+            counts[medal["tier"]] = counts.get(medal["tier"], 0) + 1
+        return "  ·  ".join(
+            f"{get_medal_emoji(tier)} **{counts[tier]}**"
+            for tier in range(len(MEDAL_TIERS)) if counts.get(tier)
+        )
+
+    def describe(self, medal):
+        when = f"{medal['date']:%d/%m/%Y}" if medal["date"] else "unknown date"
+        map_id = medal["map_id"]
+        tail = f" `#{map_id}`" if map_id is not None else ""
+        return (
+            f"{get_medal_emoji(medal['tier'])} Cup #{medal['index']} - {when}"
+            f"  ·  **{medal['map_name']}**{tail}"
+        )
+
+    def render(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=DAILY_CUP_COLOR)
+
+        heading = f"## 🏅 {self.username}\n-# {self.summary()}"
+        if self.page_count > 1:
+            heading += f" · page {self.page + 1}/{self.page_count}"
+        container.add_item(discord.ui.TextDisplay(heading))
+        container.add_item(discord.ui.Separator())
+
+        start = self.page * MEDALS_PER_PAGE
+        page_medals = self.medals[start:start + MEDALS_PER_PAGE]
+        container.add_item(discord.ui.TextDisplay(
+            "\n".join(self.describe(medal) for medal in page_medals)
+        ))
+
+        note = dev_universe_note()
+        if note:
+            container.add_item(discord.ui.TextDisplay(note))
+
+        row = discord.ui.ActionRow()
+        if self.page_count > 1:
+            previous = discord.ui.Button(
+                label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️",
+                disabled=self.page == 0,
+            )
+            previous.callback = self.previous_page
+            row.add_item(previous)
+
+            following = discord.ui.Button(
+                label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
+                disabled=self.page >= self.page_count - 1,
+            )
+            following.callback = self.next_page
+            row.add_item(following)
+
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+        if row.children:
+            container.add_item(row)
+
+        self.add_item(container)
+
+    async def show_page(self, interaction, page):
+        self.page = max(0, min(page, self.page_count - 1))
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    @keeps_context
+    async def previous_page(self, interaction):
+        await self.show_page(interaction, self.page - 1)
+
+    @keeps_context
+    async def next_page(self, interaction):
+        await self.show_page(interaction, self.page + 1)
+
+async def build_medals_view(user_id, username, parent=None):
+    """A player's medal history, newest cup first, or None when they have none.
+
+    Medals are stored as the cup indexes they were won in, so the map and the
+    date are resolved back out of the rotation rather than read from the entry.
+    """
+    entry = await fetch_entry(str(user_id), datastore="Main_Data")
+    data = entry.get("Data") if isinstance(entry, dict) else None
+    data = data if isinstance(data, dict) else {}
+
+    earned = []
+    for tier, name in enumerate(MEDAL_TIERS):
+        for stored in dig(data, "Medals", name, default=[]) or []:
+            index = coerce_cup_index(stored)
+            if index is not None:
+                earned.append((index, tier))
+    if not earned:
+        return None
+
+    todays_map = await fetch_entry("TodaysMap") or {}
+    current_index, _ = await resolve_current_cup(todays_map)
+    resolve_map, maps_by_id = await asyncio.gather(
+        cup_map_rotation(todays_map), get_community_maps()
+    )
+    maps_by_id = maps_by_id or {}
+
+    # Newest cup first, and the better medal first if a cup ever yields two.
+    earned.sort(key=lambda item: (-item[0], item[1]))
+    medals = []
+    for index, tier in earned:
+        map_id = resolve_map(index)
+        medals.append({
+            "index": index,
+            "tier": tier,
+            "date": cup_date_for_index(index, current_index),
+            "map_id": map_id,
+            "map_name": (maps_by_id.get(map_id) or {}).get("Name") or "Unknown Map",
+        })
+    return MedalListView(medals, username=username, parent=parent)
 
 async def build_map_search_view(query, matches, parent=None):
     """A pick-list of maps matching a name search."""
@@ -3009,6 +3173,22 @@ async def maps_command(ctx, username: str = None):
     view = await build_created_maps_view(user_id, canonical)
     if view is None:
         await ctx.send(f"**{canonical}** has no public maps...")
+        return
+
+    await ctx.send(view=view)
+
+@bot.hybrid_command(name="medals", description="Show the daily cups a player earned medals in")
+@app_commands.describe(username="Roblox username. Uses your linked account if omitted.")
+async def medals_command(ctx, username: str = None):
+    await ctx.defer()
+
+    user_id, canonical = await resolve_command_user(ctx, username)
+    if user_id is None:
+        return
+
+    view = await build_medals_view(user_id, canonical)
+    if view is None:
+        await ctx.send(f"**{canonical}** hasn't earned any daily cup medals.")
         return
 
     await ctx.send(view=view)
