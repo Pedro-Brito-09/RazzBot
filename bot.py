@@ -44,6 +44,15 @@ MAPS_PER_PAGE = 10
 # never appear in anyone's slash command list.
 ADMIN_USER_ID = 541010558653169667
 
+# The role !changelog can ping, and its card's accent.
+CHANGELOG_ROLE_ID = 1257828474769379368
+CHANGELOG_COLOR = discord.Color(0x57F287)
+# Discord only renders colour inside an ansi code block, keyed by line prefix.
+CHANGELOG_LINE_COLORS = {"+": "32", "-": "31", "=": "34"}
+CHANGELOG_DEFAULT_COLOR = "37"
+# A Components V2 message caps at 4000 characters across its text displays.
+CHANGELOG_CHARACTER_BUDGET = 3900
+
 GLOBAL_LEADERBOARDS = {
     "wins": ("Wins", "Wins"),
     "medals": ("Medals", "Medals"),
@@ -3740,6 +3749,244 @@ async def admin_unban(ctx, player: str):
             await ctx.send(f"✅ Unbanned **{name}** (`{user_id}`).")
         else:
             await ctx.send(f"Failed to unban **{name}**. Check the logs.")
+
+_LUA_STRING = re.compile(r'(?:(\w+)\s*=\s*)?"((?:[^"\\]|\\.)*)"')
+_LUA_ESCAPES = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}
+
+def unescape_lua(value):
+    return re.sub(r"\\(.)", lambda m: _LUA_ESCAPES.get(m.group(1), m.group(1)), value)
+
+def strip_code_fence(text):
+    """The body of a fenced block, or the text unchanged when it isn't fenced."""
+    match = re.search(r"```[a-zA-Z]*\n?(.*?)```", text, re.S)
+    return match.group(1) if match else text
+
+def split_lua_sections(body):
+    """The tables nested directly inside the outer changelog table.
+
+    Brace counting rather than a regex, since a section's strings can hold
+    braces of their own.
+    """
+    start = body.find("{")
+    if start == -1:
+        return []
+
+    sections = []
+    depth = 0
+    section_start = None
+    in_string = False
+    escape = False
+    for position in range(start, len(body)):
+        char = body[position]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+            if depth == 2:
+                section_start = position + 1
+        elif char == "}":
+            if depth == 2 and section_start is not None:
+                sections.append(body[section_start:position])
+                section_start = None
+            depth -= 1
+            if depth == 0:
+                break
+    return sections
+
+def parse_changelog(text):
+    """A lua changelog table -> (date, [(title, [lines])]).
+
+    Keyed strings name their field, bare ones are the coloured lines, so the
+    order they were written in is the order they render in.
+    """
+    body = strip_code_fence(text).strip()
+
+    date = None
+    stamp = re.search(r'Date\s*=\s*"((?:[^"\\]|\\.)*)"', body)
+    if stamp:
+        date = unescape_lua(stamp.group(1))
+
+    sections = []
+    for chunk in split_lua_sections(body):
+        title = None
+        lines = []
+        for key, value in _LUA_STRING.findall(chunk):
+            value = unescape_lua(value)
+            if key == "Title":
+                title = value
+            elif not key:
+                lines.append(value)
+        if title or lines:
+            sections.append((title, lines))
+    return date, sections
+
+def render_changelog_lines(lines):
+    """One ansi block, each line coloured by the prefix it was written with."""
+    coloured = []
+    # Discord wants the real ESC byte, so the literals below are control
+    # characters rather than a backslash-u escape. Keep them intact.
+    for line in lines:
+        colour = CHANGELOG_LINE_COLORS.get(line[:1], CHANGELOG_DEFAULT_COLOR)
+        # A stray fence in the text would end the block early.
+        safe = line.replace("```", "`​``")
+        coloured.append(f"[0;{colour}m{safe}[0m")
+    return "```ansi\n" + "\n".join(coloured) + "\n```"
+
+def changelog_blocks(date, sections, *, ping=False):
+    """Every text block of the card, in order, so length can be checked."""
+    blocks = []
+    if ping:
+        blocks.append(f"<@&{CHANGELOG_ROLE_ID}>")
+
+    heading = "## 📋 Changelog"
+    if date:
+        heading += f"\n-# {date}"
+    blocks.append(heading)
+
+    for title, lines in sections:
+        parts = []
+        if title:
+            parts.append(f"### {title}")
+        if lines:
+            parts.append(render_changelog_lines(lines))
+        blocks.append("\n".join(parts))
+    return blocks
+
+def build_changelog_container(date, sections, *, ping=False):
+    """The card itself. Rebuilt per message, since a component binds to one."""
+    container = discord.ui.Container(accent_colour=CHANGELOG_COLOR)
+    blocks = changelog_blocks(date, sections, ping=ping)
+    for position, block in enumerate(blocks):
+        # Separate the sections from the heading and from each other.
+        if position > (1 if ping else 0):
+            container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(block))
+    return container
+
+def build_changelog_card(date, sections, *, ping=False):
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(build_changelog_container(date, sections, ping=ping))
+    return view
+
+class ChangelogPreviewView(OwnedView, discord.ui.LayoutView):
+    """The changelog as it will appear, with Post and Cancel under it."""
+
+    def __init__(self, date, sections, channel, ping, *, timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(timeout=timeout)
+        self.universe = current_universe()
+        self.bind_owner()
+        self.message = None
+        self.date = date
+        self.sections = sections
+        self.channel = channel
+        self.ping = ping
+        self.render()
+
+    def render(self, outcome=None, error=None):
+        self.clear_items()
+        # Previewed with the ping line in place, but sent silently below, so
+        # what you approve is exactly what gets posted.
+        container = build_changelog_container(
+            self.date, self.sections, ping=self.ping
+        )
+        container.add_item(discord.ui.Separator())
+
+        if outcome is not None:
+            container.add_item(discord.ui.TextDisplay(outcome))
+            self.add_item(container)
+            return
+
+        note = (
+            f"-# Posting to {self.channel.mention}"
+            + ("  ·  pinging the changelog role" if self.ping else "  ·  no ping")
+        )
+        if error:
+            note += f"\n-# ⚠️ Couldn't post: {error}"
+        container.add_item(discord.ui.TextDisplay(note))
+
+        row = discord.ui.ActionRow()
+        post = discord.ui.Button(
+            label="Post", style=discord.ButtonStyle.success, emoji="📨"
+        )
+        post.callback = self.confirm_post
+        row.add_item(post)
+
+        cancel = discord.ui.Button(
+            label="Cancel", style=discord.ButtonStyle.secondary
+        )
+        cancel.callback = self.cancel_post
+        row.add_item(cancel)
+        container.add_item(row)
+
+        self.add_item(container)
+
+    @keeps_context
+    async def confirm_post(self, interaction):
+        await interaction.response.defer()
+        try:
+            posted = await self.channel.send(
+                view=build_changelog_card(self.date, self.sections, ping=self.ping),
+                allowed_mentions=(
+                    discord.AllowedMentions(roles=True) if self.ping else SILENT
+                ),
+            )
+        except discord.HTTPException as error:
+            # Left retryable: the Post button stays for a transient failure.
+            print(f"changelog post to {self.channel.id} failed: {error}")
+            self.render(error=error)
+        else:
+            self.render(outcome=f"-# ✅ Posted to {self.channel.mention} — {posted.jump_url}")
+            self.stop()
+        await interaction.edit_original_response(view=self)
+
+    @keeps_context
+    async def cancel_post(self, interaction):
+        await interaction.response.defer()
+        self.render(outcome="-# Cancelled. Nothing was posted.")
+        self.stop()
+        await interaction.edit_original_response(view=self)
+
+@bot.command(name="changelog", hidden=True)
+@is_admin()
+async def admin_changelog(ctx, channel: discord.TextChannel, ping: bool, *, body: str):
+    """!changelog <#channel> <true|false> <lua code block>"""
+    date, sections = parse_changelog(body)
+    if not sections:
+        await ctx.send(view=simple_card(
+            "Couldn't read any sections out of that block. Each entry needs "
+            "its own table:\n"
+            '```lua\n{ Title = "text", "+ green", "- red", "= blue", "white" }\n```',
+            colour=discord.Color.red(),
+        ))
+        return
+
+    me = ctx.guild.me if ctx.guild else None
+    if me is not None and not channel.permissions_for(me).send_messages:
+        await ctx.send(view=simple_card(
+            f"I can't send messages in {channel.mention}.",
+            colour=discord.Color.red(),
+        ), allowed_mentions=SILENT)
+        return
+
+    length = sum(len(block) for block in changelog_blocks(date, sections, ping=ping))
+    if length > CHANGELOG_CHARACTER_BUDGET:
+        await ctx.send(view=simple_card(
+            f"That changelog is {length} characters; Discord caps a card at "
+            f"{CHANGELOG_CHARACTER_BUDGET}. Split it across two posts.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    view = ChangelogPreviewView(date, sections, channel, ping)
+    view.message = await ctx.send(view=view, allowed_mentions=SILENT)
 
 async def resolve_cup_reference(ctx, reference):
     """A cup index, a DD/MM/YYYY date, or nothing for the live cup."""
