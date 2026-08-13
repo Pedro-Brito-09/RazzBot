@@ -3575,16 +3575,19 @@ async def sync_command(ctx, *, target: str = None):
     await ctx.defer()
 
     is_admin_user = ctx.author.id == ADMIN_USER_ID
-    if target and not is_admin_user:
-        await ctx.send(view=simple_card("Only an admin can sync someone else.",
-                                        colour=discord.Color.red()))
-        return
+    wanted = target.strip() if target else ""
 
     rules = await fetch_role_rules(ctx.guild.id)
     map_cache = {}
 
     # Everyone linked, admin only.
-    if target and target.strip().lower() == "all":
+    if wanted.lower() == "all":
+        if not is_admin_user:
+            await ctx.send(view=simple_card(
+                "Only an admin can sync everyone.",
+                colour=discord.Color.red(),
+            ))
+            return
         linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
         linked = linked if isinstance(linked, dict) else {}
 
@@ -3613,15 +3616,22 @@ async def sync_command(ctx, *, target: str = None):
         ))
         return
 
-    if target:
-        member = await find_discord_user(ctx, target)
+    if wanted:
+        member = await find_discord_user(ctx, wanted)
         if member is None or ctx.guild.get_member(member.id) is None:
             await ctx.send(view=simple_card(
-                f"Couldn't find `{target.strip()}` in this server.",
+                f"Couldn't find `{wanted}` in this server.",
                 colour=discord.Color.red(),
             ))
             return
         member = ctx.guild.get_member(member.id)
+        # Naming yourself is just the no-argument case spelled out.
+        if member.id != ctx.author.id and not is_admin_user:
+            await ctx.send(view=simple_card(
+                "Only an admin can sync someone else.",
+                colour=discord.Color.red(),
+            ))
+            return
     else:
         member = ctx.guild.get_member(ctx.author.id) or ctx.author
 
