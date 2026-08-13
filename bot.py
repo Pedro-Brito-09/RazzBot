@@ -533,6 +533,11 @@ async def purge_player_from_board(user_id, key):
     Map and Daily Cup boards are lists inside a regular entry, so removing a
     row takes a read-modify-write rather than a delete. True once the board no
     longer lists them.
+
+    Boards the game saved as a Luau buffer cannot be rewritten at all: Open
+    Cloud reports a buffer but will not accept one, so the write would land as
+    a plain table and break the game's own read. Those come back False and
+    have to be edited from Luau instead.
     """
     def transform(entries):
         if not isinstance(entries, list):
@@ -740,7 +745,7 @@ async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4
 
     transform(decoded_value) returns the new value, or None to leave the
     entry alone. Pass default to create the entry when it doesn't exist yet.
-    Returns "ok", "skipped", "conflict", "missing" or "error".
+    Returns "ok", "skipped", "conflict", "missing", "buffer" or "error".
     """
     for attempt in range(1, attempts + 1):
         status, resource = await fetch_entry_resource(
@@ -753,6 +758,18 @@ async def update_entry_with_retry(entry_key, datastore, transform, *, attempts=4
         else:
             raw_value = resource.get("value")
             etag, allow_missing = resource.get("etag"), False
+
+        # Open Cloud only *reports* a Luau buffer, as {"t": "buffer", ...}. It
+        # does not take one back: writing that envelope stores a plain table,
+        # and the game then dies on buffer.tostring reading its own entry.
+        # Refuse the write rather than corrupt the entry. Restoring one takes
+        # a Luau-side SetAsync -- see purge_player_from_board.
+        if is_buffer_value(raw_value):
+            print(
+                f"update_entry_with_retry({datastore}/{entry_key}) refused: "
+                f"the entry is a Luau buffer, which Open Cloud cannot write"
+            )
+            return "buffer"
 
         new_value = transform(decode_entry_value(raw_value))
         if new_value is None:
@@ -4317,7 +4334,9 @@ class LeaderboardRemoveView(OwnedView, discord.ui.View):
             self.stop()
         else:
             self.outcome = [
-                f"⚠️ Couldn't remove from {self.label}. Check the logs."
+                f"⚠️ Couldn't remove from {self.label}. Check the logs — if "
+                f"the game saved that board as a buffer, it can only be "
+                f"edited from Luau."
             ]
             self.clear_items()
             retry = discord.ui.Button(
