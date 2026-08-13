@@ -2725,11 +2725,12 @@ class LinkedListView(CardView):
         return max(1, -(-len(self.links) // LINKED_PER_PAGE))
 
     def describe(self, position, link):
-        who = link["mention"] or f"`{link['account_id']}`"
+        # A raw mention renders whether or not the account is cached, or even
+        # still in the server, so there is nothing to resolve here.
         name = link["name"] or "unknown"
         tail = "  ·  not in this server" if link["absent"] else ""
         return (
-            f"`{position:>3}.` {who} → **{name}**\n"
+            f"`{position:>3}.` <@{link['account_id']}> → **{name}**\n"
             f"-# Discord `{link['account_id']}`  ·  "
             f"Roblox `{link['roblox_id']}`{tail}"
         )
@@ -2819,14 +2820,11 @@ async def build_linked_view(guild, parent=None):
 
     links = []
     for account_id, roblox_id in pairs:
-        member = guild.get_member(account_id) if guild else None
-        user = member or bot.get_user(account_id)
         links.append({
             "account_id": account_id,
             "roblox_id": roblox_id,
             "name": names.get(roblox_id),
-            "mention": user.mention if user else None,
-            "absent": members_known and member is None,
+            "absent": members_known and guild.get_member(account_id) is None,
         })
 
     # Named accounts first, alphabetically; unresolved Roblox IDs last.
