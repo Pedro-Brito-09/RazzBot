@@ -632,6 +632,11 @@ local store = DataStoreService:GetDataStore("Leaderboards")
 local key = %s
 local payload = %s
 
+-- Ground truth for what is actually stored. Open Cloud reports a real buffer
+-- and a plain table holding {t = "buffer", zbase64 = ...} identically, so
+-- this is the only way to tell a healthy board from a broken one.
+local before = typeof(store:GetAsync(key))
+
 -- Exactly how the game saves these: JSON text wrapped in a buffer.
 store:SetAsync(key, buffer.fromstring(payload))
 
@@ -650,7 +655,7 @@ if not ok or type(rows) ~= "table" then
     return { status = "unreadable" }
 end
 
-return { status = "ok", rows = #rows, bytes = #payload }
+return { status = "ok", was = before, rows = #rows, bytes = #payload }
 """
 
 def lua_long_string(text):
@@ -705,7 +710,7 @@ async def write_board_rows(key, rows):
         return False, "the entry wrote but the game's own read of it failed"
     if status != "ok":
         return False, f"the task returned {result!r}"
-    return True, None
+    return True, result
 
 def same_roblox_id(value, user_id):
     """Compare a stored UserId to a Roblox ID, whichever way it was written."""
@@ -4600,7 +4605,7 @@ async def leaderboard_restore(ctx, board: str, reference: str = None):
         if target is None:
             return
         label, key = target
-        status, rows, layers = await read_board_rows(key)
+        status, rows, _ = await read_board_rows(key)
 
         if status != "ok":
             notes = {
@@ -4616,27 +4621,28 @@ async def leaderboard_restore(ctx, board: str, reference: str = None):
             ))
             return
 
-        if layers == 1:
-            await ctx.send(view=simple_card(
-                f"{label} is already a single-layer buffer — "
-                f"{len(rows)} row(s), nothing to repair.",
-                colour=discord.Color.greyple(),
-            ))
-            return
-
-        written, reason = await write_board_rows(key, rows)
+        # Always rewritten, never skipped on the strength of the layer count:
+        # a plain table holding {t = "buffer", zbase64 = ...} is indis-
+        # tinguishable from a real buffer over Open Cloud, and that is exactly
+        # what a broken board looks like. Luau reports what it really was.
+        written, detail = await write_board_rows(key, rows)
 
     if not written:
         await ctx.send(view=simple_card(
-            f"Couldn't rewrite {label}.\n-# {reason}",
+            f"Couldn't rewrite {label}.\n-# {detail}",
             colour=discord.Color.red(),
         ))
         return
 
-    was = "a plain table" if layers == 0 else f"{layers} nested buffer layers"
+    was = detail.get("was") if isinstance(detail, dict) else None
+    note = (
+        "it was already a buffer, and has been rewritten anyway"
+        if was == "buffer"
+        else f"the game was seeing a **{was}** there"
+    )
     await ctx.send(view=simple_card(
-        f"🔧 Rewrote {label} as a single-layer buffer — {len(rows)} row(s) "
-        f"intact.\n-# It was stored as {was}.",
+        f"🔧 Rewrote {label} as a buffer — {len(rows)} row(s) intact.\n"
+        f"-# Before the write {note}.",
         colour=discord.Color.green(),
     ))
 
