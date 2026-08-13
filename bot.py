@@ -523,10 +523,36 @@ async def purge_player_from_board(user_id, key):
     # all -- both are the state we wanted, same as a 404 on a delete.
     return status in ("ok", "skipped", "missing")
 
-async def find_player_on_board(user_id, key, value_formatter):
-    """Where a player sits on a list-shaped board, as text, or None."""
+def sort_board_entries(entries):
+    """Order a time board fastest-first. The game stores it unsorted.
+
+    Rows without a usable Value sink to the bottom rather than taking a
+    podium place off a real time.
+    """
+    def ranking(entry):
+        value = entry.get("Value") if isinstance(entry, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return (1, 0)
+        return (0, value)
+
+    # sorted() is stable, so equal times keep the order the game wrote them.
+    return sorted(entries, key=ranking)
+
+async def fetch_board(key):
+    """A map or Daily Cup leaderboard, sorted, or None when there isn't one.
+
+    Every caller that cares about rank goes through here, so the position a
+    player is shown at is the position their medal is calculated from.
+    """
     board = await fetch_entry(key, datastore="Leaderboards")
     if not isinstance(board, list):
+        return None
+    return sort_board_entries(board)
+
+async def find_player_on_board(user_id, key, value_formatter):
+    """Where a player sits on a list-shaped board, as text, or None."""
+    board = await fetch_board(key)
+    if board is None:
         return None
     for position, entry in enumerate(board):
         if isinstance(entry, dict) and same_roblox_id(entry.get("UserId"), user_id):
@@ -2442,8 +2468,8 @@ async def build_leaderboard_embed(
 async def build_map_leaderboard_embed(map_id, map_name):
     """Build the same map leaderboard used by the map card button and command."""
     key = MAP_LEADERBOARD_KEY.format(id=map_id)
-    leaderboard = await fetch_entry(key, datastore="Leaderboards")
-    if not isinstance(leaderboard, list):
+    leaderboard = await fetch_board(key)
+    if leaderboard is None:
         return None
 
     return await build_leaderboard_embed(
@@ -2566,9 +2592,7 @@ async def publish_daily_cup_announcement(destination=None):
     current_date = cup_day_today()
     previous_index = current_index - 1
     previous_leaderboard, previous_map_id, maps_by_id = await asyncio.gather(
-        fetch_entry(
-            f"DailyCup_{previous_index}", datastore="Leaderboards"
-        ),
+        fetch_board(f"DailyCup_{previous_index}"),
         get_cup_map_id(previous_index, todays_map),
         get_community_maps(),
     )
@@ -2718,7 +2742,7 @@ async def on_command_error(ctx, error):
 async def send_cup_leaderboard(ctx, index, date_text, *, todays_map=None):
     """Post one cup's leaderboard, or explain why it isn't there."""
     leaderboard, map_id = await asyncio.gather(
-        fetch_entry(f"DailyCup_{index}", datastore="Leaderboards"),
+        fetch_board(f"DailyCup_{index}"),
         get_cup_map_id(index, todays_map or {}),
     )
     if not leaderboard:
