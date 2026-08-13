@@ -5207,10 +5207,6 @@ def restrict_to_home_guild():
     Safe to call more than once -- copy_global_to replaces the guild's
     command list, so this has to run again after it.
     """
-    if HOME_GUILD is None:
-        print("GUILD_ID is not set; /achievements and /sync stay global")
-        return
-
     moved = []
     for target in HOME_GUILD_COMMANDS:
         # A hybrid command keeps its app command on the side; a tree command
@@ -5218,9 +5214,31 @@ def restrict_to_home_guild():
         app_command = getattr(target, "app_command", target)
         if app_command is None:
             continue
+
+        if HOME_GUILD is None:
+            # No guild to bind to. Override the tree's defaults so they at
+            # least stay out of user installs and DMs, where neither works.
+            # Only done in this branch: a guild command carries no install
+            # metadata, and sending it anyway risks a rejected sync.
+            app_command.allowed_installs = app_commands.AppInstallationType(
+                guild=True, user=False
+            )
+            app_command.allowed_contexts = app_commands.AppCommandContext(
+                guild=True, dm_channel=False, private_channel=False
+            )
+            continue
+
         bot.tree.remove_command(app_command.name)
         bot.tree.add_command(app_command, guild=HOME_GUILD, override=True)
         moved.append(app_command.name)
+
+    if HOME_GUILD is None:
+        print(
+            "GUILD_ID is not set; /achievements and /sync stay global, "
+            "but are no longer user-installable. Set GUILD_ID to scope them "
+            "to the home server."
+        )
+        return
 
     print(f"Restricted /{', /'.join(moved)} to guild {HOME_GUILD.id}")
 
