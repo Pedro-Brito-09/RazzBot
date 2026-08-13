@@ -75,6 +75,17 @@ MAPS_CACHE_TTL = 600
 MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
               "Playstyle", "Privacy", "Featured")
 
+# Luau Execution runs a script on a real server for the place. It is the only
+# way to write a value the game reads back as a buffer: the datastore API can
+# report a buffer but never store one. Needs the API key scope
+# universe.place.luau-execution-session:write on this place.
+LUAU_PLACE_ID = os.getenv("LUAU_PLACE_ID") or "86832525327994"
+# The matching place in DEV_UNIVERSE_ID, for the !dev_ twins.
+DEV_LUAU_PLACE_ID = os.getenv("DEV_LUAU_PLACE_ID")
+# A task queues, boots a server, then runs; 10-30s is normal.
+LUAU_POLL_SECONDS = 3
+LUAU_TASK_TIMEOUT = 150
+
 UNIVERSE_ID = 8993151589
 # Every command has a !dev_ twin that runs against this universe instead.
 DEV_UNIVERSE_ID = int(os.getenv("DEV_UNIVERSE_ID") or 7117693401)
@@ -520,6 +531,183 @@ async def delete_ordered_entry(entry_key, datastore="Data", scope="Wins"):
               f"{type(error).__name__}: {error}")
         return False
 
+def current_luau_place():
+    """The place to execute against, matching the active universe."""
+    if on_dev_universe():
+        return DEV_LUAU_PLACE_ID
+    return LUAU_PLACE_ID
+
+async def start_luau_task(script):
+    """Queue a Luau script on a real server for the place."""
+    url = (
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}"
+        f"/places/{quote(str(current_luau_place()), safe='')}"
+        f"/luau-execution-session-tasks"
+    )
+    headers = {
+        "x-api-key": API_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    session = await get_session()
+    try:
+        async with session.post(url, headers=headers,
+                                json={"script": script}) as resp:
+            if resp.status not in (200, 201):
+                body = (await resp.text())[:300]
+                print(f"start_luau_task -> HTTP {resp.status}: {body}")
+                return None
+            return await resp.json(content_type=None)
+    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+        print(f"start_luau_task failed: {type(error).__name__}: {error}")
+        return None
+
+async def fetch_luau_logs(path):
+    """Whatever the task printed, as one string."""
+    data = await request_json(
+        f"https://apis.roblox.com/cloud/v2/{path}/logs",
+        headers={"x-api-key": API_KEY, "Accept": "application/json"},
+        label="fetch_luau_logs",
+    )
+    if not isinstance(data, dict):
+        return ""
+    lines = []
+    for entry in data.get("luauExecutionSessionTaskLogs") or []:
+        lines.extend(entry.get("messages") or [])
+    return "\n".join(lines)
+
+async def run_luau(script):
+    """Run Luau on a real server. Returns (state, result).
+
+    result is the script's first return value once COMPLETE, otherwise a short
+    reason to show. Blocks while the task boots and runs, which is normally
+    10-30s.
+    """
+    if not current_luau_place():
+        return "ERROR", (
+            "no place is configured for this universe — set DEV_LUAU_PLACE_ID"
+            if on_dev_universe() else "LUAU_PLACE_ID is not set"
+        )
+
+    task = await start_luau_task(script)
+    path = (task or {}).get("path")
+    if not path:
+        return "ERROR", (
+            "couldn't queue the task — the API key may be missing "
+            "`universe.place.luau-execution-session:write`"
+        )
+
+    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    deadline = time.monotonic() + LUAU_TASK_TIMEOUT
+    state = task.get("state")
+    while state in (None, "STATE_UNSPECIFIED", "QUEUED", "PROCESSING"):
+        if time.monotonic() > deadline:
+            return "TIMEOUT", f"still running after {LUAU_TASK_TIMEOUT}s"
+        await asyncio.sleep(LUAU_POLL_SECONDS)
+        task = await request_json(
+            f"https://apis.roblox.com/cloud/v2/{path}",
+            headers=headers, label="poll_luau_task",
+        )
+        if not isinstance(task, dict):
+            return "ERROR", "lost track of the task"
+        state = task.get("state")
+
+    if state != "COMPLETE":
+        logs = await fetch_luau_logs(path)
+        reason = (task.get("error") or {}).get("message") or state
+        print(f"run_luau {state}: {reason}\n{logs}")
+        return state, reason
+
+    results = (task.get("output") or {}).get("results") or []
+    return "COMPLETE", results[0] if results else None
+
+# Reads whatever shape the entry is in, and always writes a buffer back --
+# so a board that was already flattened into a table gets repaired in place.
+LUAU_BOARD_REMOVE = """
+local DataStoreService = game:GetService("DataStoreService")
+local HttpService = game:GetService("HttpService")
+
+local store = DataStoreService:GetDataStore("Leaderboards")
+local key = %s
+local userId = %s
+
+local value = store:GetAsync(key)
+if value == nil then
+    return { status = "missing" }
+end
+
+local text
+if typeof(value) == "buffer" then
+    text = buffer.tostring(value)
+elseif type(value) == "string" then
+    text = value
+else
+    text = HttpService:JSONEncode(value)
+end
+
+local ok, entries = pcall(function()
+    return HttpService:JSONDecode(text)
+end)
+if not ok or type(entries) ~= "table" then
+    return { status = "unreadable" }
+end
+
+local kept = {}
+local removed = 0
+for _, entry in ipairs(entries) do
+    if type(entry) == "table" and tonumber(entry.UserId) == userId then
+        removed += 1
+    else
+        table.insert(kept, entry)
+    end
+end
+
+if removed == 0 then
+    return { status = "absent" }
+end
+
+store:SetAsync(key, buffer.fromstring(HttpService:JSONEncode(kept)))
+return { status = "ok", removed = removed, remaining = #kept }
+"""
+
+# Repairs a board the datastore API flattened into a plain table. The rows
+# survived that write intact, so this only puts the buffer wrapper back.
+LUAU_BOARD_RESTORE = """
+local DataStoreService = game:GetService("DataStoreService")
+local HttpService = game:GetService("HttpService")
+
+local store = DataStoreService:GetDataStore("Leaderboards")
+local key = %s
+
+local value = store:GetAsync(key)
+if value == nil then
+    return { status = "missing" }
+end
+if typeof(value) == "buffer" then
+    return { status = "already_buffer" }
+end
+
+local text
+if type(value) == "string" then
+    text = value
+else
+    text = HttpService:JSONEncode(value)
+end
+
+local ok, entries = pcall(function()
+    return HttpService:JSONDecode(text)
+end)
+if not ok or type(entries) ~= "table" then
+    return { status = "unreadable" }
+end
+
+store:SetAsync(key, buffer.fromstring(HttpService:JSONEncode(entries)))
+return { status = "ok", entries = #entries }
+"""
+
+def luau_result_status(result):
+    return result.get("status") if isinstance(result, dict) else None
+
 def same_roblox_id(value, user_id):
     """Compare a stored UserId to a Roblox ID, whichever way it was written."""
     try:
@@ -528,32 +716,27 @@ def same_roblox_id(value, user_id):
         return False
 
 async def purge_player_from_board(user_id, key):
-    """Drop a player's row from a list-shaped leaderboard entry.
+    """Drop a player's row from a map or Daily Cup leaderboard.
 
-    Map and Daily Cup boards are lists inside a regular entry, so removing a
-    row takes a read-modify-write rather than a delete. True once the board no
-    longer lists them.
-
-    Boards the game saved as a Luau buffer cannot be rewritten at all: Open
-    Cloud reports a buffer but will not accept one, so the write would land as
-    a plain table and break the game's own read. Those come back False and
-    have to be edited from Luau instead.
+    Runs through Luau Execution rather than the datastore API. The game keeps
+    these boards as buffers, and Open Cloud can report a buffer but never
+    store one, so writing from here would leave a plain table the game fails
+    to read back.
     """
-    def transform(entries):
-        if not isinstance(entries, list):
-            return None
-        kept = [
-            entry for entry in entries
-            if not (isinstance(entry, dict)
-                    and same_roblox_id(entry.get("UserId"), user_id))
-        ]
-        # None leaves the entry alone, so an absent player costs no write.
-        return kept if len(kept) != len(entries) else None
+    state, result = await run_luau(
+        LUAU_BOARD_REMOVE % (json.dumps(str(key)), int(user_id))
+    )
+    if state != "COMPLETE":
+        print(f"purge_player_from_board({key}) {state}: {result}")
+        return False
 
-    status = await update_entry_with_retry(key, "Leaderboards", transform)
-    # "skipped" is the player not being on the board, "missing" is no board at
+    status = luau_result_status(result)
+    # "absent" is the player not being on the board, "missing" is no board at
     # all -- both are the state we wanted, same as a 404 on a delete.
-    return status in ("ok", "skipped", "missing")
+    if status in ("ok", "absent", "missing"):
+        return True
+    print(f"purge_player_from_board({key}) returned {status!r}")
+    return False
 
 def sort_board_entries(entries):
     """Order a time board fastest-first. The game stores it unsorted.
@@ -4327,6 +4510,12 @@ class LeaderboardRemoveView(OwnedView, discord.ui.View):
     @keeps_context
     async def confirm_remove(self, interaction):
         await interaction.response.defer()
+        # Board edits boot a server through Luau Execution, so this sits for
+        # 10-30s. Say so rather than leaving the card looking stuck.
+        self.outcome = [f"⏳ Removing from {self.label}…"]
+        self.clear_items()
+        await interaction.edit_original_response(content=self.render(), view=self)
+
         if await self.action():
             self.outcome = [f"🗑️ Removed from {self.label}."]
             self.clear_items()
@@ -4353,6 +4542,71 @@ class LeaderboardRemoveView(OwnedView, discord.ui.View):
         self.clear_items()
         self.stop()
         await interaction.edit_original_response(content=self.render(), view=self)
+
+async def resolve_board_key(ctx, board, reference):
+    """A map or cup board as (label, datastore key), or None once reported."""
+    selected = board.strip().lower()
+
+    if selected == "map":
+        if reference is None or not reference.strip().isdigit():
+            await ctx.send(
+                "Give the map ID: `!leaderboard restore map <id>`."
+            )
+            return None
+        map_id = int(reference.strip())
+        maps_by_id = await get_community_maps()
+        entry = (maps_by_id or {}).get(map_id)
+        name = (entry or {}).get("Name") or "Unnamed Map"
+        return (
+            f"the **{name}** board (map `{map_id}`)",
+            MAP_LEADERBOARD_KEY.format(id=map_id),
+        )
+
+    if selected == "cup":
+        index = await resolve_cup_reference(ctx, reference)
+        if index is None:
+            return None
+        return f"Daily Cup #{index}", f"DailyCup_{index}"
+
+    await ctx.send(
+        "Board must be `map <id>` or `cup [index|DD/MM/YYYY]`."
+    )
+    return None
+
+@leaderboard_command.command(name="restore")
+@is_admin()
+async def leaderboard_restore(ctx, board: str, reference: str = None):
+    """!leaderboard restore <map|cup> [id] — rewrite a board as a buffer"""
+    async with ctx.typing():
+        target = await resolve_board_key(ctx, board, reference)
+        if target is None:
+            return
+        label, key = target
+        state, result = await run_luau(LUAU_BOARD_RESTORE % json.dumps(key))
+
+    if state != "COMPLETE":
+        await ctx.send(view=simple_card(
+            f"Couldn't run the restore for {label} ({state}).\n-# {result}",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    status = luau_result_status(result)
+    count = result.get("entries") if isinstance(result, dict) else None
+    notes = {
+        "ok": f"🔧 Rewrote {label} as a buffer — {count} row(s) intact.",
+        "already_buffer": f"{label} is already a buffer. Nothing to do.",
+        "missing": f"There's no board stored for {label}.",
+        "unreadable": (
+            f"Couldn't read {label} — the stored value isn't JSON. It needs "
+            f"restoring from DataStore version history instead."
+        ),
+    }
+    await ctx.send(view=simple_card(
+        notes.get(status, f"Unexpected result from the restore: `{status}`."),
+        colour=discord.Color.green() if status == "ok"
+        else discord.Color.orange(),
+    ))
 
 @leaderboard_command.command(name="remove")
 @is_admin()
