@@ -93,6 +93,10 @@ DAILY_CUP_PLAY_URL_TEMPLATE = (
     "https://www.roblox.com/games/start"
     "?placeId=133478407190616"
 )
+# Handed out verbatim by /invite, /game and /group so Discord unfurls them.
+DISCORD_INVITE_URL = "https://discord.gg/ytbW6zMpdS"
+GAME_URL = "https://www.roblox.com/games/86832525327994/NEW-Party-Chaos"
+GROUP_URL = "https://www.roblox.com/communities/34940057/Chaotic-Inc#!/about"
 # A community map's leaderboard is keyed by the map ID on its own.
 MAP_LEADERBOARD_KEY = "{id}"
 # How long the Leaderboard button stays clickable.
@@ -3370,6 +3374,18 @@ async def sync_command(ctx, *, target: str = None):
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
     await ctx.send("hello fuckers")
+
+@bot.hybrid_command(description="Get the Discord server invite")
+async def invite(ctx):
+    await ctx.send(DISCORD_INVITE_URL)
+
+@bot.hybrid_command(description="Get the link to the game")
+async def game(ctx):
+    await ctx.send(GAME_URL)
+
+@bot.hybrid_command(description="Get the link to the Roblox group")
+async def group(ctx):
+    await ctx.send(GROUP_URL)
 
 async def admin_only_predicate(ctx):
     return ctx.author.id == ADMIN_USER_ID
