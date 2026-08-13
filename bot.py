@@ -500,11 +500,12 @@ def same_roblox_id(value, user_id):
     except (TypeError, ValueError):
         return False
 
-async def purge_player_from_cup(user_id, index):
-    """Drop a player's row from one Daily Cup leaderboard.
+async def purge_player_from_board(user_id, key):
+    """Drop a player's row from a list-shaped leaderboard entry.
 
-    The board is a list inside a regular entry, so it takes a read-modify-write
-    rather than a delete. True once the board no longer lists them.
+    Map and Daily Cup boards are lists inside a regular entry, so removing a
+    row takes a read-modify-write rather than a delete. True once the board no
+    longer lists them.
     """
     def transform(entries):
         if not isinstance(entries, list):
@@ -517,12 +518,31 @@ async def purge_player_from_cup(user_id, index):
         # None leaves the entry alone, so an absent player costs no write.
         return kept if len(kept) != len(entries) else None
 
-    status = await update_entry_with_retry(
-        f"DailyCup_{index}", "Leaderboards", transform
-    )
+    status = await update_entry_with_retry(key, "Leaderboards", transform)
     # "skipped" is the player not being on the board, "missing" is no board at
     # all -- both are the state we wanted, same as a 404 on a delete.
     return status in ("ok", "skipped", "missing")
+
+async def find_player_on_board(user_id, key, value_formatter):
+    """Where a player sits on a list-shaped board, as text, or None."""
+    board = await fetch_entry(key, datastore="Leaderboards")
+    if not isinstance(board, list):
+        return None
+    for position, entry in enumerate(board):
+        if isinstance(entry, dict) and same_roblox_id(entry.get("UserId"), user_id):
+            value = entry.get("Value")
+            shown = (
+                value_formatter(value) if isinstance(value, (int, float)) else "--"
+            )
+            return f"Currently #{position + 1} with `{shown}`."
+    return None
+
+async def find_player_on_ordered_board(user_id, scope, value_name):
+    """The player's value on a global ordered board, as text, or None."""
+    value = await fetch_ordered_entry(str(user_id), datastore="Data", scope=scope)
+    if value is None:
+        return None
+    return f"Currently on `{format_number(value)}` {value_name}."
 
 async def ban_purge_targets(user_id):
     """Everything a permanent ban clears, as (label, action) pairs.
@@ -541,7 +561,7 @@ async def ban_purge_targets(user_id):
     if index is not None:
         targets.append((
             f"Daily Cup #{index}",
-            functools.partial(purge_player_from_cup, user_id, index),
+            functools.partial(purge_player_from_board, user_id, f"DailyCup_{index}"),
         ))
     return targets
 
@@ -2981,14 +3001,12 @@ async def badges_command(ctx, username: str = None):
 
     await ctx.send(view=view)
 
-@bot.hybrid_command(
-    name="leaderboard",
-    description="Show a map, wins, medals, or creators leaderboard",
-)
-@app_commands.describe(target="Community map ID, wins, medals, or creators")
-async def leaderboard_command(ctx, target: str):
-    await ctx.defer()
+async def build_leaderboard_reply(target):
+    """Resolve a leaderboard target to (embed, error text).
 
+    Shared by the slash command and the prefix group so the two renderings
+    of the same board can't drift apart.
+    """
     selected = target.strip().lower()
     global_leaderboard = GLOBAL_LEADERBOARDS.get(selected)
     if global_leaderboard is not None:
@@ -3008,36 +3026,53 @@ async def leaderboard_command(ctx, target: str):
                 value_formatter=format_number,
             )
         if embed is None:
-            await ctx.send(f"No entries found for the **{value_name}** leaderboard.")
-            return
-
-        await ctx.send(embed=embed)
-        return
+            return None, f"No entries found for the **{value_name}** leaderboard."
+        return embed, None
 
     try:
         map_id = int(selected)
     except ValueError:
-        await ctx.send("Choose a map ID, `wins`, `medals`, or `creators`.")
-        return
+        return None, "Choose a map ID, `wins`, `medals`, or `creators`."
 
     maps_by_id = await get_community_maps()
     if not maps_by_id:
-        await ctx.send("Failed to fetch the community map list.")
-        return
+        return None, "Failed to fetch the community map list."
 
     entry = maps_by_id.get(map_id)
     if entry is None:
-        await ctx.send(f"No community map with ID `{map_id}`.")
-        return
+        return None, f"No community map with ID `{map_id}`."
 
     embed = await build_map_leaderboard_embed(
         map_id, entry.get("Name") or "Unnamed Map"
     )
     if embed is None:
         key = MAP_LEADERBOARD_KEY.format(id=map_id)
-        await ctx.send(f"No leaderboard found for `{key}`.")
-        return
+        return None, f"No leaderboard found for `{key}`."
+    return embed, None
 
+@bot.tree.command(
+    name="leaderboard",
+    description="Show a map, wins, medals, or creators leaderboard",
+)
+@app_commands.describe(target="Community map ID, wins, medals, or creators")
+async def leaderboard_slash_command(interaction: discord.Interaction, target: str):
+    await interaction.response.defer()
+    embed, error = await build_leaderboard_reply(target)
+    if error:
+        await interaction.followup.send(error)
+        return
+    await interaction.followup.send(embed=embed)
+
+# Prefix-only, so the admin `remove` subcommand never reaches anyone's slash
+# list. The slash command above stays a plain command, unchanged by the group.
+@bot.group(name="leaderboard", invoke_without_command=True)
+async def leaderboard_command(ctx, target: str):
+    """Show a map, wins, medals, or creators leaderboard."""
+    async with ctx.typing():
+        embed, error = await build_leaderboard_reply(target)
+    if error:
+        await ctx.send(error)
+        return
     await ctx.send(embed=embed)
 
 async def build_map_view(entry, parent=None):
@@ -3460,6 +3495,179 @@ async def admin_unban(ctx, player: str):
             await ctx.send(f"✅ Unbanned **{name}** (`{user_id}`).")
         else:
             await ctx.send(f"Failed to unban **{name}**. Check the logs.")
+
+async def resolve_cup_reference(ctx, reference):
+    """A cup index, a DD/MM/YYYY date, or nothing for the live cup."""
+    current_index, _ = await resolve_current_cup(await fetch_entry("TodaysMap") or {})
+
+    if reference is None:
+        if current_index is None:
+            await ctx.send("No daily cup index set, so there's no board to edit.")
+            return None
+        return current_index
+
+    cleaned = reference.strip()
+    if cleaned.isdigit():
+        return int(cleaned)
+
+    target = parse_cup_date(cleaned)
+    if target is None:
+        await ctx.send("Give a cup index or a date like `10/08/2026`.")
+        return None
+    if current_index is None:
+        await ctx.send("Can't reach past cups: TodaysMap has no index.")
+        return None
+
+    # The index advances by one per cup day, so counting days back from
+    # today's index lands on that day's cup.
+    days_back = (cup_day_today() - target).days
+    if days_back < 0:
+        await ctx.send(f"`{target:%d/%m/%Y}` is in the future.")
+        return None
+    index = current_index - days_back
+    if index < 0:
+        await ctx.send(f"No cup on `{target:%d/%m/%Y}` — that's before the first one.")
+        return None
+    return index
+
+async def resolve_removal_board(ctx, user_id, board, reference):
+    """A removal target as (label, remove action, standing lookup).
+
+    Returns None once it has reported why the board couldn't be resolved.
+    """
+    selected = board.strip().lower()
+
+    global_board = GLOBAL_LEADERBOARDS.get(selected)
+    if global_board is not None:
+        scope, value_name = global_board
+        return (
+            f"the {value_name} leaderboard",
+            functools.partial(
+                delete_ordered_entry, str(user_id), datastore="Data", scope=scope
+            ),
+            functools.partial(
+                find_player_on_ordered_board, user_id, scope, value_name
+            ),
+        )
+
+    if selected == "map":
+        if reference is None or not reference.strip().isdigit():
+            await ctx.send(
+                "Give the map ID: `!leaderboard remove <player> map <id>`."
+            )
+            return None
+        map_id = int(reference.strip())
+        maps_by_id = await get_community_maps()
+        entry = (maps_by_id or {}).get(map_id)
+        # A board can outlive its map, so an unknown ID is still removable.
+        name = (entry or {}).get("Name") or "Unnamed Map"
+        key = MAP_LEADERBOARD_KEY.format(id=map_id)
+        return (
+            f"the **{name}** board (map `{map_id}`)",
+            functools.partial(purge_player_from_board, user_id, key),
+            functools.partial(find_player_on_board, user_id, key, format_time),
+        )
+
+    if selected == "cup":
+        index = await resolve_cup_reference(ctx, reference)
+        if index is None:
+            return None
+        key = f"DailyCup_{index}"
+        return (
+            f"Daily Cup #{index}",
+            functools.partial(purge_player_from_board, user_id, key),
+            functools.partial(find_player_on_board, user_id, key, format_time),
+        )
+
+    await ctx.send(
+        "Board must be `wins`, `medals`, `creators`, `map <id>`, or "
+        "`cup [index|DD/MM/YYYY]`."
+    )
+    return None
+
+class LeaderboardRemoveView(OwnedView, discord.ui.View):
+    """Confirm dropping one player from one board, then report the outcome."""
+
+    def __init__(self, notice, label, action, *, timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(timeout=timeout)
+        self.universe = current_universe()
+        self.bind_owner()
+        self.message = None
+        self.notice = notice
+        self.label = label
+        self.action = action
+        self.outcome = None
+
+        confirm = discord.ui.Button(
+            label="Remove", style=discord.ButtonStyle.danger, emoji="🗑️"
+        )
+        confirm.callback = self.confirm_remove
+        self.add_item(confirm)
+
+        cancel = discord.ui.Button(
+            label="Cancel", style=discord.ButtonStyle.secondary
+        )
+        cancel.callback = self.cancel_remove
+        self.add_item(cancel)
+
+    def render(self):
+        return "\n".join(self.outcome or self.notice)
+
+    @keeps_context
+    async def confirm_remove(self, interaction):
+        await interaction.response.defer()
+        if await self.action():
+            self.outcome = [f"🗑️ Removed from {self.label}."]
+            self.clear_items()
+            # Nothing left to do, so the view is done.
+            self.stop()
+        else:
+            self.outcome = [
+                f"⚠️ Couldn't remove from {self.label}. Check the logs."
+            ]
+            self.clear_items()
+            retry = discord.ui.Button(
+                label="Retry", style=discord.ButtonStyle.danger, emoji="🔁"
+            )
+            retry.callback = self.confirm_remove
+            self.add_item(retry)
+        await interaction.edit_original_response(content=self.render(), view=self)
+
+    @keeps_context
+    async def cancel_remove(self, interaction):
+        await interaction.response.defer()
+        self.outcome = ["Cancelled. Nothing was removed."]
+        self.clear_items()
+        self.stop()
+        await interaction.edit_original_response(content=self.render(), view=self)
+
+@leaderboard_command.command(name="remove")
+@is_admin()
+async def leaderboard_remove(ctx, player: str, board: str, reference: str = None):
+    """!leaderboard remove <player> <wins|medals|creators|map|cup> [id]"""
+    async with ctx.typing():
+        user_id, name = await resolve_admin_target(ctx, player)
+        if user_id is None:
+            return
+
+        target = await resolve_removal_board(ctx, user_id, board, reference)
+        if target is None:
+            return
+        label, remove, find_standing = target
+        standing = await find_standing()
+
+    lines = [f"⚠️ Remove **{name}** (`{user_id}`) from {label}?"]
+    lines.append(
+        f"-# {standing}" if standing
+        else "-# They aren't on that board right now."
+    )
+    lines.append("-# This deletes their entry. There is no undo.")
+    note = dev_universe_note()
+    if note:
+        lines.append(note)
+
+    view = LeaderboardRemoveView(lines, label, remove)
+    view.message = await ctx.send(view.render(), view=view)
 
 async def set_map_featured(ctx, map_id, featured):
     """Flip Featured on one map inside the Community Maps index."""
