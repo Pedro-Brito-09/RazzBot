@@ -39,6 +39,9 @@ MAP_COLOR = discord.Color.blurple()
 DAILY_CUP_COLOR = discord.Color(0xF1C40F)
 PROFILE_COLOR = discord.Color(0x9B59B6)
 MAX_LEADERBOARD_ROWS = 10
+# Player and value are separate inline fields, so a name long enough to wrap
+# pushes every row under it out of step with the values beside it.
+MAX_LEADERBOARD_NAME = 18
 # Maps shown per page in a search result or a player's map list.
 MAPS_PER_PAGE = 10
 # Admin commands are prefix-only and answer to this account alone, so they
@@ -1981,6 +1984,21 @@ async def fetch_headshots(user_ids):
             headshots[item.get("targetId")] = item["imageUrl"]
     return headshots
 
+MENTION_PATTERN = re.compile(r"<@!?\d+>")
+
+def truncate_name(name, limit=MAX_LEADERBOARD_NAME):
+    """Shorten a display name so the value column stays aligned.
+
+    A mention is left alone -- Discord renders it as a pill and sizes it
+    itself, and cutting one up would leave raw markup on screen.
+    """
+    name = " ".join(str(name).split())
+    if MENTION_PATTERN.fullmatch(name) or len(name) <= limit:
+        return name
+    # Never end on a lone backslash: escaping runs after this, and a trailing
+    # one would escape the bold marker that follows and swallow it.
+    return name[:limit - 1].rstrip("\\") + "…"
+
 async def collect_leaderboard_rows(
     leaderboard, limit, *, value_formatter=format_time
 ):
@@ -1999,6 +2017,9 @@ async def collect_leaderboard_rows(
         if not name:
             # A failed username lookup shouldn't drop the whole row.
             name = f"User {user_id}" if user_id is not None else "Unknown"
+        # Trimmed first, then escaped, so the limit counts visible characters
+        # rather than the backslashes escaping adds.
+        name = truncate_name(name)
 
         country = entry.get("Country")
         country = country.strip().upper()[:2] if isinstance(country, str) else ""
@@ -3873,10 +3894,13 @@ def achievement_leaderboard_rows(guild, rules):
         earned = sum(1 for role in member.roles if role.id in role_ids)
         if earned:
             rows.append({
-                "Name": discord.utils.escape_markdown(member.display_name),
+                # A mention rather than the name: Discord renders it as a
+                # pill, and one inside an embed never notifies anyone.
+                "Name": f"<@{member.id}>",
                 "Value": earned,
+                "Sort": member.display_name.lower(),
             })
-    rows.sort(key=lambda row: (-row["Value"], row["Name"].lower()))
+    rows.sort(key=lambda row: (-row["Value"], row["Sort"]))
     return rows
 
 async def build_leaderboard_reply(target, guild=None):
