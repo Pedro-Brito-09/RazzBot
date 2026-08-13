@@ -2381,7 +2381,7 @@ class ProfileView(CardView):
             achievements_button = discord.ui.Button(
                 label="Achievements",
                 style=discord.ButtonStyle.secondary,
-                emoji="🎭",
+                emoji="💎",
             )
             achievements_button.callback = self.show_achievements
             row.add_item(achievements_button)
@@ -5540,7 +5540,7 @@ class PlayerAchievementsView(CardView):
             body = "\n".join(f"❌ {role.mention}" for role in roles)
             body = body or "✅ This player is not missing any achievements."
         else:
-            title = f"## 🎭 {self.player_name}'s Achievements"
+            title = f"## 💎 {self.player_name}'s Achievements"
             roles = self.achieved_roles
             body = "\n".join(f"✅ {role.mention}" for role in roles)
             body = body or "This player has no achievements yet."
@@ -5602,13 +5602,13 @@ def build_role_rules_view(
             )
         return simple_card(
             text,
-            heading="🎭 Achievement Roles",
+            heading="💎 Achievement Roles",
             colour=discord.Color.greyple(),
         )
 
     container = discord.ui.Container(accent_colour=PROFILE_COLOR)
     container.add_item(discord.ui.TextDisplay(
-        f"## 🎭 Achievement Roles\n-# {len(rules)} available"
+        f"## 💎 Achievement Roles\n-# {len(rules)} available"
     ))
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(
