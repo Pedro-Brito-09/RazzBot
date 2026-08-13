@@ -85,6 +85,16 @@ Discord Developer Mode, right-click the destination channel, and choose
 **Copy Channel ID**. The bot needs View Channel, Send Messages, Embed Links,
 and Use External Emojis permissions there.
 
+If that channel is an **Announcement channel**, the bot publishes both messages
+after posting, pushing them to every server that follows it. Publishing its own
+messages needs no extra permission beyond Send Messages. Other servers still have
+to follow the channel themselves — open it there and use *Follow*; the bot cannot
+add followers. In an ordinary text channel the publish step is skipped silently,
+and `!testcup` never publishes, so a preview can't reach followers.
+
+Discord caps published messages at 10 per hour per channel; the Daily Cup posts
+two per day.
+
 `DAILY_CUP_ROLE_ID` is the ID of the role pinged with the new map card. If it
 is omitted, the bot falls back to a role named exactly `Daily Cup Notification`.
 

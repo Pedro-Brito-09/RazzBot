@@ -2769,8 +2769,29 @@ def daily_cup_role_mention(destination):
     print("Daily Cup notification role was not found")
     return None
 
-async def publish_daily_cup_announcement(destination=None):
-    """Post yesterday's cup leaderboard, followed by today's map card."""
+async def crosspost_message(message):
+    """Publish a message to the servers following its announcement channel.
+
+    A no-op anywhere else, so the same call is safe in an ordinary channel.
+    Publishing the bot's own message needs only Send Messages; a failure is
+    logged rather than raised, since the post itself already succeeded.
+    """
+    channel = message.channel
+    if not isinstance(channel, discord.TextChannel) or not channel.is_news():
+        return False
+    try:
+        await message.publish()
+    except discord.HTTPException as error:
+        print(f"Crossposting message {message.id} failed: {error}")
+        return False
+    return True
+
+async def publish_daily_cup_announcement(destination=None, *, crosspost=True):
+    """Post yesterday's cup leaderboard, followed by today's map card.
+
+    crosspost=False keeps a preview from reaching every following server if
+    it happens to be run in the announcement channel itself.
+    """
     if destination is None:
         try:
             channel_id = int(DAILY_CUP_CHANNEL_ID)
@@ -2839,7 +2860,7 @@ async def publish_daily_cup_announcement(destination=None):
     role_mention = daily_cup_role_mention(destination)
 
     # Preserve the requested order: completed cup first, new cup second.
-    await destination.send(embed=leaderboard_embed)
+    leaderboard_message = await destination.send(embed=leaderboard_embed)
     map_view.message = await destination.send(
         content=(
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2854,6 +2875,13 @@ async def publish_daily_cup_announcement(destination=None):
             replied_user=False,
         ),
     )
+    if crosspost:
+        published = 0
+        for message in (leaderboard_message, map_view.message):
+            published += await crosspost_message(message)
+        if published:
+            print(f"Crossposted {published} Daily Cup message(s) to followers")
+
     print(
         f"Posted Daily Cup #{previous_index} results and "
         f"Daily Cup #{current_index} map {map_id} to channel {channel_id}"
@@ -5089,7 +5117,8 @@ async def admin_roles_remove(ctx, rule_id: str):
 async def test_cup_announcement(ctx):
     """Owner-only preview of the scheduled Daily Cup messages."""
     async with ctx.typing():
-        posted = await publish_daily_cup_announcement(ctx.channel)
+        # A preview must never reach the servers following the real channel.
+        posted = await publish_daily_cup_announcement(ctx.channel, crosspost=False)
     if not posted:
         await ctx.send(
             "Couldn't build the Daily Cup announcement. Check the bot logs "
