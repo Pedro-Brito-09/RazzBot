@@ -151,7 +151,8 @@ DAILY_CUP_ROLE_ID = os.getenv("DAILY_CUP_ROLE_ID")
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(
-    command_prefix="!",
+    # Pinging the bot works as a second prefix: "@Razz profile" == "!profile".
+    command_prefix=commands.when_mentioned_or("!"),
     intents=intents,
     # Replaced by the /help below, which can hide the admin commands.
     help_command=None,
@@ -2941,8 +2942,9 @@ async def on_message(message):
     prefix commands -- so process_commands has to be called by hand.
     """
     if not message.author.bot and bot.user is not None:
-        # Only a mention on its own. A reply carries one too, and so does any
-        # message that happens to name the bot, and neither is a greeting.
+        # Only a mention on its own -- the prefix with no command after it.
+        # A reply carries a mention too, and so does any message that happens
+        # to name the bot, and neither of those is a greeting.
         if re.fullmatch(rf"<@!?{bot.user.id}>", message.content.strip()):
             await message.reply(MENTION_REPLY, mention_author=False)
             return
