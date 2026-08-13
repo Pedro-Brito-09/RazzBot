@@ -105,14 +105,15 @@ The admin commands need more: `universe.user-restriction:write` for `!ban` and
 `!unban`, plus delete access on the `Community Maps` data store and the ordered
 data stores for `!deletemap` and permanent bans.
 
-Editing a map or Daily Cup leaderboard additionally needs
+Editing `Community Maps/Ids` or a map or Daily Cup leaderboard additionally needs
 **`universe.place.luau-execution-session:write`** on `LUAU_PLACE_ID`. The game
-stores those boards as Luau buffers, and the Open Cloud data store API can
+stores those entries as Luau buffers, and the Open Cloud data store API can
 *report* a buffer but never store one — writing through it leaves a plain table
-and the game then fails reading its own entry. So `!leaderboard remove`, the
-permanent-ban cup purge, and `!leaderboard restore` run their edit as a Luau
-script on a real server instead, where a buffer stays a buffer. Each of those
-takes 10-30s while the task boots.
+and the game then fails reading its own entry. So `!feature`, `!unfeature`,
+`!deletemap`, `!communitymaps restore`, `!leaderboard remove`, the permanent-ban
+cup purge, and `!leaderboard restore` run their edit as a Luau script on a real
+server instead, where a buffer stays a buffer. Each of those takes 10-30s while
+the task boots.
 
 `/sync` and `!roles` store their rules in a `Roles` data store, which the key
 needs read, create, and update access to.

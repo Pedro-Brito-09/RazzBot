@@ -549,7 +549,48 @@ def current_luau_place():
         return DEV_LUAU_PLACE_ID
     return LUAU_PLACE_ID
 
-async def start_luau_task(script):
+async def create_luau_binary_input(payload):
+    """Upload bytes for a Luau task and return its binary-input path."""
+    url = (
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}"
+        "/luau-execution-session-task-binary-inputs"
+    )
+    headers = {
+        "x-api-key": API_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    session = await get_session()
+    try:
+        async with session.post(url, headers=headers,
+                                json={"size": len(payload)}) as resp:
+            if resp.status not in (200, 201):
+                body = (await resp.text())[:300]
+                print(f"create_luau_binary_input -> HTTP {resp.status}: {body}")
+                return None
+            binary_input = await resp.json(content_type=None)
+
+        path = binary_input.get("path")
+        upload_uri = binary_input.get("uploadUri")
+        if not path or not upload_uri:
+            print("create_luau_binary_input -> response omitted path/uploadUri")
+            return None
+
+        async with session.put(
+            upload_uri,
+            headers={"Content-Type": "application/octet-stream"},
+            data=payload,
+        ) as resp:
+            if resp.status not in (200, 201, 204):
+                body = (await resp.text())[:300]
+                print(f"upload_luau_binary_input -> HTTP {resp.status}: {body}")
+                return None
+        return path
+    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+        print(f"create_luau_binary_input failed: {type(error).__name__}: {error}")
+        return None
+
+async def start_luau_task(script, *, binary_input=None):
     """Queue a Luau script on a real server for the place."""
     url = (
         f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}"
@@ -561,10 +602,13 @@ async def start_luau_task(script):
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+    payload = {"script": script}
+    if binary_input:
+        payload["binaryInput"] = binary_input
     session = await get_session()
     try:
         async with session.post(url, headers=headers,
-                                json={"script": script}) as resp:
+                                json=payload) as resp:
             if resp.status not in (200, 201):
                 body = (await resp.text())[:300]
                 print(f"start_luau_task -> HTTP {resp.status}: {body}")
@@ -588,7 +632,7 @@ async def fetch_luau_logs(path):
         lines.extend(entry.get("messages") or [])
     return "\n".join(lines)
 
-async def run_luau(script):
+async def run_luau(script, *, binary_payload=None):
     """Run Luau on a real server. Returns (state, result).
 
     result is the script's first return value once COMPLETE, otherwise a short
@@ -601,7 +645,13 @@ async def run_luau(script):
             if on_dev_universe() else "LUAU_PLACE_ID is not set"
         )
 
-    task = await start_luau_task(script)
+    binary_input = None
+    if binary_payload is not None:
+        binary_input = await create_luau_binary_input(binary_payload)
+        if not binary_input:
+            return "ERROR", "couldn't upload the task's binary input"
+
+    task = await start_luau_task(script, binary_input=binary_input)
     path = (task or {}).get("path")
     if not path:
         return "ERROR", (
@@ -633,16 +683,20 @@ async def run_luau(script):
     results = (task.get("output") or {}).get("results") or []
     return "COMPLETE", results[0] if results else None
 
-# Luau has no zstd, and a damaged board's inner layer is zstd-compressed, so
-# the decoding stays in Python and Luau only does the write. buffer.fromstring
-# is the whole point: a buffer written from Luau is a real buffer.
-LUAU_BOARD_WRITE = """
+# Luau has no zstd, and a damaged entry's inner layer is zstd-compressed, so
+# the decoding stays in Python. The JSON bytes are uploaded as the task's
+# binary input, which Luau receives and stores as a real buffer.
+LUAU_BUFFER_WRITE = """
 local DataStoreService = game:GetService("DataStoreService")
 local HttpService = game:GetService("HttpService")
-local store = DataStoreService:GetDataStore("Leaderboards")
+local store = DataStoreService:GetDataStore(%s)
 
 local key = %s
-local payload = %s
+local arguments = ({ ... })[1]
+local payload = arguments and arguments.BinaryInput
+if typeof(payload) ~= "buffer" then
+    return { status = "missing_binary_input", stored = typeof(payload) }
+end
 
 -- Ground truth for what is actually stored. Open Cloud reports a real buffer
 -- and a plain table holding {t = "buffer", zbase64 = ...} identically, so
@@ -650,7 +704,7 @@ local payload = %s
 local before = typeof(store:GetAsync(key))
 
 -- Exactly how the game saves these: JSON text wrapped in a buffer.
-store:SetAsync(key, buffer.fromstring(payload))
+store:SetAsync(key, payload)
 
 -- Then read it back the way the game reads it, so the reply proves the round
 -- trip rather than assuming it. This is the line that failed before:
@@ -660,36 +714,20 @@ if typeof(stored) ~= "buffer" then
     return { status = "not_a_buffer", stored = typeof(stored) }
 end
 
-local ok, rows = pcall(function()
+local ok, value = pcall(function()
     return HttpService:JSONDecode(buffer.tostring(stored))
 end)
-if not ok or type(rows) ~= "table" then
+if not ok or type(value) ~= "table" then
     return { status = "unreadable" }
 end
 
-return { status = "ok", was = before, rows = #rows, bytes = #payload }
+return {
+    status = "ok",
+    was = before,
+    items = #value,
+    bytes = buffer.len(payload),
+}
 """
-
-def lua_long_string(text):
-    """Wrap text in a Lua long-bracket literal, which needs no escaping.
-
-    JSON escapes and Lua's do not agree -- \\uXXXX is valid in one and not the
-    other -- so quoting the payload is a trap. Long brackets take the bytes
-    verbatim; the level grows until the closer can't match early.
-
-    The test is against text plus closer, not text alone: JSON ends in "]",
-    which butts against a level-0 "]]" and would close the string one
-    character short.
-    """
-    level = 0
-    while True:
-        pad = "=" * level
-        closer = f"]{pad}]"
-        # A long string swallows one leading newline, so give it one.
-        body = f"\n{text}"
-        if (body + closer).index(closer) == len(body):
-            return f"[{pad}[{body}{closer}"
-        level += 1
 
 def luau_result_status(result):
     return result.get("status") if isinstance(result, dict) else None
@@ -704,14 +742,17 @@ async def read_board_rows(key):
         return "unreadable", None, layers
     return "ok", rows, layers
 
-async def write_board_rows(key, rows):
-    """Write rows back as a single-layer buffer, through Luau."""
-    payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
-    state, result = await run_luau(LUAU_BOARD_WRITE % (
-        json.dumps(str(key)), lua_long_string(payload)
-    ))
+async def write_buffer_value(datastore, key, value):
+    """Write JSON back as a single-layer, real Luau buffer."""
+    payload = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    state, result = await run_luau(LUAU_BUFFER_WRITE % (
+        json.dumps(str(datastore)),
+        json.dumps(str(key)),
+    ), binary_payload=payload)
     if state != "COMPLETE":
-        print(f"write_board_rows({key}) {state}: {result}")
+        print(f"write_buffer_value({datastore}/{key}) {state}: {result}")
         return False, result
 
     status = luau_result_status(result)
@@ -720,9 +761,50 @@ async def write_board_rows(key, rows):
         return False, f"it was stored back as a {stored}, not a buffer"
     if status == "unreadable":
         return False, "the entry wrote but the game's own read of it failed"
+    if status == "missing_binary_input":
+        return False, "the Luau task did not receive its binary input"
     if status != "ok":
         return False, f"the task returned {result!r}"
     return True, result
+
+async def write_board_rows(key, rows):
+    """Write leaderboard rows back as a single-layer buffer, through Luau."""
+    return await write_buffer_value("Leaderboards", key, rows)
+
+async def read_community_map_ids():
+    """Community Maps/Ids, unwrapped however deep."""
+    status, resource = await fetch_entry_resource(
+        "Ids", "Community Maps", fresh=True
+    )
+    if status != "ok":
+        return status, None, 0
+    entries, layers = unwrap_entry_value(resource.get("value"))
+    if not isinstance(entries, list):
+        return "unreadable", None, layers
+    return "ok", entries, layers
+
+async def update_community_map_ids(transform):
+    """Read-modify-write Community Maps/Ids as a real Luau buffer.
+
+    Open Cloud is used only to read and decode the potentially damaged value.
+    The write runs in-engine because sending a buffer envelope back through
+    the datastore API stores a plain table that fails buffer.tostring().
+    """
+    status, entries, _ = await read_community_map_ids()
+    if status != "ok":
+        return status
+
+    new_entries = transform(entries)
+    if new_entries is None:
+        return "skipped"
+
+    written, reason = await write_buffer_value(
+        "Community Maps", "Ids", new_entries
+    )
+    if not written:
+        print(f"update_community_map_ids failed: {reason}")
+        return "error"
+    return "ok"
 
 def same_roblox_id(value, user_id):
     """Compare a stored UserId to a Roblox ID, whichever way it was written."""
@@ -4976,6 +5058,66 @@ async def leaderboard_restore(ctx, board: str, reference: str = None):
         colour=discord.Color.green(),
     ))
 
+@bot.command(name="communitymaps", hidden=True)
+@is_admin()
+async def community_maps_admin(ctx, action: str = None):
+    """!communitymaps restore — rewrite Community Maps/Ids as a buffer."""
+    if not action or action.strip().lower() != "restore":
+        await ctx.send("Use `!communitymaps restore`.")
+        return
+
+    async with ctx.typing():
+        status, entries, _ = await read_community_map_ids()
+        if status != "ok":
+            notes = {
+                "missing": "There's no `Community Maps/Ids` entry to restore.",
+                "unreadable": (
+                    "Couldn't read `Community Maps/Ids` — what's stored doesn't "
+                    "decode to a list of maps. Check it with "
+                    "`tools/inspect_entry.py`."
+                ),
+            }
+            await ctx.send(view=simple_card(
+                notes.get(
+                    status,
+                    f"Couldn't read `Community Maps/Ids` (`{status}`).",
+                ),
+                colour=discord.Color.red(),
+            ))
+            return
+
+        # Open Cloud cannot distinguish a real buffer from a plain table that
+        # contains its envelope. Always rewrite; Luau reports the actual type.
+        written, detail = await write_buffer_value(
+            "Community Maps", "Ids", entries
+        )
+
+    if not written:
+        await ctx.send(view=simple_card(
+            f"Couldn't rewrite `Community Maps/Ids`.\n-# {detail}",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    invalidate_maps_cache()
+    was = detail.get("was") if isinstance(detail, dict) else None
+    note = (
+        "it was already a buffer, and has been rewritten anyway"
+        if was == "buffer"
+        else f"the game was seeing a **{was}** there"
+    )
+    lines = [
+        f"🔧 Rewrote `Community Maps/Ids` as a buffer — "
+        f"{len(entries)} map(s) intact.",
+        f"-# Before the write {note}.",
+    ]
+    universe_note = dev_universe_note()
+    if universe_note:
+        lines.append(universe_note)
+    await ctx.send(view=simple_card(
+        "\n".join(lines), colour=discord.Color.green()
+    ))
+
 @leaderboard_command.command(name="remove")
 @is_admin()
 async def leaderboard_remove(ctx, player: str, board: str, reference: str = None):
@@ -5023,7 +5165,7 @@ async def set_map_featured(ctx, map_id, featured):
         return None
 
     async with ctx.typing():
-        result = await update_entry_with_retry("Ids", "Community Maps", transform)
+        result = await update_community_map_ids(transform)
 
     word = "featured" if featured else "unfeatured"
     if not state["found"]:
@@ -5085,7 +5227,7 @@ async def perform_map_delete(map_id):
                 return entries[:position] + entries[position + 1:]
         return None
 
-    result = await update_entry_with_retry("Ids", "Community Maps", transform)
+    result = await update_community_map_ids(transform)
     if not state["found"]:
         return "missing", None, []
     if result != "ok":

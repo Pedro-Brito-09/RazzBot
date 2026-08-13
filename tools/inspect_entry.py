@@ -157,7 +157,12 @@ def main():
     else:
         print("VERDICT: stored as a PLAIN TABLE, not a buffer")
         print("         if the game expects a buffer here it will fail on")
-        print("         buffer.tostring — repair with !leaderboard restore")
+        command = (
+            "!communitymaps restore"
+            if args.datastore == "Community Maps" and args.key == "Ids"
+            else "!leaderboard restore"
+        )
+        print(f"         buffer.tostring — repair with {command}")
 
     if len(layers) > 1:
         print()
