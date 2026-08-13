@@ -168,9 +168,13 @@ If dependencies changed, re-run the `pip install` line from step 4 before restar
 - **User installs:** In the Discord Developer Portal, open **Installation**, enable both
   **User Install** and **Guild Install**, and add `applications.commands` to the User
   Install scopes. The bot always syncs its user-installable commands globally.
-- **Privileged intent:** `bot.py` sets `intents.message_content = True`. Enable
-  *Message Content Intent* under Bot → Privileged Gateway Intents in the Discord
-  developer portal, or login fails with `PrivilegedIntentsRequired`.
+- **Privileged intents:** `bot.py` sets `intents.message_content = True` and
+  `intents.members = True`. Enable **both** *Message Content Intent* and *Server
+  Members Intent* under Bot → Privileged Gateway Intents in the Discord developer
+  portal, or login fails with `PrivilegedIntentsRequired`. Without the members
+  intent the member cache holds only accounts the bot has happened to see, so
+  `guild.get_member` misses nearly everyone — `/sync all` skips them and
+  `!linked` reports them as not in the server.
 - **Oracle idle reclamation:** free-tier instances can be reclaimed when idle for 7 days.
   A Discord bot's gateway traffic is usually enough to stay above the threshold, but
   keep an eye on it.

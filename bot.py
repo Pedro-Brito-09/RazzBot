@@ -172,6 +172,11 @@ DAILY_CUP_ROLE_ID = os.getenv("DAILY_CUP_ROLE_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
+# Without this the member cache holds only whoever the bot has happened to
+# see, so guild.get_member misses nearly everyone -- /sync all skips them and
+# !linked calls them absent. Privileged: enable Server Members Intent in the
+# developer portal first, or login fails with PrivilegedIntentsRequired.
+intents.members = True
 bot = commands.Bot(
     # Pinging the bot works as a second prefix: "@Razz profile" == "!profile".
     command_prefix=commands.when_mentioned_or("!"),
@@ -2722,7 +2727,7 @@ class LinkedListView(CardView):
     def describe(self, position, link):
         who = link["mention"] or f"`{link['account_id']}`"
         name = link["name"] or "unknown"
-        tail = "" if link["mention"] else "  ·  not in this server"
+        tail = "  ·  not in this server" if link["absent"] else ""
         return (
             f"`{position:>3}.` {who} → **{name}**\n"
             f"-# Discord `{link['account_id']}`  ·  "
@@ -2807,14 +2812,21 @@ async def build_linked_view(guild, parent=None):
         return None
 
     names = await fetch_usernames([roblox_id for _, roblox_id in pairs])
+    # Only claim someone is absent when the member list is actually complete.
+    # Without the members intent the cache holds almost nobody, and every row
+    # would be labelled absent whether or not it is.
+    members_known = bool(guild is not None and guild.chunked)
+
     links = []
     for account_id, roblox_id in pairs:
         member = guild.get_member(account_id) if guild else None
+        user = member or bot.get_user(account_id)
         links.append({
             "account_id": account_id,
             "roblox_id": roblox_id,
             "name": names.get(roblox_id),
-            "mention": member.mention if member else None,
+            "mention": user.mention if user else None,
+            "absent": members_known and member is None,
         })
 
     # Named accounts first, alphabetically; unresolved Roblox IDs last.
