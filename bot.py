@@ -109,6 +109,8 @@ EMPTY_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
 MAX_BADGE_GALLERIES = 3
 # Badges per page of the name-only checklist behind the badge card's toggle.
 BADGES_PER_CHECKLIST_PAGE = 15
+# Accounts per page of !linked.
+LINKED_PER_PAGE = 15
 
 # Roblox game URL for challenge mode on a community map.
 PLAY_URL_TEMPLATE = (
@@ -2704,6 +2706,122 @@ async def build_medals_view(user_id, username, parent=None):
         })
     return MedalListView(medals, username=username, parent=parent)
 
+class LinkedListView(CardView):
+    """Every Discord account linked to a Roblox one, paged."""
+
+    def __init__(self, links, *, parent=None):
+        super().__init__(parent=parent)
+        self.links = links
+        self.page = 0
+        self.render()
+
+    @property
+    def page_count(self):
+        return max(1, -(-len(self.links) // LINKED_PER_PAGE))
+
+    def describe(self, position, link):
+        who = link["mention"] or f"`{link['account_id']}`"
+        name = link["name"] or "unknown"
+        tail = "" if link["mention"] else "  ·  not in this server"
+        return (
+            f"`{position:>3}.` {who} → **{name}**\n"
+            f"-# Discord `{link['account_id']}`  ·  "
+            f"Roblox `{link['roblox_id']}`{tail}"
+        )
+
+    def render(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+
+        heading = (
+            f"## 🔗 Linked accounts\n"
+            f"-# {len(self.links)} link{'s' if len(self.links) != 1 else ''}"
+        )
+        if self.page_count > 1:
+            heading += f" · page {self.page + 1}/{self.page_count}"
+        container.add_item(discord.ui.TextDisplay(heading))
+        container.add_item(discord.ui.Separator())
+
+        start = self.page * LINKED_PER_PAGE
+        page_links = self.links[start:start + LINKED_PER_PAGE]
+        container.add_item(discord.ui.TextDisplay("\n".join(
+            self.describe(start + offset + 1, link)
+            for offset, link in enumerate(page_links)
+        )))
+
+        note = dev_universe_note()
+        if note:
+            container.add_item(discord.ui.TextDisplay(note))
+
+        row = discord.ui.ActionRow()
+        if self.page_count > 1:
+            previous = discord.ui.Button(
+                label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️",
+                disabled=self.page == 0,
+            )
+            previous.callback = self.previous_page
+            row.add_item(previous)
+
+            following = discord.ui.Button(
+                label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
+                disabled=self.page >= self.page_count - 1,
+            )
+            following.callback = self.next_page
+            row.add_item(following)
+
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+        if row.children:
+            container.add_item(row)
+
+        self.add_item(container)
+
+    async def show_page(self, interaction, page):
+        self.page = max(0, min(page, self.page_count - 1))
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    @keeps_context
+    async def previous_page(self, interaction):
+        await self.show_page(interaction, self.page - 1)
+
+    @keeps_context
+    async def next_page(self, interaction):
+        await self.show_page(interaction, self.page + 1)
+
+async def build_linked_view(guild, parent=None):
+    """Resolve the whole link table into a card, or None when it's empty."""
+    linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
+    if not isinstance(linked, dict):
+        return None
+
+    pairs = []
+    for account_id, roblox_id in linked.items():
+        try:
+            pairs.append((int(account_id), int(roblox_id)))
+        except (TypeError, ValueError):
+            # A damaged row shouldn't cost the whole listing.
+            print(f"linked: skipping {account_id!r} -> {roblox_id!r}")
+    if not pairs:
+        return None
+
+    names = await fetch_usernames([roblox_id for _, roblox_id in pairs])
+    links = []
+    for account_id, roblox_id in pairs:
+        member = guild.get_member(account_id) if guild else None
+        links.append({
+            "account_id": account_id,
+            "roblox_id": roblox_id,
+            "name": names.get(roblox_id),
+            "mention": member.mention if member else None,
+        })
+
+    # Named accounts first, alphabetically; unresolved Roblox IDs last.
+    links.sort(key=lambda link: (link["name"] is None,
+                                 (link["name"] or "").lower()))
+    return LinkedListView(links, parent=parent)
+
 async def build_map_search_view(query, matches, parent=None):
     """A pick-list of maps matching a name search."""
     creators = await fetch_usernames([m.get("Creator") for m in matches])
@@ -4158,6 +4276,21 @@ async def admin_ban(ctx, player: str, duration: str = "perm", *, reason: str = "
             view.message = await ctx.send(view.render(), view=view)
         else:
             await ctx.send(view.render())
+
+@bot.command(name="linked", hidden=True)
+@is_admin()
+async def admin_linked(ctx):
+    """Every Discord account linked to a Roblox one."""
+    async with ctx.typing():
+        view = await build_linked_view(ctx.guild)
+    if view is None:
+        await ctx.send(view=simple_card(
+            "No linked accounts — or the link table couldn't be read. "
+            "Check the logs.",
+            colour=discord.Color.greyple(),
+        ))
+        return
+    view.message = await ctx.send(view=view, allowed_mentions=SILENT)
 
 @bot.command(name="unban", hidden=True)
 @is_admin()
