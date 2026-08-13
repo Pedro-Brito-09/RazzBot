@@ -2928,6 +2928,27 @@ async def on_ready():
             bot.tree.allowed_contexts = global_contexts
             bot.tree.allowed_installs = global_installs
 
+MENTION_REPLY = (
+    "<:razz_wave:1425152760889868298> Hey!! Type `/help` for a list of all "
+    "the available commands!"
+)
+
+@bot.event
+async def on_message(message):
+    """Greet a bare mention, then hand every message to the commands.
+
+    Defining on_message replaces the default one, which is what dispatches
+    prefix commands -- so process_commands has to be called by hand.
+    """
+    if not message.author.bot and bot.user is not None:
+        # Only a mention on its own. A reply carries one too, and so does any
+        # message that happens to name the bot, and neither is a greeting.
+        if re.fullmatch(rf"<@!?{bot.user.id}>", message.content.strip()):
+            await message.reply(MENTION_REPLY, mention_author=False)
+            return
+
+    await bot.process_commands(message)
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
