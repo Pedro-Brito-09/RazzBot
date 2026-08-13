@@ -141,9 +141,15 @@ VERIFICATION_GAME_URL = os.getenv(
     "VERIFICATION_GAME_URL",
     "https://www.roblox.com/games/start?placeId=120140749641241",
 )
-# Optional: also sync a guild-only test copy so changes appear instantly there.
-# Global commands are always synced because user installs only support them.
+# The home server. Also gets a guild-only copy of every global command, so
+# changes appear there instantly, and it is the only place /achievements and
+# /sync are published. Global commands are always synced too, because user
+# installs only support them.
 GUILD_ID = os.getenv("GUILD_ID")
+try:
+    HOME_GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
+except (TypeError, ValueError):
+    HOME_GUILD = None
 # Channel that receives the previous leaderboard and new map every day at the
 # Daily Cup rollover (09:00 UTC, matching cup_day_today()).
 DAILY_CUP_CHANNEL_ID = os.getenv("DAILY_CUP_CHANNEL_ID")
@@ -2951,6 +2957,9 @@ async def on_ready():
         try:
             guild = discord.Object(id=int(GUILD_ID))
             bot.tree.copy_global_to(guild=guild)
+            # copy_global_to replaces this guild's command list, which would
+            # drop the home-guild-only commands. Put them back before syncing.
+            restrict_to_home_guild()
             guild_synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(guild_synced)} test command(s) to guild {GUILD_ID}")
         except Exception:
@@ -4929,7 +4938,7 @@ def build_role_rules_view(
         text = "No achievement roles are configured yet."
         if admin:
             text += (
-                "\n-# Add: `!roles add @Role <map|badge> <ID>`"
+                "\n-# Add: `!achievements add @Role <map|badge> <ID>`"
             )
         return simple_card(
             text,
@@ -4955,8 +4964,8 @@ def build_role_rules_view(
     ))
     if admin:
         footer = (
-            "-# Remove: `!roles remove <rule ID>`\n"
-            "-# Add: `!roles add @Role <map|badge> <ID>`"
+            "-# Remove: `!achievements remove <rule ID>`\n"
+            "-# Add: `!achievements add @Role <map|badge> <ID>`"
         )
     else:
         footer = "-# Use `/sync` to update your roles."
@@ -4970,9 +4979,11 @@ def build_role_rules_view(
     view.add_item(container)
     return view
 
-@bot.tree.command(name="roles", description="View the server's achievement roles")
+@bot.tree.command(
+    name="achievements", description="View the server's achievement roles"
+)
 @app_commands.describe(player="Show this member's earned and missing achievements")
-async def roles_slash_command(
+async def achievements_slash_command(
     interaction: discord.Interaction, player: discord.Member = None
 ):
     if interaction.guild is None:
@@ -4995,8 +5006,8 @@ async def roles_slash_command(
     )
     await interaction.followup.send(view=view, allowed_mentions=SILENT)
 
-@bot.group(name="roles", hidden=True, invoke_without_command=True)
-async def admin_roles(ctx, player: discord.Member = None):
+@bot.group(name="achievements", hidden=True, invoke_without_command=True)
+async def admin_achievements(ctx, player: discord.Member = None):
     """View achievement roles, optionally filtered to a server member."""
     if ctx.guild is None:
         await ctx.send("This command only works inside a server.")
@@ -5018,10 +5029,10 @@ async def admin_roles(ctx, player: discord.Member = None):
         allowed_mentions=SILENT,
     )
 
-@admin_roles.command(name="add")
+@admin_achievements.command(name="add")
 @is_admin()
-async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
-    """!roles add <@role> <badge|map> <id>"""
+async def admin_achievements_add(ctx, role: discord.Role, condition: str, value: int):
+    """!achievements add <@role> <badge|map> <id>"""
     kind = condition.strip().lower()
     if kind not in ROLE_CONDITIONS:
         await ctx.send(view=simple_card(
@@ -5079,10 +5090,10 @@ async def admin_roles_add(ctx, role: discord.Role, condition: str, value: int):
         heading="✅ Rule added",
     ), allowed_mentions=SILENT)
 
-@admin_roles.command(name="remove")
+@admin_achievements.command(name="remove")
 @is_admin()
-async def admin_roles_remove(ctx, rule_id: str):
-    """!roles remove <rule_id>"""
+async def admin_achievements_remove(ctx, rule_id: str):
+    """!achievements remove <rule_id>"""
     wanted = rule_id.strip().lower()
     state = {"rule": None}
 
@@ -5181,6 +5192,39 @@ def register_dev_variants():
     print(f"Registered {len(added)} dev command(s) on universe {DEV_UNIVERSE_ID}")
 
 register_dev_variants()
+
+# Published to the home server alone. Both need a real member and this
+# server's own role rules, so there is nothing for them to do anywhere else.
+HOME_GUILD_COMMANDS = (achievements_slash_command, sync_command)
+
+def restrict_to_home_guild():
+    """Move the home-guild commands off the global tree onto GUILD_ID.
+
+    Being guild commands also takes them out of user installs, which cannot
+    carry guild context at all. The prefix halves are untouched:
+    !achievements and !sync keep working in any server the bot is in.
+
+    Safe to call more than once -- copy_global_to replaces the guild's
+    command list, so this has to run again after it.
+    """
+    if HOME_GUILD is None:
+        print("GUILD_ID is not set; /achievements and /sync stay global")
+        return
+
+    moved = []
+    for target in HOME_GUILD_COMMANDS:
+        # A hybrid command keeps its app command on the side; a tree command
+        # already is one.
+        app_command = getattr(target, "app_command", target)
+        if app_command is None:
+            continue
+        bot.tree.remove_command(app_command.name)
+        bot.tree.add_command(app_command, guild=HOME_GUILD, override=True)
+        moved.append(app_command.name)
+
+    print(f"Restricted /{', /'.join(moved)} to guild {HOME_GUILD.id}")
+
+restrict_to_home_guild()
 
 _original_close = bot.close
 
