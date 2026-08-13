@@ -626,16 +626,31 @@ async def run_luau(script):
 # is the whole point: a buffer written from Luau is a real buffer.
 LUAU_BOARD_WRITE = """
 local DataStoreService = game:GetService("DataStoreService")
+local HttpService = game:GetService("HttpService")
 local store = DataStoreService:GetDataStore("Leaderboards")
 
 local key = %s
 local payload = %s
 
+-- Exactly how the game saves these: JSON text wrapped in a buffer.
 store:SetAsync(key, buffer.fromstring(payload))
 
--- Read back, so the reply reports what actually landed rather than assuming.
+-- Then read it back the way the game reads it, so the reply proves the round
+-- trip rather than assuming it. This is the line that failed before:
+-- buffer.tostring on a table.
 local stored = store:GetAsync(key)
-return { status = "ok", stored = typeof(stored), bytes = #payload }
+if typeof(stored) ~= "buffer" then
+    return { status = "not_a_buffer", stored = typeof(stored) }
+end
+
+local ok, rows = pcall(function()
+    return HttpService:JSONDecode(buffer.tostring(stored))
+end)
+if not ok or type(rows) ~= "table" then
+    return { status = "unreadable" }
+end
+
+return { status = "ok", rows = #rows, bytes = #payload }
 """
 
 def lua_long_string(text):
@@ -681,11 +696,15 @@ async def write_board_rows(key, rows):
     if state != "COMPLETE":
         print(f"write_board_rows({key}) {state}: {result}")
         return False, result
-    if luau_result_status(result) != "ok":
+
+    status = luau_result_status(result)
+    if status == "not_a_buffer":
+        stored = result.get("stored")
+        return False, f"it was stored back as a {stored}, not a buffer"
+    if status == "unreadable":
+        return False, "the entry wrote but the game's own read of it failed"
+    if status != "ok":
         return False, f"the task returned {result!r}"
-    stored = result.get("stored") if isinstance(result, dict) else None
-    if stored != "buffer":
-        return False, f"the entry came back as a {stored}, not a buffer"
     return True, None
 
 def same_roblox_id(value, user_id):
