@@ -96,6 +96,8 @@ EMPTY_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
 # counts. Three nine-image galleries leave room for the surrounding content
 # and the summary shown when more badges were earned.
 MAX_BADGE_GALLERIES = 3
+# Badges per page of the name-only checklist behind the badge card's toggle.
+BADGES_PER_CHECKLIST_PAGE = 15
 
 # Roblox game URL for challenge mode on a community map.
 PLAY_URL_TEMPLATE = (
@@ -1867,8 +1869,163 @@ async def get_community_maps():
     print(f"community maps indexed: {len(by_id)} entries (universe {universe})")
     return by_id
 
+def badge_display_name(badge):
+    return badge.get("displayName") or badge.get("name") or "Unnamed"
+
 class BadgesCardView(CardView):
-    pass
+    """A player's badges, as icon galleries or as a name-only checklist.
+
+    The galleries only fit the first few dozen earned badges, so the
+    checklist is also the way to see the rest -- and the only place the
+    missing ones are listed at all.
+    """
+
+    def __init__(self, badges, owned_ids, icons, *, username, parent=None):
+        super().__init__(parent=parent)
+        self.badges = badges
+        self.owned_ids = owned_ids
+        self.icons = icons
+        self.username = username
+        self.checklist = False
+        self.page = 0
+        self.render()
+
+    @property
+    def owned(self):
+        return [badge for badge in self.badges if badge["id"] in self.owned_ids]
+
+    @property
+    def page_count(self):
+        return max(1, -(-len(self.badges) // BADGES_PER_CHECKLIST_PAGE))
+
+    def render(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+
+        heading = (
+            f"## 🎖️ Badges — {self.username}\n"
+            f"-# {len(self.owned)} of {len(self.badges)} earned"
+        )
+        if self.checklist and self.page_count > 1:
+            heading += f" · page {self.page + 1}/{self.page_count}"
+        container.add_item(discord.ui.TextDisplay(heading))
+
+        if self.checklist:
+            self.render_checklist(container)
+        else:
+            self.render_galleries(container)
+
+        note = dev_universe_note()
+        if note:
+            container.add_item(discord.ui.TextDisplay(note))
+
+        self.attach_controls(container)
+        self.add_item(container)
+
+    def render_checklist(self, container):
+        """Names only, earned and missing, paged so it can't overflow."""
+        container.add_item(discord.ui.Separator())
+        start = self.page * BADGES_PER_CHECKLIST_PAGE
+        container.add_item(discord.ui.TextDisplay("\n".join(
+            f"✅ **{badge_display_name(badge)}**"
+            if badge["id"] in self.owned_ids
+            else f"⬜ {badge_display_name(badge)}"
+            for badge in self.badges[start:start + BADGES_PER_CHECKLIST_PAGE]
+        )))
+
+    def render_galleries(self, container):
+        owned = self.owned
+        if not owned:
+            container.add_item(discord.ui.TextDisplay("-# No badges earned yet."))
+            return
+
+        container.add_item(discord.ui.Separator())
+        shown = owned[:MAX_BADGE_GALLERIES * BADGES_PER_LARGE_GALLERY]
+        galleries = 0
+        start = 0
+        while start < len(shown):
+            remaining = len(shown) - start
+            gallery_size = (
+                BADGES_PER_SMALL_GALLERY
+                if remaining <= BADGES_PER_SMALL_GALLERY
+                else BADGES_PER_LARGE_GALLERY
+            )
+            batch = shown[start:start + gallery_size]
+            start += len(batch)
+
+            gallery = discord.ui.MediaGallery()
+            for badge in batch:
+                icon = self.icons.get(badge["id"])
+                if icon:
+                    gallery.add_item(media=icon, description=badge_display_name(badge))
+            if gallery.items:
+                # Pad to the selected grid size so partial galleries keep their
+                # proportions even when a badge icon could not be resolved.
+                while len(gallery.items) < gallery_size:
+                    gallery.add_item(media=EMPTY_IMAGE_URL, description="")
+                container.add_item(gallery)
+                galleries += 1
+
+        if len(owned) > len(shown):
+            container.add_item(discord.ui.TextDisplay(
+                f"-# and {len(owned) - len(shown)} more — see the checklist"
+            ))
+
+        # No icon resolved for anything: fall back to naming them.
+        if not galleries:
+            container.add_item(discord.ui.TextDisplay(
+                "\n".join(f"✅ **{badge_display_name(b)}**" for b in owned)
+            ))
+
+    def attach_controls(self, container):
+        row = discord.ui.ActionRow()
+        toggle = discord.ui.Button(
+            label="Gallery" if self.checklist else "Checklist",
+            style=discord.ButtonStyle.secondary,
+            emoji="🖼️" if self.checklist else "📋",
+        )
+        toggle.callback = self.toggle_checklist
+        row.add_item(toggle)
+
+        if self.checklist and self.page_count > 1:
+            previous = discord.ui.Button(
+                label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️",
+                disabled=self.page == 0,
+            )
+            previous.callback = self.previous_page
+            row.add_item(previous)
+
+            following = discord.ui.Button(
+                label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
+                disabled=self.page >= self.page_count - 1,
+            )
+            following.callback = self.next_page
+            row.add_item(following)
+
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+        container.add_item(row)
+
+    @keeps_context
+    async def toggle_checklist(self, interaction):
+        self.checklist = not self.checklist
+        self.page = 0
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    async def show_page(self, interaction, page):
+        self.page = max(0, min(page, self.page_count - 1))
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    @keeps_context
+    async def previous_page(self, interaction):
+        await self.show_page(interaction, self.page - 1)
+
+    @keeps_context
+    async def next_page(self, interaction):
+        await self.show_page(interaction, self.page + 1)
 
 class MapsCardView(CardView):
     pass
@@ -2069,71 +2226,13 @@ async def build_badges_view(user_id, username, parent=None):
 
     owned_ids = await fetch_owned_badge_ids(user_id, [b["id"] for b in badges])
     owned = [b for b in badges if b["id"] in owned_ids]
-
-    view = BadgesCardView(parent=parent)
-    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-    container.add_item(discord.ui.TextDisplay(
-        f"## 🎖️ Badges — {username}\n-# {len(owned)} of {len(badges)} earned"
-    ))
-
-    dev_note = dev_universe_note()
-
-    if not owned:
-        container.add_item(discord.ui.TextDisplay("-# No badges earned yet."))
-        if dev_note:
-            container.add_item(discord.ui.TextDisplay(dev_note))
-        view.add_item(container)
-        return view
-
-    container.add_item(discord.ui.Separator())
-
-    def badge_name(badge):
-        return badge.get("displayName") or badge.get("name") or "Unnamed"
-
+    # Only the badges a gallery can show need an icon; the checklist is names.
     shown = owned[:MAX_BADGE_GALLERIES * BADGES_PER_LARGE_GALLERY]
     icons = await fetch_badge_icons([b["id"] for b in shown])
-    galleries = 0
-    start = 0
-    while start < len(shown):
-        remaining = len(shown) - start
-        gallery_size = (
-            BADGES_PER_SMALL_GALLERY
-            if remaining <= BADGES_PER_SMALL_GALLERY
-            else BADGES_PER_LARGE_GALLERY
-        )
-        batch = shown[start:start + gallery_size]
-        start += len(batch)
 
-        gallery = discord.ui.MediaGallery()
-        for badge in batch:
-            icon = icons.get(badge["id"])
-            if icon:
-                gallery.add_item(media=icon, description=badge_name(badge))
-        if gallery.items:
-            # Pad to the selected grid size so partial galleries keep their
-            # proportions even when a badge icon could not be resolved.
-            while len(gallery.items) < gallery_size:
-                gallery.add_item(media=EMPTY_IMAGE_URL, description="")
-            container.add_item(gallery)
-            galleries += 1
-
-    if len(owned) > len(shown):
-        container.add_item(discord.ui.TextDisplay(
-            f"-# and {len(owned) - len(shown)} more"
-        ))
-
-    # No icon resolved for anything: fall back to naming them.
-    if not galleries:
-        container.add_item(discord.ui.TextDisplay(
-            "\n".join(f"✅ **{badge_name(b)}**" for b in owned)
-        ))
-
-    if dev_note:
-        container.add_item(discord.ui.TextDisplay(dev_note))
-
-    view.attach_back_button(container)
-    view.add_item(container)
-    return view
+    return BadgesCardView(
+        badges, owned_ids, icons, username=username, parent=parent
+    )
 
 def search_public_maps(maps_by_id, query, limit=50):
     """Public maps whose name matches, best match first.
