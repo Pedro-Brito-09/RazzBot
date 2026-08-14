@@ -17,7 +17,7 @@ import secrets
 import string
 import time
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from datetime import datetime, time as datetime_time, timedelta, timezone
 
 # aiohttp's default UA ("Python/3.x aiohttp/3.x") appears to get blackholed by
@@ -116,6 +116,18 @@ MAX_BADGE_GALLERIES = 3
 BADGES_PER_CHECKLIST_PAGE = 15
 # Accounts per page of !linked.
 LINKED_PER_PAGE = 15
+
+# Rows per page of a !datastore or !o_datastore listing.
+DATASTORE_PER_PAGE = 15
+# Keys asked for per request, and the ceiling on how many !datastore list
+# walks: Main_Data holds one key per player, and the listing is read by eye.
+DATASTORE_PAGE_SIZE = 100
+DATASTORE_LIST_LIMIT = 1000
+# Ordered stores cap maxPageSize at 100, and one page is plenty to eyeball.
+ORDERED_LIST_LIMIT = 100
+# A Components V2 message caps at 4000 characters across its text displays.
+# A value longer than this is sent as a file rather than a code block.
+DATASTORE_VALUE_BUDGET = 3000
 
 # Roblox game URL for challenge mode on a community map.
 PLAY_URL_TEMPLATE = (
@@ -1108,6 +1120,158 @@ async def delete_entry_resource(entry_key, datastore, *, universe_id=None,
         print(f"delete_entry_resource({datastore}/{entry_key}) failed: "
               f"{type(error).__name__}: {error}")
         return False
+
+async def fetch_cloud_page(url, label):
+    """One page of a v2 list endpoint, as (status, payload).
+
+    Status separates the failures the admin can act on -- a key missing a
+    scope, a store that isn't there -- from anything else, which is "error".
+    """
+    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
+    session = await get_session()
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                return "ok", await resp.json(content_type=None)
+            body = (await resp.text())[:200]
+            print(f"{label} -> HTTP {resp.status}: {body}")
+            if resp.status in (401, 403):
+                return "forbidden", None
+            if resp.status == 404:
+                return "missing", None
+            if resp.status == 400:
+                return "rejected", None
+            return "error", None
+    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+        print(f"{label} failed: {type(error).__name__}: {error}")
+        return "error", None
+
+def cloud_resource_id(resource):
+    """The id of a listed v2 resource, or the tail of its path."""
+    if not isinstance(resource, dict):
+        return None
+    identifier = resource.get("id")
+    if isinstance(identifier, str) and identifier:
+        return identifier
+    path = resource.get("path")
+    if isinstance(path, str) and "/" in path:
+        return unquote(path.rsplit("/", 1)[-1])
+    return None
+
+async def walk_cloud_list(url, field, *, label, query=None,
+                          limit=DATASTORE_LIST_LIMIT):
+    """Page a v2 list endpoint. Returns (status, ids, more still waiting).
+
+    Stops at the limit rather than walking a store with a key per player to
+    the end -- what comes back is only ever read by eye.
+    """
+    ids = []
+    page_token = None
+    while True:
+        parts = [f"maxPageSize={DATASTORE_PAGE_SIZE}"]
+        if query:
+            parts.append(query)
+        if page_token:
+            parts.append(f"pageToken={quote(page_token, safe='')}")
+
+        status, payload = await fetch_cloud_page(f"{url}?{'&'.join(parts)}", label)
+        if status != "ok":
+            return status, ids, False
+
+        # An empty store omits the field rather than sending an empty list.
+        items = (payload or {}).get(field)
+        items = items if isinstance(items, list) else []
+        for resource in items:
+            identifier = cloud_resource_id(resource)
+            if identifier is not None:
+                ids.append(identifier)
+
+        page_token = (payload or {}).get("nextPageToken")
+        if not page_token or not items:
+            return "ok", ids, False
+        if len(ids) >= limit:
+            return "ok", ids[:limit], True
+
+async def list_data_stores():
+    """Every data store in the universe, as (status, names, truncated)."""
+    return await walk_cloud_list(
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}"
+        f"/data-stores",
+        "dataStores",
+        label="list_data_stores",
+    )
+
+async def list_data_store_keys(datastore, prefix=None):
+    """Keys in one data store, as (status, keys, truncated).
+
+    A prefix is pushed to Roblox, which is the only way to narrow a store
+    holding more keys than the walk limit. If it refuses the expression the
+    walk runs unfiltered and the prefix is applied here instead.
+    """
+    url = (
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}"
+        f"/data-stores/{quote(datastore, safe='')}/entries"
+    )
+    label = f"list_data_store_keys({datastore})"
+
+    if not prefix:
+        return await walk_cloud_list(url, "dataStoreEntries", label=label)
+
+    expression = 'id.startsWith("' + prefix + '")'
+    status, keys, truncated = await walk_cloud_list(
+        url, "dataStoreEntries", label=label,
+        query="filter=" + quote(expression, safe=""),
+    )
+    if status != "rejected":
+        return status, keys, truncated
+
+    print(f"{label}: filter refused, narrowing locally instead")
+    status, keys, truncated = await walk_cloud_list(
+        url, "dataStoreEntries", label=label
+    )
+    return status, [key for key in keys if key.startswith(prefix)], truncated
+
+async def list_ordered_entries(datastore, scope, *, limit=ORDERED_LIST_LIMIT):
+    """One page of an ordered store's scope, highest value first.
+
+    Returns (status, [(id, value)], more still waiting).
+    """
+    url = (
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}/"
+        f"ordered-data-stores/{quote(datastore, safe='')}/"
+        f"scopes/{quote(scope, safe='')}/entries"
+        f"?maxPageSize={limit}&orderBy={quote('value desc', safe='')}"
+    )
+    status, payload = await fetch_cloud_page(
+        url, f"list_ordered_entries({datastore}/{scope})"
+    )
+    if status != "ok":
+        return status, [], False
+
+    entries = (payload or {}).get("orderedDataStoreEntries")
+    entries = entries if isinstance(entries, list) else []
+    rows = []
+    for entry in entries:
+        identifier = cloud_resource_id(entry)
+        if identifier is None:
+            continue
+        # int64 arrives as a string often enough to coerce every time.
+        value = entry.get("value") if isinstance(entry, dict) else None
+        if isinstance(value, str):
+            try:
+                value = int(value)
+            except ValueError:
+                pass
+        rows.append((identifier, value))
+
+    return "ok", rows, bool((payload or {}).get("nextPageToken"))
+
+async def fetch_ordered_entry_resource(entry_key, datastore, scope):
+    """The whole ordered entry, rather than fetch_ordered_entry's number."""
+    return await fetch_cloud_page(
+        ordered_entry_url(entry_key, datastore, scope),
+        f"fetch_ordered_entry_resource({datastore}/{scope}/{entry_key})",
+    )
 
 def invalidate_maps_cache():
     _maps_cache.pop(current_universe(), None)
@@ -5645,6 +5809,456 @@ async def admin_debug_linked(ctx):
             io.BytesIO(payload), filename="account-linking-linked-debug.json"
         ),
     )
+
+class DataStoreListView(CardView):
+    """Any long list of datastore lines, paged."""
+
+    def __init__(self, heading, lines, *, subtitle=None, footer=None,
+                 colour=PROFILE_COLOR, parent=None):
+        super().__init__(parent=parent)
+        self.heading = heading
+        self.lines = lines
+        self.subtitle = subtitle
+        self.footer = footer
+        self.colour = colour
+        self.page = 0
+        self.render()
+
+    @property
+    def page_count(self):
+        return max(1, -(-len(self.lines) // DATASTORE_PER_PAGE))
+
+    def render(self):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=self.colour)
+
+        heading = f"## {self.heading}"
+        if self.subtitle:
+            heading += f"\n-# {self.subtitle}"
+        if self.page_count > 1:
+            heading += f" · page {self.page + 1}/{self.page_count}"
+        container.add_item(discord.ui.TextDisplay(heading))
+        container.add_item(discord.ui.Separator())
+
+        start = self.page * DATASTORE_PER_PAGE
+        container.add_item(discord.ui.TextDisplay(
+            "\n".join(self.lines[start:start + DATASTORE_PER_PAGE])
+        ))
+
+        if self.footer:
+            container.add_item(discord.ui.TextDisplay(f"-# {self.footer}"))
+        note = dev_universe_note()
+        if note:
+            container.add_item(discord.ui.TextDisplay(note))
+
+        row = discord.ui.ActionRow()
+        if self.page_count > 1:
+            previous = discord.ui.Button(
+                label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️",
+                disabled=self.page == 0,
+            )
+            previous.callback = self.previous_page
+            row.add_item(previous)
+
+            following = discord.ui.Button(
+                label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
+                disabled=self.page >= self.page_count - 1,
+            )
+            following.callback = self.next_page
+            row.add_item(following)
+
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+        if row.children:
+            container.add_item(row)
+
+        self.add_item(container)
+
+    async def show_page(self, interaction, page):
+        self.page = max(0, min(page, self.page_count - 1))
+        self.render()
+        await interaction.response.edit_message(view=self)
+
+    @keeps_context
+    async def previous_page(self, interaction):
+        await self.show_page(interaction, self.page - 1)
+
+    @keeps_context
+    async def next_page(self, interaction):
+        await self.show_page(interaction, self.page + 1)
+
+DATASTORE_USAGE = (
+    "**`!datastore list`** — every data store in the universe\n"
+    "**`!datastore list <store> [prefix]`** — the keys in one store\n"
+    "**`!datastore get <store> <key> [--raw]`** — one entry, buffers decoded\n"
+    "\n"
+    "-# A store whose name has spaces needs quoting: "
+    "`!datastore list \"Daily Cup Submissions\"`.\n"
+    "-# `--raw` shows the stored envelope and its ETag instead of the "
+    "decoded value.\n"
+    "-# Ordered stores are a separate API — see `!o_datastore`.\n"
+    "-# `!dev_datastore` does the same against the test universe."
+)
+
+ORDERED_DATASTORE_USAGE = (
+    "**`!o_datastore list`** — the ordered stores this bot reads\n"
+    "**`!o_datastore list <store> <scope>`** — top entries of one scope\n"
+    "**`!o_datastore get <store> <scope> <key>`** — one entry\n"
+    "\n"
+    "-# Ordered stores are always scoped: `!o_datastore list Data Wins`.\n"
+    "-# Open Cloud has no endpoint that enumerates ordered stores or their "
+    "scopes, so the bare `list` reports what this bot is configured to use.\n"
+    "-# `!dev_o_datastore` does the same against the test universe."
+)
+
+def datastore_failure_text(status, *, store=None, key=None, listing=True):
+    """Why a read failed, in terms of what the admin can do about it."""
+    if status == "forbidden":
+        scope = (
+            "`universe-datastores.control:list` and "
+            "`universe-datastores.objects:list`" if listing
+            else "`universe-datastores.objects:read`"
+        )
+        return (
+            f"The API key isn't allowed to do that — it needs {scope} on this "
+            f"universe."
+        )
+    if status == "missing":
+        if key is not None:
+            return f"No entry `{key}` in `{store}`."
+        if store is not None:
+            return (
+                f"No data store named `{store}` — or it holds nothing. Run "
+                f"`!datastore list` for the names."
+            )
+        return "Nothing came back."
+    if status == "rejected":
+        return "Roblox rejected that request. Check the logs for the reason."
+    return f"Couldn't read that (`{status}`). Check the logs."
+
+def datastore_value_text(value):
+    """A decoded value as text, with the code-block language to show it in."""
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        try:
+            return raw.decode("utf-8"), ""
+        except UnicodeDecodeError:
+            return f"{len(raw)} bytes, not UTF-8:\n{raw[:512].hex(' ')}", ""
+    return json.dumps(
+        value, indent=2, ensure_ascii=False, default=datastore_debug_json_default
+    ), "json"
+
+def describe_entry_storage(layers, raw_value):
+    """How the entry is stored, in the terms tools/inspect_entry.py uses."""
+    if not layers:
+        return (
+            "📄 stored as a **plain table**, not a buffer — which only matters "
+            "where the game reads it back with `buffer.tostring`"
+        )
+    if layers > 1:
+        return (
+            f"⚠️ **{layers} buffer layers**, one inside the next — the game "
+            f"unwraps one and finds an envelope where the rows should be"
+        )
+    return f"🧊 stored as a **Luau buffer** (`{buffer_encoding_field(raw_value)}`)"
+
+def entry_revision_note(resource):
+    """A one-line revision/ETag footer, or None when Roblox sent neither."""
+    if not isinstance(resource, dict):
+        return None
+    bits = []
+    revision = resource.get("revisionId")
+    if revision:
+        bits.append(f"revision `{revision}`")
+
+    stamp = resource.get("revisionCreateTime") or resource.get("createTime")
+    if isinstance(stamp, str):
+        try:
+            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            bits.append(f"written <t:{int(moment.timestamp())}:R>")
+        except ValueError:
+            pass
+
+    etag = resource.get("etag")
+    if etag:
+        bits.append(f"etag `{str(etag)[:32]}`")
+    return " · ".join(bits) if bits else None
+
+def datastore_filename(*parts):
+    """A filename Discord accepts, built from store and key names."""
+    cleaned = [
+        re.sub(r"[^A-Za-z0-9._-]+", "-", str(part)).strip("-") or "entry"
+        for part in parts
+    ]
+    return ("-".join(cleaned))[:80] + ".json"
+
+async def send_datastore_value(ctx, title, text, language, notes, *, name_parts):
+    """The value in a card, or attached whole once it outgrows one."""
+    lines = [title, *[note for note in notes if note]]
+
+    if len(text) <= DATASTORE_VALUE_BUDGET:
+        # A value holding a fence of its own would end the block early.
+        fenced = text.replace("```", "``​`")
+        # simple_card adds the dev-universe note itself.
+        await ctx.send(view=simple_card(
+            "\n".join(lines) + f"\n```{language}\n{fenced}\n```"
+        ))
+        return
+
+    lines.append(f"-# {len(text)} characters — attached rather than inlined.")
+    note = dev_universe_note()
+    if note:
+        lines.append(note)
+    await ctx.send(
+        "\n".join(lines),
+        file=discord.File(io.BytesIO(text.encode("utf-8")),
+                          filename=datastore_filename(*name_parts)),
+    )
+
+async def datastore_list_reply(ctx, arguments):
+    """!datastore list [store] [prefix]"""
+    store = arguments[0] if arguments else None
+    prefix = " ".join(arguments[1:]) or None
+
+    async with ctx.typing():
+        if store is None:
+            status, names, truncated = await list_data_stores()
+        else:
+            status, names, truncated = await list_data_store_keys(store, prefix)
+
+    if status != "ok":
+        await ctx.send(view=simple_card(
+            datastore_failure_text(status, store=store),
+            colour=discord.Color.red(),
+        ))
+        return
+
+    if not names:
+        if store is None:
+            empty = "This universe has no data stores the key can see."
+        elif prefix:
+            empty = f"No keys in `{store}` starting with `{prefix}`."
+        else:
+            empty = f"`{store}` holds no keys."
+        await ctx.send(view=simple_card(empty, colour=discord.Color.greyple()))
+        return
+
+    lines = [
+        f"`{position:>3}.` `{name}`"
+        for position, name in enumerate(names, 1)
+    ]
+    counted = f"{len(names)} {'key' if store is not None else 'store'}"
+    if len(names) != 1:
+        counted += "s"
+
+    if store is None:
+        heading = "🗄️ Data stores"
+        subtitle = counted
+        footer = (
+            "Ordered stores (Wins, Medals, Creator Points) aren't listed here "
+            "— they're a separate API. Use `!o_datastore`."
+        )
+    else:
+        heading = f"🔑 `{store}`"
+        subtitle = counted + (f" starting with `{prefix}`" if prefix else "")
+        footer = "Read one with `!datastore get`."
+
+    if truncated:
+        footer = (
+            f"Stopped at {DATASTORE_LIST_LIMIT} — there are more. "
+            f"Narrow it with a prefix: `!datastore list <store> <prefix>`."
+        )
+
+    view = DataStoreListView(heading, lines, subtitle=subtitle, footer=footer)
+    view.message = await ctx.send(view=view)
+
+async def datastore_get_reply(ctx, arguments, *, raw):
+    """!datastore get <store> <key> [--raw]"""
+    if len(arguments) < 2:
+        await ctx.send(view=simple_card(
+            "Give a store and a key: `!datastore get <store> <key>`.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    store = arguments[0]
+    # Everything after the store is the key, so an unquoted key with spaces
+    # still resolves.
+    key = " ".join(arguments[1:])
+
+    async with ctx.typing():
+        status, resource = await fetch_entry_resource(key, store, fresh=True)
+
+    if status != "ok":
+        await ctx.send(view=simple_card(
+            datastore_failure_text(status, store=store, key=key, listing=False),
+            colour=discord.Color.red(),
+        ))
+        return
+
+    stored = resource.get("value") if isinstance(resource, dict) else None
+    decoded, layers = unwrap_entry_value(stored)
+    title = f"🗄️ `{store}` / `{key}`"
+
+    if raw:
+        text, language = json.dumps(
+            resource, indent=2, ensure_ascii=False,
+            default=datastore_debug_json_default,
+        ), "json"
+    else:
+        text, language = datastore_value_text(decoded)
+
+    notes = [describe_entry_storage(layers, stored)]
+    revision = entry_revision_note(resource)
+    if revision:
+        notes.append(f"-# {revision}")
+    if isinstance(decoded, list):
+        notes.append(f"-# {len(decoded)} row(s)")
+    if raw:
+        notes.append("-# `--raw`: the stored envelope, not the decoded value.")
+
+    await send_datastore_value(
+        ctx, title, text, language, notes, name_parts=(store, key)
+    )
+
+@bot.command(name="datastore", hidden=True)
+@is_admin()
+async def admin_datastore(ctx, action: str = None, *arguments: str):
+    """!datastore list [store] [prefix] · !datastore get <store> <key>"""
+    verb = (action or "").strip().lower()
+    rest = [argument for argument in arguments if argument != "--raw"]
+    raw = len(rest) != len(arguments)
+
+    if verb == "list":
+        await datastore_list_reply(ctx, rest)
+    elif verb == "get":
+        await datastore_get_reply(ctx, rest, raw=raw)
+    else:
+        await ctx.send(view=simple_card(DATASTORE_USAGE, heading="🗄️ Data stores"))
+
+async def ordered_datastore_list_reply(ctx, arguments):
+    """!o_datastore list [store] [scope]"""
+    if not arguments:
+        # Nothing enumerates ordered stores, so report what the bot reads.
+        lines = [
+            f"`{position:>3}.` `Data` / `{scope}`  ·  {title}"
+            for position, (scope, title, _)
+            in enumerate(GLOBAL_LEADERBOARDS.values(), 1)
+        ]
+        await ctx.send(view=simple_card(
+            "\n".join(lines)
+            + "\n\n-# Open Cloud can't enumerate ordered stores or scopes, so "
+              "this is what the bot is configured to read — there may be "
+              "others.\n-# List one with `!o_datastore list Data Wins`.",
+            heading="📊 Ordered stores",
+        ))
+        return
+
+    store = arguments[0]
+    scope = " ".join(arguments[1:])
+    if not scope:
+        await ctx.send(view=simple_card(
+            "Ordered stores are always scoped: "
+            "`!o_datastore list <store> <scope>`.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    async with ctx.typing():
+        status, rows, more = await list_ordered_entries(store, scope)
+
+    if status != "ok":
+        await ctx.send(view=simple_card(
+            datastore_failure_text(status, store=f"{store}/{scope}"),
+            colour=discord.Color.red(),
+        ))
+        return
+
+    if not rows:
+        await ctx.send(view=simple_card(
+            f"No entries in `{store}` / `{scope}`.",
+            colour=discord.Color.greyple(),
+        ))
+        return
+
+    lines = [
+        f"`{position:>3}.` `{identifier}` — **{value}**"
+        for position, (identifier, value) in enumerate(rows, 1)
+    ]
+    footer = "Read one with `!o_datastore get`."
+    if more:
+        footer = (
+            f"Top {len(rows)} by value — there are more below them. "
+            f"Read one with `!o_datastore get`."
+        )
+
+    view = DataStoreListView(
+        f"📊 `{store}` / `{scope}`",
+        lines,
+        subtitle=f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'}, "
+                 f"highest value first",
+        footer=footer,
+        colour=LEADERBOARD_COLOR,
+    )
+    view.message = await ctx.send(view=view)
+
+async def ordered_datastore_get_reply(ctx, arguments):
+    """!o_datastore get <store> <scope> <key>"""
+    if len(arguments) < 3:
+        await ctx.send(view=simple_card(
+            "Give a store, a scope and a key: "
+            "`!o_datastore get <store> <scope> <key>`.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    store = arguments[0]
+    # An ordered key is a user ID, never spaced -- so the last word is the
+    # key and everything between is the scope, quoted or not.
+    key = arguments[-1]
+    scope = " ".join(arguments[1:-1])
+
+    async with ctx.typing():
+        status, resource = await fetch_ordered_entry_resource(key, store, scope)
+
+    if status != "ok":
+        await ctx.send(view=simple_card(
+            datastore_failure_text(
+                status, store=f"{store}/{scope}", key=key, listing=False
+            ),
+            colour=discord.Color.red(),
+        ))
+        return
+
+    text = json.dumps(resource, indent=2, ensure_ascii=False,
+                      default=datastore_debug_json_default)
+    value = resource.get("value") if isinstance(resource, dict) else None
+
+    await send_datastore_value(
+        ctx,
+        f"📊 `{store}` / `{scope}` / `{key}`",
+        text,
+        "json",
+        [f"📊 value: **{value}**"],
+        name_parts=(store, scope, key),
+    )
+
+@bot.command(name="o_datastore", hidden=True)
+@is_admin()
+async def admin_ordered_datastore(ctx, action: str = None, *arguments: str):
+    """!o_datastore list [store] [scope] · !o_datastore get <store> <scope> <key>"""
+    verb = (action or "").strip().lower()
+    rest = list(arguments)
+
+    if verb == "list":
+        await ordered_datastore_list_reply(ctx, rest)
+    elif verb == "get":
+        await ordered_datastore_get_reply(ctx, rest)
+    else:
+        await ctx.send(view=simple_card(
+            ORDERED_DATASTORE_USAGE, heading="📊 Ordered stores"
+        ))
 
 def simple_card(text, *, colour=PROFILE_COLOR, heading=None):
     """A one-block Components V2 card, for short replies."""
