@@ -117,6 +117,16 @@ BADGES_PER_CHECKLIST_PAGE = 15
 # Accounts per page of !linked.
 LINKED_PER_PAGE = 15
 
+# Map reviewers: the role !submissions answers to, and the one pinged once
+# the accepted rotation is close to repeating itself.
+SUBMISSIONS_ROLE_ID = 1500969484738105457
+SUBMISSIONS_CHANNEL_ID = os.getenv("SUBMISSIONS_CHANNEL_ID") or "1538973284731850962"
+# Accepted maps still ahead of today's before the rotation wraps and starts
+# replaying. At or below this the reviewers get pinged at the 09:00 rollover.
+SUBMISSIONS_LOW_WATER = 5
+# Submissions per page of !submissions.
+SUBMISSIONS_PER_PAGE = 10
+
 # Rows per page of a !datastore or !o_datastore listing.
 DATASTORE_PER_PAGE = 15
 # Keys asked for per request, and the ceiling on how many !datastore list
@@ -3687,12 +3697,145 @@ async def publish_daily_cup_announcement(destination=None, *, crosspost=True):
     # truthy, which is all the scheduled task and !testcup check.
     return destination
 
+async def fetch_submissions():
+    """Every map submission, as stored. Damaged rows are dropped."""
+    submissions = await fetch_entry("Submissions")
+    if not isinstance(submissions, list):
+        return None
+    return [
+        submission for submission in submissions
+        if isinstance(submission, dict)
+    ]
+
+def submission_order(submission):
+    """Submission timestamp as something sortable, whatever was stored."""
+    stamp = submission.get("Timestamp", 0)
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return 0
+    return stamp
+
+def submissions_by_status(submissions):
+    """Status as stored -> its submissions, oldest first."""
+    buckets = {}
+    for submission in sorted(submissions, key=submission_order):
+        status = submission.get("Status")
+        label = str(status) if status is not None else "No status"
+        buckets.setdefault(label, []).append(submission)
+    return buckets
+
+def accepted_rotation_runway(submissions, current_id):
+    """Accepted maps left before the rotation wraps back to the start.
+
+    cup_map_rotation walks the accepted maps in timestamp order and takes
+    the index modulo their count, so reaching the end replays the lot rather
+    than running dry. Returns (remaining, total), remaining being None when
+    today's map isn't among them and the position can't be placed.
+    """
+    accepted = [
+        submission for submission in submissions
+        if submission.get("Status") == "Accepted"
+        and submission.get("Id") is not None
+    ]
+    accepted.sort(key=submission_order)
+    map_ids = [submission["Id"] for submission in accepted]
+
+    if not map_ids:
+        return 0, 0
+    if current_id not in map_ids:
+        return None, len(map_ids)
+    return len(map_ids) - 1 - map_ids.index(current_id), len(map_ids)
+
+async def resolve_current_map_id():
+    """Today's cup map, allowing for a TodaysMap that hasn't caught up."""
+    _, current_id = await resolve_current_cup(await fetch_entry("TodaysMap") or {})
+    return current_id
+
+async def current_rotation_runway():
+    """The runway against today's live cup, as (remaining, total)."""
+    current_id = await resolve_current_map_id()
+    submissions = await fetch_submissions()
+    if submissions is None:
+        return None, None
+    return accepted_rotation_runway(submissions, current_id)
+
+def submissions_role_mention(destination):
+    """The reviewer role, by mention even when it isn't cached."""
+    guild = getattr(destination, "guild", None)
+    role = guild.get_role(SUBMISSIONS_ROLE_ID) if guild is not None else None
+    return role.mention if role is not None else f"<@&{SUBMISSIONS_ROLE_ID}>"
+
+async def announce_low_submissions():
+    """Ping the reviewers when the accepted rotation is nearly exhausted.
+
+    Runs at the rollover, so it repeats daily for as long as the pool stays
+    low -- which is the point, and self-limiting at one message a day.
+    """
+    try:
+        channel_id = int(SUBMISSIONS_CHANNEL_ID)
+    except (TypeError, ValueError):
+        print("Low submissions check skipped: invalid SUBMISSIONS_CHANNEL_ID")
+        return False
+
+    remaining, total = await current_rotation_runway()
+    if remaining is None:
+        print(
+            "Low submissions check skipped: today's map isn't in the accepted "
+            "rotation, so there's no position to count from"
+            if total is not None else
+            "Low submissions check skipped: Submissions couldn't be read"
+        )
+        return False
+    if remaining > SUBMISSIONS_LOW_WATER:
+        return False
+
+    destination = bot.get_channel(channel_id)
+    if destination is None:
+        destination = await bot.fetch_channel(channel_id)
+
+    if remaining == 0:
+        headline = (
+            "⚠️ **Today's map is the last accepted one.** Tomorrow the Daily "
+            "Cup wraps around and starts replaying maps."
+        )
+    else:
+        wraps = cup_day_today() + timedelta(days=remaining + 1)
+        headline = (
+            f"⚠️ **{remaining} accepted map{'s' if remaining != 1 else ''} "
+            f"left** after today. The rotation starts repeating on "
+            f"{wraps:%d/%m/%Y} unless more get accepted."
+        )
+
+    await destination.send(
+        content=(
+            f"{submissions_role_mention(destination)}\n"
+            f"{headline}\n"
+            f"-# {total} accepted in total · check the queue with "
+            f"`!submissions pending`"
+        ),
+        allowed_mentions=discord.AllowedMentions(
+            everyone=False, users=False, roles=True, replied_user=False
+        ),
+    )
+    print(
+        f"Pinged the reviewers in {channel_id}: {remaining} accepted map(s) "
+        f"left of {total}"
+    )
+    return True
+
 @tasks.loop(time=datetime_time(hour=9, minute=0, tzinfo=timezone.utc))
 async def daily_cup_announcement():
     try:
         await publish_daily_cup_announcement()
     except Exception:
         print("Daily Cup announcement failed:")
+        traceback.print_exc()
+
+    # Independent of the announcement: the queue still needs watching on a
+    # day the cup card couldn't be built.
+    try:
+        await announce_low_submissions()
+    except Exception:
+        print("Low submissions check failed:")
         traceback.print_exc()
 
 @daily_cup_announcement.before_loop
@@ -5810,23 +5953,25 @@ async def admin_debug_linked(ctx):
         ),
     )
 
-class DataStoreListView(CardView):
-    """Any long list of datastore lines, paged."""
+class PagedListView(CardView):
+    """Any long list of preformatted lines, paged."""
 
     def __init__(self, heading, lines, *, subtitle=None, footer=None,
-                 colour=PROFILE_COLOR, parent=None):
+                 colour=PROFILE_COLOR, per_page=DATASTORE_PER_PAGE,
+                 parent=None):
         super().__init__(parent=parent)
         self.heading = heading
         self.lines = lines
         self.subtitle = subtitle
         self.footer = footer
         self.colour = colour
+        self.per_page = per_page
         self.page = 0
         self.render()
 
     @property
     def page_count(self):
-        return max(1, -(-len(self.lines) // DATASTORE_PER_PAGE))
+        return max(1, -(-len(self.lines) // self.per_page))
 
     def render(self):
         self.clear_items()
@@ -5840,9 +5985,9 @@ class DataStoreListView(CardView):
         container.add_item(discord.ui.TextDisplay(heading))
         container.add_item(discord.ui.Separator())
 
-        start = self.page * DATASTORE_PER_PAGE
+        start = self.page * self.per_page
         container.add_item(discord.ui.TextDisplay(
-            "\n".join(self.lines[start:start + DATASTORE_PER_PAGE])
+            "\n".join(self.lines[start:start + self.per_page])
         ))
 
         if self.footer:
@@ -6070,7 +6215,7 @@ async def datastore_list_reply(ctx, arguments):
             f"Narrow it with a prefix: `!datastore list <store> <prefix>`."
         )
 
-    view = DataStoreListView(heading, lines, subtitle=subtitle, footer=footer)
+    view = PagedListView(heading, lines, subtitle=subtitle, footer=footer)
     view.message = await ctx.send(view=view)
 
 async def datastore_get_reply(ctx, arguments, *, raw):
@@ -6193,7 +6338,7 @@ async def ordered_datastore_list_reply(ctx, arguments):
             f"Read one with `!o_datastore get`."
         )
 
-    view = DataStoreListView(
+    view = PagedListView(
         f"📊 `{store}` / `{scope}`",
         lines,
         subtitle=f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'}, "
@@ -6243,6 +6388,121 @@ async def ordered_datastore_get_reply(ctx, arguments):
         [f"📊 value: **{value}**"],
         name_parts=(store, scope, key),
     )
+
+def reviews_submissions(user):
+    """Map reviewers, plus the admin. Everyone else is turned away."""
+    if getattr(user, "id", None) == ADMIN_USER_ID:
+        return True
+    return any(
+        role.id == SUBMISSIONS_ROLE_ID
+        for role in getattr(user, "roles", None) or []
+    )
+
+def submission_line(position, submission, maps_by_id):
+    """One submission as a row: name, ID, creator, when it came in."""
+    map_id = submission.get("Id")
+    try:
+        entry = maps_by_id.get(int(map_id)) if maps_by_id else None
+    except (TypeError, ValueError):
+        entry = None
+
+    name = (entry or {}).get("Name") or "Unnamed Map"
+    creator = (entry or {}).get("Creator")
+    row = f"`{position:>3}.` **{name}** · `{map_id}`"
+    if creator:
+        row += f" · by {creator}"
+
+    stamp = submission.get("Timestamp")
+    if isinstance(stamp, (int, float)) and stamp > 0:
+        row += f"\n-# submitted <t:{int(stamp)}:d>"
+    return row
+
+@bot.command(name="submissions", hidden=True)
+async def submissions_command(ctx, status: str = None):
+    """!submissions <accepted|pending|rejected> — the map review queue"""
+    if not reviews_submissions(ctx.author):
+        await ctx.send(view=simple_card(
+            "That command is for map reviewers.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    async with ctx.typing():
+        submissions = await fetch_submissions()
+        if submissions is None:
+            await ctx.send(view=simple_card(
+                "Couldn't read `Daily Cup Submissions` / `Submissions`. "
+                "Check the logs.",
+                colour=discord.Color.red(),
+            ))
+            return
+
+        buckets = submissions_by_status(submissions)
+        wanted = (status or "").strip().lower()
+
+        # No status asked for: report what's in each of them.
+        if not wanted:
+            counts = "\n".join(
+                f"**{len(entries)}** {label.lower()}"
+                for label, entries in sorted(
+                    buckets.items(), key=lambda item: -len(item[1])
+                )
+            ) or "There are no submissions at all."
+            remaining, total = await current_rotation_runway()
+            runway = ""
+            if remaining is not None:
+                runway = (
+                    f"\n\n🗺️ **{remaining}** accepted map"
+                    f"{'s' if remaining != 1 else ''} left before the rotation "
+                    f"wraps and starts replaying."
+                )
+            await ctx.send(view=simple_card(
+                f"{counts}{runway}\n\n"
+                f"-# `!submissions <accepted|pending|rejected>` lists one.",
+                heading="📥 Submissions",
+            ))
+            return
+
+        matched = [
+            entries for label, entries in buckets.items()
+            if label.lower() == wanted
+        ]
+        if not matched:
+            known = ", ".join(f"`{label.lower()}`" for label in buckets) or "none"
+            await ctx.send(view=simple_card(
+                f"No submissions are marked `{wanted}`.\n"
+                f"-# Statuses in use right now: {known}.",
+                colour=discord.Color.greyple(),
+            ))
+            return
+
+        entries = [entry for group in matched for entry in group]
+        maps_by_id = await get_community_maps()
+
+    lines = [
+        submission_line(position, submission, maps_by_id)
+        for position, submission in enumerate(entries, 1)
+    ]
+    label = wanted.capitalize()
+    footer = None
+    if wanted == "accepted":
+        remaining, _ = accepted_rotation_runway(
+            submissions, await resolve_current_map_id()
+        )
+        if remaining is not None:
+            footer = (
+                f"In rotation order. {remaining} left after today's map before "
+                f"it wraps and replays from the top."
+            )
+
+    view = PagedListView(
+        f"📥 {label} submissions",
+        lines,
+        subtitle=f"{len(entries)} map{'s' if len(entries) != 1 else ''}",
+        footer=footer,
+        per_page=SUBMISSIONS_PER_PAGE,
+    )
+    view.message = await ctx.send(view=view, allowed_mentions=SILENT)
 
 @bot.command(name="o_datastore", hidden=True)
 @is_admin()
