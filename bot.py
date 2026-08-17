@@ -3764,17 +3764,24 @@ def submissions_role_mention(destination):
     role = guild.get_role(SUBMISSIONS_ROLE_ID) if guild is not None else None
     return role.mention if role is not None else f"<@&{SUBMISSIONS_ROLE_ID}>"
 
-async def announce_low_submissions():
+async def announce_low_submissions(destination=None, *, force=False, ping=True):
     """Ping the reviewers when the accepted rotation is nearly exhausted.
 
     Runs at the rollover, so it repeats daily for as long as the pool stays
     low -- which is the point, and self-limiting at one message a day.
+
+    force posts whatever the runway is, and ping=False leaves the role out
+    of it; !testsubmissions uses both to preview the real message safely.
+    Returns the channel it posted to, or False.
     """
-    try:
-        channel_id = int(SUBMISSIONS_CHANNEL_ID)
-    except (TypeError, ValueError):
-        print("Low submissions check skipped: invalid SUBMISSIONS_CHANNEL_ID")
-        return False
+    if destination is None:
+        try:
+            channel_id = int(SUBMISSIONS_CHANNEL_ID)
+        except (TypeError, ValueError):
+            print("Low submissions check skipped: invalid SUBMISSIONS_CHANNEL_ID")
+            return False
+    else:
+        channel_id = destination.id
 
     remaining, total = await current_rotation_runway()
     if remaining is None:
@@ -3785,12 +3792,13 @@ async def announce_low_submissions():
             "Low submissions check skipped: Submissions couldn't be read"
         )
         return False
-    if remaining > SUBMISSIONS_LOW_WATER:
+    if remaining > SUBMISSIONS_LOW_WATER and not force:
         return False
 
-    destination = bot.get_channel(channel_id)
     if destination is None:
-        destination = await bot.fetch_channel(channel_id)
+        destination = bot.get_channel(channel_id)
+        if destination is None:
+            destination = await bot.fetch_channel(channel_id)
 
     if remaining == 0:
         headline = (
@@ -3805,22 +3813,33 @@ async def announce_low_submissions():
             f"{wraps:%d/%m/%Y} unless more get accepted."
         )
 
+    lines = []
+    if ping:
+        lines.append(submissions_role_mention(destination))
+    lines.append(headline)
+    lines.append(
+        f"-# {total} accepted in total · check the queue with "
+        f"`!submissions pending`"
+    )
+    # Said plainly, so a forced preview in a live channel can't be mistaken
+    # for the real alarm.
+    if force and remaining > SUBMISSIONS_LOW_WATER:
+        lines.append(
+            f"-# 🧪 Preview — the pool isn't actually low. The real ping "
+            f"waits for {SUBMISSIONS_LOW_WATER} or fewer."
+        )
+
     await destination.send(
-        content=(
-            f"{submissions_role_mention(destination)}\n"
-            f"{headline}\n"
-            f"-# {total} accepted in total · check the queue with "
-            f"`!submissions pending`"
-        ),
+        content="\n".join(lines),
         allowed_mentions=discord.AllowedMentions(
-            everyone=False, users=False, roles=True, replied_user=False
+            everyone=False, users=False, roles=ping, replied_user=False
         ),
     )
     print(
-        f"Pinged the reviewers in {channel_id}: {remaining} accepted map(s) "
-        f"left of {total}"
+        f"Posted the submissions warning to {channel_id}: {remaining} accepted "
+        f"map(s) left of {total}{'' if ping else ' (role not pinged)'}"
     )
-    return True
+    return destination
 
 @tasks.loop(time=datetime_time(hour=9, minute=0, tzinfo=timezone.utc))
 async def daily_cup_announcement():
@@ -7042,6 +7061,32 @@ async def test_cup_announcement(
         await ctx.send(
             "Couldn't build the Daily Cup announcement. Check the bot logs "
             "for the missing Roblox data or the configured channel."
+        )
+        return
+
+    if posted.id != ctx.channel.id:
+        await ctx.send(f"Posted to {posted.mention}.", allowed_mentions=SILENT)
+
+@bot.command(name="testsubmissions", hidden=True)
+@commands.is_owner()
+async def test_submissions_warning(
+    ctx, channel: Optional[discord.TextChannel] = None, ping: bool = False
+):
+    """Owner-only run of the low-rotation warning, whatever the runway is.
+
+    Goes to SUBMISSIONS_CHANNEL_ID by default, so it exercises the real
+    path. Name a channel to post elsewhere: `!testsubmissions #scratch`.
+    Pass true to mention the reviewer role for real: `!testsubmissions true`
+    -- that pings everyone who has it, so it defaults to off.
+    """
+    async with ctx.typing():
+        posted = await announce_low_submissions(channel, force=True, ping=ping)
+
+    if not posted:
+        await ctx.send(
+            "Couldn't work out the rotation runway — today's map may not be "
+            "among the accepted submissions, or Submissions wouldn't read. "
+            "Check the bot logs."
         )
         return
 
