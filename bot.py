@@ -5089,6 +5089,8 @@ return { status = "ok", catalogs = catalogs }
 
 # Keyed by universe: a !dev_give must never answer from the live catalogs.
 _reward_catalog_cache = {}
+# One read at a time per universe, so simultaneous callers share a task.
+_reward_catalog_locks = {}
 
 async def fetch_reward_catalogs(*, refresh=False):
     """Every item the game defines, as {category: [names]}.
@@ -5098,11 +5100,22 @@ async def fetch_reward_catalogs(*, refresh=False):
     REWARD_CATALOG_TTL runs out or --refresh asks for it again.
     """
     universe = current_universe()
-    now = time.monotonic()
     cached = _reward_catalog_cache.get(universe)
-    if cached and not refresh and now - cached[0] < REWARD_CATALOG_TTL:
+    if cached and not refresh and time.monotonic() - cached[0] < REWARD_CATALOG_TTL:
         return "ok", cached[1]
 
+    # /catalog is public, so a cold cache can be asked for by several people
+    # at once. One task answers all of them rather than each booting a server.
+    lock = _reward_catalog_locks.setdefault(universe, asyncio.Lock())
+    async with lock:
+        now = time.monotonic()
+        cached = _reward_catalog_cache.get(universe)
+        if cached and not refresh and now - cached[0] < REWARD_CATALOG_TTL:
+            return "ok", cached[1]
+        return await _read_reward_catalogs(universe, now)
+
+async def _read_reward_catalogs(universe, now):
+    """The task itself. Only ever called with the universe's lock held."""
     state, result = await run_luau(LUAU_READ_CATALOGS % luau_asset_table())
     if state != "COMPLETE":
         return "error", f"the catalog task {state.lower()} — {result}"
@@ -5271,8 +5284,13 @@ def split_reward_flags(text):
     value = " ".join(word for word in words if not word.startswith("--"))
     return flags, value or None
 
-async def reward_catalog_reply(ctx, kind, *, refresh):
-    """!give <player> <type> with no value: everything that type can hold."""
+async def reward_catalog_reply(ctx, kind, *, refresh=False, footer=None,
+                               show_source=True):
+    """Post everything one type can hold.
+
+    Shared by `!give <player> <type>` and `/catalog`. The admin listing names
+    the asset each catalog came out of; the public one has no use for it.
+    """
     label = reward_type_label(kind)
     if kind == "badge":
         badges = await fetch_universe_badges()
@@ -5314,14 +5332,56 @@ async def reward_catalog_reply(ctx, kind, *, refresh):
         ]
         source = f"asset `{asset_id}`"
 
+    subtitle = f"{len(lines)} in {source}" if show_source else f"{len(lines)} total"
     view = PagedListView(
         f"🎁 {label}s",
         lines,
-        subtitle=f"{len(lines)} in {source}",
-        footer=f"Queue one with `!give <player> {kind} <name>`.",
+        subtitle=subtitle,
+        footer=(footer if footer is not None
+                else f"Queue one with `!give <player> {kind} <name>`."),
         per_page=REWARD_CATALOG_PER_PAGE,
     )
     view.message = await ctx.send(view=view)
+
+# The public half of the same catalogs. Badges are left out: they are Roblox
+# badges rather than a collection in the profile, and /badges already shows
+# them per player.
+CATALOG_KINDS = tuple(kind for kind in REWARD_TYPES if kind != "badge")
+CATALOG_CHOICES = [
+    app_commands.Choice(name=f"{reward_type_label(kind)}s", value=f"{kind}s")
+    for kind in CATALOG_KINDS
+]
+
+@bot.hybrid_command(
+    name="catalog",
+    description="Show every item the game has in one collection",
+)
+@app_commands.describe(category="Which collection to list")
+@app_commands.choices(category=CATALOG_CHOICES)
+async def catalog_command(ctx, category: str):
+    await ctx.defer()
+
+    kind = resolve_reward_type(category)
+    if kind == "badge":
+        await ctx.send(view=simple_card(
+            "Badges aren't a collection in your profile — `/badges` shows "
+            "which of the game's badges a player has earned.",
+            colour=discord.Color.greyple(),
+        ))
+        return
+    if kind is None or kind not in CATALOG_KINDS:
+        await ctx.send(view=simple_card(
+            f"`{category}` isn't a collection. Pick one of: "
+            + ", ".join(f"`{name}s`" for name in CATALOG_KINDS) + ".",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    await reward_catalog_reply(
+        ctx, kind,
+        footer="Everything the game has — not what you own.",
+        show_source=False,
+    )
 
 @bot.command(name="give", hidden=True, usage="<player> <type> <value>")
 @is_admin()
