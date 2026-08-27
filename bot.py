@@ -167,6 +167,46 @@ LINK_CODE_EXPIRATIONS_KEY = "CodeExpirations"
 # Discord role rules live here, keyed by guild.
 ROLES_DATASTORE = "Roles"
 ROLE_CONDITIONS = ("badge", "map")
+# Rewards !give can queue, mapped to the Main_Data category each one lands in.
+# The record carries that category rather than the word typed, so the in-game
+# giver can append straight to profile.Data[reward.Type].Owned without a
+# lookup table of its own. "Badge" is the odd one out: those are real Roblox
+# badges, awarded through BadgeService, not a list inside the profile.
+REWARD_TYPES = {
+    "badge": "Badge",
+    "emote": "Emotes",
+    "skin": "Skins",
+    "chat_tag": "Tags",
+    "username_effect": "UsernameEffects",
+    "death_effect": "DeathEffects",
+    "sticker": "Stickers",
+}
+# Every spelling accepted for a type: the bare word and its plural, so
+# "sticker" and "stickers" both land, plus the shorthand for chat tags.
+REWARD_TYPE_LOOKUP = {
+    alias: name
+    for name in REWARD_TYPES
+    for alias in (name.replace("_", ""), name.replace("_", "") + "s")
+}
+REWARD_TYPE_LOOKUP.update({"tag": "chat_tag", "tags": "chat_tag"})
+# Group-owned assets defining what each category contains. They are private,
+# so Open Cloud cannot download them -- assetdelivery answers 403 -- and the
+# only way to read one is from inside the game. See fetch_reward_catalogs.
+REWARD_CATALOG_ASSETS = {
+    "UsernameEffects": 127282682192573,
+    "Tags": 72463035179278,
+    "DeathEffects": 106363251529565,
+    "Skins": 84460733985367,
+    "Emotes": 112243662880501,
+    "Stickers": 79048466389363,
+}
+# Reading them boots a server, so the answer is cached per universe.
+REWARD_CATALOG_TTL = 1800
+# Items per page of the catalog listing.
+REWARD_CATALOG_PER_PAGE = 20
+# Queued rewards, keyed by Roblox user ID. Each entry holds a list, so a
+# player can have several waiting at once.
+PENDING_REWARDS_DATASTORE = "PendingRewards"
 # Always granted by /sync, but omitted from its change summary. These organize
 # achievement roles into Discord profile categories rather than representing
 # achievements themselves.
@@ -4910,6 +4950,531 @@ async def admin_unban(ctx, player: str):
             await ctx.send(f"✅ Unbanned **{name}** (`{user_id}`).")
         else:
             await ctx.send(f"Failed to unban **{name}**. Check the logs.")
+
+def resolve_reward_type(text):
+    """A typed reward name -> its canonical key, or None.
+
+    Forgiving about punctuation and plurals, so chat_tag, chat-tag, chattags
+    and tag all land on the same type.
+    """
+    return REWARD_TYPE_LOOKUP.get(re.sub(r"[^a-z]", "", (text or "").lower()))
+
+def reward_type_label(kind):
+    """chat_tag -> "Chat Tag", for reading back in a reply."""
+    return kind.replace("_", " ").title()
+
+def same_reward_value(left, right):
+    """Whether two reward values name the same thing.
+
+    Item names compare case-insensitively, so an admin's "ice explosion" still
+    matches the "Ice Explosion" the profile stores. Badge IDs are numbers and
+    compare as they are.
+    """
+    if isinstance(left, str) and isinstance(right, str):
+        return left.strip().casefold() == right.strip().casefold()
+    return left == right
+
+def luau_asset_table():
+    """REWARD_CATALOG_ASSETS as a Luau table literal."""
+    return "{" + ", ".join(
+        f"[{json.dumps(category)}] = {asset_id}"
+        for category, asset_id in REWARD_CATALOG_ASSETS.items()
+    ) + "}"
+
+# The catalog assets belong to the group and are not public, so Open Cloud
+# cannot download them -- assetdelivery answers 403 for anything that isn't.
+# Inside the game they are reachable, so one task reads all six at once.
+LUAU_READ_CATALOGS = """
+local InsertService = game:GetService("InsertService")
+local assets = %s
+
+-- A table is an item when it carries anything that isn't a table -- a price,
+-- an id, an animation. A table holding nothing but tables is a group to
+-- descend into, which is how a catalog split by rarity or season is shaped.
+local function looksLikeItem(value)
+    if next(value) == nil then
+        return true
+    end
+    for _, field in pairs(value) do
+        if type(field) ~= "table" then
+            return true
+        end
+    end
+    return false
+end
+
+-- Harvest names out of whatever shape the module returns: an array of names,
+-- an array of {Name = ...} records, or a table keyed by the name itself.
+local function collect(source, names, seen, depth)
+    for key, value in pairs(source) do
+        if type(value) == "table" and depth < 3 and not looksLikeItem(value) then
+            collect(value, names, seen, depth + 1)
+        else
+            local name = nil
+            if type(value) == "table" then
+                name = value.Name or value.name or value.DisplayName
+            end
+            if name == nil and type(key) == "string" then
+                name = key
+            end
+            if name == nil and type(value) == "string" then
+                name = value
+            end
+            if type(name) == "string" and name ~= "" and not seen[name] then
+                seen[name] = true
+                table.insert(names, name)
+            end
+        end
+    end
+end
+
+local function fromTable(source)
+    local names, seen = {}, {}
+    collect(source, names, seen, 1)
+    return names
+end
+
+local function readAsset(id)
+    -- A module asset can just be required.
+    local ok, module = pcall(require, id)
+    if ok and type(module) == "table" then
+        return fromTable(module), "module"
+    end
+
+    local loaded, model = pcall(function()
+        return InsertService:LoadAsset(id)
+    end)
+    if not loaded or typeof(model) ~= "Instance" then
+        return nil, tostring(model)
+    end
+
+    for _, descendant in ipairs(model:GetDescendants()) do
+        if descendant:IsA("ModuleScript") then
+            local required, source = pcall(require, descendant)
+            if required and type(source) == "table" then
+                return fromTable(source), "model module"
+            end
+        end
+    end
+
+    -- No module in there: the instances are the items themselves. Step past
+    -- whatever wrapper the asset was published with to reach them.
+    local root = model
+    while true do
+        local children = root:GetChildren()
+        if #children ~= 1 or #children[1]:GetChildren() == 0 then
+            break
+        end
+        root = children[1]
+    end
+
+    local names, seen = {}, {}
+    for _, child in ipairs(root:GetChildren()) do
+        if not seen[child.Name] then
+            seen[child.Name] = true
+            table.insert(names, child.Name)
+        end
+    end
+    return names, "model"
+end
+
+local catalogs = {}
+for category, id in pairs(assets) do
+    local names, source = readAsset(id)
+    catalogs[category] = { items = names or {}, source = source }
+end
+
+return { status = "ok", catalogs = catalogs }
+"""
+
+# Keyed by universe: a !dev_give must never answer from the live catalogs.
+_reward_catalog_cache = {}
+
+async def fetch_reward_catalogs(*, refresh=False):
+    """Every item the game defines, as {category: [names]}.
+
+    Returns (status, catalogs) or ("error", reason). Reading the assets boots
+    a server, which takes 10-30s, so the answer is cached until
+    REWARD_CATALOG_TTL runs out or --refresh asks for it again.
+    """
+    universe = current_universe()
+    now = time.monotonic()
+    cached = _reward_catalog_cache.get(universe)
+    if cached and not refresh and now - cached[0] < REWARD_CATALOG_TTL:
+        return "ok", cached[1]
+
+    state, result = await run_luau(LUAU_READ_CATALOGS % luau_asset_table())
+    if state != "COMPLETE":
+        return "error", f"the catalog task {state.lower()} — {result}"
+    if luau_result_status(result) != "ok":
+        return "error", "the catalog task returned nothing usable"
+
+    catalogs = {}
+    for category in REWARD_CATALOG_ASSETS:
+        items = dig(result, "catalogs", category, "items")
+        catalogs[category] = (
+            [item for item in items if isinstance(item, str)]
+            if isinstance(items, list) else []
+        )
+
+    if not any(catalogs.values()):
+        return "error", "none of the catalog assets could be read in game"
+
+    _reward_catalog_cache[universe] = (now, catalogs)
+    print("reward catalogs read: " + ", ".join(
+        f"{category}={len(items)}" for category, items in catalogs.items()
+    ))
+    return "ok", catalogs
+
+def match_catalog_value(names, value):
+    """The catalog's own spelling of value, or None when it holds no such item."""
+    for name in names:
+        if same_reward_value(name, value):
+            return name
+    return None
+
+def suggest_catalog_values(names, value, limit=5):
+    """Catalog entries the typed value reads like, for a "did you mean"."""
+    wanted = value.strip().casefold()
+    return [name for name in names if wanted in name.casefold()][:limit]
+
+async def fetch_profile_data(user_id):
+    """(status, the player's Data table).
+
+    "missing" is a player who has never saved, which is a real answer. It is
+    kept apart from a failed read so a dead API call can't read as "owns
+    nothing" and queue something they already have.
+    """
+    status, resource = await fetch_entry_resource(str(user_id), "Main_Data")
+    if status != "ok":
+        return status, {}
+    data = dig(decode_entry_value((resource or {}).get("value")), "Data")
+    return "ok", data if isinstance(data, dict) else {}
+
+def owned_reward_values(data, category):
+    """Every item the player already holds in one category.
+
+    Owned is the list the game appends to. The equipped item is folded in as
+    well: stickers equip into numbered slots, and an equipped entry naming
+    something the Owned list has lost still means they have it.
+    """
+    values = [
+        item for item in (dig(data, category, "Owned") or [])
+        if isinstance(item, str)
+    ]
+    equipped = dig(data, category, "Equipped")
+    if isinstance(equipped, str):
+        values.append(equipped)
+    elif isinstance(equipped, dict):
+        values.extend(
+            item for item in equipped.values() if isinstance(item, str)
+        )
+    return values
+
+async def resolve_reward_badge(value):
+    """A badge ID or name -> (badge_id, name), or (None, why not)."""
+    badges = await fetch_universe_badges()
+    if not badges:
+        return None, "Couldn't read this game's badge list. Try again in a moment."
+
+    wanted = value.strip()
+    if wanted.isdigit():
+        badge_id = int(wanted)
+        for badge in badges:
+            if badge.get("id") == badge_id:
+                return badge_id, badge_display_name(badge)
+        return None, (
+            f"No badge `{badge_id}` in this game — "
+            f"`!give <player> badge` lists them."
+        )
+
+    matches = [
+        badge for badge in badges
+        if same_reward_value(badge_display_name(badge), wanted)
+    ]
+    if len(matches) > 1:
+        ids = ", ".join(f"`{badge.get('id')}`" for badge in matches[:5])
+        return None, (
+            f"{len(matches)} badges are called **{wanted}**. Give the ID "
+            f"instead: {ids}."
+        )
+    if not matches:
+        near = suggest_catalog_values(
+            [badge_display_name(badge) for badge in badges], wanted
+        )
+        text = f"No badge named **{wanted}**."
+        if near:
+            text += " Did you mean " + ", ".join(f"**{n}**" for n in near) + "?"
+        return None, text
+
+    return matches[0].get("id"), badge_display_name(matches[0])
+
+async def player_owns_badge(user_id, badge_id):
+    """Whether the player has one badge, asked directly.
+
+    Deliberately not fetch_owned_badge_ids: that cache is keyed by the player
+    alone, so seeding it from a single badge would leave the badge card
+    reporting every other badge unowned until the entry expires.
+    """
+    _, owned = await _badge_is_owned(user_id, badge_id, asyncio.Semaphore(1))
+    return owned
+
+async def queue_pending_reward(user_id, record):
+    """Append one reward to the player's queue.
+
+    Returns "ok", "duplicate", "unreadable", or an update_entry_with_retry
+    status. The duplicate check runs inside the transform, so a reward that
+    lands underneath us is still caught when the write is reapplied.
+    """
+    state = {"result": None}
+
+    def transform(stored):
+        if stored is None:
+            stored = []
+        if not isinstance(stored, list):
+            state["result"] = "unreadable"
+            return None
+        for pending in stored:
+            if (isinstance(pending, dict)
+                    and pending.get("Type") == record["Type"]
+                    and same_reward_value(pending.get("Value"), record["Value"])):
+                state["result"] = "duplicate"
+                return None
+        return stored + [record]
+
+    result = await update_entry_with_retry(
+        str(user_id), PENDING_REWARDS_DATASTORE, transform, default=[],
+    )
+    return state["result"] or result
+
+GIVE_USAGE = (
+    "**`!give <player> <type> <value>`** — queue an item for a player\n"
+    "**`!give <player> <type>`** — list what that catalog holds\n"
+    "\n"
+    "-# Types: " + ", ".join(f"`{name}`" for name in REWARD_TYPES) + ".\n"
+    "-# `<player>` is a Roblox username or ID, `<value>` may contain spaces.\n"
+    "-# A badge takes its ID or its name; every other type takes the item's "
+    "name, matched against the game's own catalog.\n"
+    "-# Refused if the player already owns the item, or already has it "
+    "queued.\n"
+    "-# `--refresh` re-reads the catalogs, `--force` queues a value the "
+    "catalog doesn't list.\n"
+    "-# `!dev_give` does the same against the test universe."
+)
+
+def split_reward_flags(text):
+    """Pull --force and --refresh out of the value. Returns (flags, value)."""
+    if not text:
+        return set(), None
+    words = text.split()
+    flags = {word.lower() for word in words if word.startswith("--")}
+    value = " ".join(word for word in words if not word.startswith("--"))
+    return flags, value or None
+
+async def reward_catalog_reply(ctx, kind, *, refresh):
+    """!give <player> <type> with no value: everything that type can hold."""
+    label = reward_type_label(kind)
+    if kind == "badge":
+        badges = await fetch_universe_badges()
+        if not badges:
+            await ctx.send(view=simple_card(
+                "Couldn't read this game's badge list.",
+                colour=discord.Color.red(),
+            ))
+            return
+        badges.sort(key=badge_display_name)
+        lines = [
+            f"`{position:>3}.` **{badge_display_name(badge)}** · "
+            f"`{badge.get('id')}`"
+            for position, badge in enumerate(badges, 1)
+        ]
+        source = "the game's badge list"
+    else:
+        category = REWARD_TYPES[kind]
+        asset_id = REWARD_CATALOG_ASSETS[category]
+        status, catalogs = await fetch_reward_catalogs(refresh=refresh)
+        if status != "ok":
+            await ctx.send(view=simple_card(
+                f"Couldn't read the catalogs — {catalogs}.",
+                colour=discord.Color.red(),
+            ))
+            return
+
+        names = catalogs.get(category) or []
+        if not names:
+            await ctx.send(view=simple_card(
+                f"The {label} catalog came back empty. Asset `{asset_id}` may "
+                f"not be readable in game — check the logs.",
+                colour=discord.Color.red(),
+            ))
+            return
+        lines = [
+            f"`{position:>3}.` **{name}**"
+            for position, name in enumerate(names, 1)
+        ]
+        source = f"asset `{asset_id}`"
+
+    view = PagedListView(
+        f"🎁 {label}s",
+        lines,
+        subtitle=f"{len(lines)} in {source}",
+        footer=f"Queue one with `!give <player> {kind} <name>`.",
+        per_page=REWARD_CATALOG_PER_PAGE,
+    )
+    view.message = await ctx.send(view=view)
+
+@bot.command(name="give", hidden=True, usage="<player> <type> <value>")
+@is_admin()
+async def admin_give(ctx, player: str = None, reward: str = None, *,
+                     value: str = None):
+    """Queue an item for a player to collect next time they play."""
+    flags, value = split_reward_flags(value)
+    if player is None or reward is None:
+        await ctx.send(view=simple_card(GIVE_USAGE, heading="🎁 Give"))
+        return
+
+    kind = resolve_reward_type(reward)
+    if kind is None:
+        await ctx.send(view=simple_card(
+            f"`{reward}` isn't a reward type. Use one of: "
+            + ", ".join(f"`{name}`" for name in REWARD_TYPES) + ".",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    category = REWARD_TYPES[kind]
+    label = reward_type_label(kind)
+
+    async with ctx.typing():
+        if value is None:
+            await reward_catalog_reply(ctx, kind, refresh="--refresh" in flags)
+            return
+
+        user_id, name = await resolve_admin_target(ctx, player)
+        if user_id is None:
+            return
+
+        # Settle what the record will carry: a badge ID, or the catalog's own
+        # spelling of the item's name.
+        if kind == "badge":
+            stored_value, badge_name = await resolve_reward_badge(value)
+            if stored_value is None:
+                # A miss puts the reason where the name would have been.
+                await ctx.send(view=simple_card(
+                    badge_name, colour=discord.Color.red()
+                ))
+                return
+            item = f"{badge_name} (`{stored_value}`)"
+        else:
+            stored_value = value.strip()
+            item = stored_value
+            if "--force" not in flags:
+                status, catalogs = await fetch_reward_catalogs(
+                    refresh="--refresh" in flags
+                )
+                if status != "ok":
+                    await ctx.send(view=simple_card(
+                        f"Couldn't read the {label} catalog — {catalogs}.\n"
+                        f"-# Add `--force` to queue **{stored_value}** without "
+                        f"checking it.",
+                        colour=discord.Color.red(),
+                    ))
+                    return
+
+                names = catalogs.get(category) or []
+                matched = match_catalog_value(names, stored_value)
+                if matched is None:
+                    if names:
+                        text = f"No {label.lower()} named **{stored_value}**."
+                        near = suggest_catalog_values(names, stored_value)
+                        if near:
+                            text += (" Did you mean "
+                                     + ", ".join(f"**{n}**" for n in near) + "?")
+                    else:
+                        text = (f"The {label} catalog came back empty, so "
+                                f"nothing can be checked against it.")
+                    text += (f"\n-# `!give {player} {kind}` lists them, or add "
+                             f"`--force` to queue it anyway.")
+                    await ctx.send(view=simple_card(
+                        text, colour=discord.Color.red()
+                    ))
+                    return
+                # The game matches on its own spelling, not the admin's.
+                stored_value = matched
+                item = matched
+
+        # Already owning it is the one thing that must never be queued.
+        if kind == "badge":
+            if await player_owns_badge(user_id, stored_value):
+                await ctx.send(view=simple_card(
+                    f"**{name}** already has the badge {item}.",
+                    colour=discord.Color.greyple(),
+                ))
+                return
+        else:
+            status, data = await fetch_profile_data(user_id)
+            if status not in ("ok", "missing"):
+                await ctx.send(view=simple_card(
+                    f"Couldn't read **{name}**'s saved data (`{status}`), so "
+                    f"there's no telling whether they already have **{item}**. "
+                    f"Nothing was queued — check the logs.",
+                    colour=discord.Color.red(),
+                ))
+                return
+            owned = owned_reward_values(data, category)
+            if any(same_reward_value(held, stored_value) for held in owned):
+                await ctx.send(view=simple_card(
+                    f"**{name}** already has the {label.lower()} **{item}**.",
+                    colour=discord.Color.greyple(),
+                ))
+                return
+
+        record = {
+            "Id": secrets.token_hex(3),
+            "Type": category,
+            "Value": stored_value,
+            "GrantedBy": str(ctx.author.id),
+            "GrantedAt": int(time.time()),
+        }
+        result = await queue_pending_reward(user_id, record)
+
+    if result == "duplicate":
+        await ctx.send(view=simple_card(
+            f"**{item}** is already queued for **{name}** — they just haven't "
+            f"collected it yet.",
+            colour=discord.Color.greyple(),
+        ))
+        return
+    if result == "unreadable":
+        await ctx.send(view=simple_card(
+            f"`{PENDING_REWARDS_DATASTORE}/{user_id}` holds something that "
+            f"isn't a list of rewards. Nothing was written — read it with "
+            f"`!datastore get {PENDING_REWARDS_DATASTORE} {user_id}`.",
+            colour=discord.Color.red(),
+        ))
+        return
+    if result == "buffer":
+        await ctx.send(view=simple_card(
+            f"`{PENDING_REWARDS_DATASTORE}/{user_id}` is stored as a Luau "
+            f"buffer, which Open Cloud can read but never write. Nothing was "
+            f"queued.",
+            colour=discord.Color.red(),
+        ))
+        return
+    if result != "ok":
+        await ctx.send(view=simple_card(
+            f"Couldn't queue **{item}** for **{name}** (`{result}`). Check the "
+            f"logs.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    await ctx.send(view=simple_card(
+        f"**{item}** — {label.lower()} for **{name}** (`{user_id}`)\n"
+        f"-# Waiting in `{PENDING_REWARDS_DATASTORE}` as `{record['Id']}`; the "
+        f"game hands it over next time they play.",
+        heading="🎁 Queued",
+    ))
 
 _LUA_STRING = re.compile(r'(?:(\w+)\s*=\s*)?"((?:[^"\\]|\\.)*)"')
 _LUA_ESCAPES = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}
