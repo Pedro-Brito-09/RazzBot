@@ -5007,7 +5007,11 @@ end
 -- an array of {Name = ...} records, or a table keyed by the name itself.
 local function collect(source, names, seen, depth)
     for key, value in pairs(source) do
-        if type(value) == "table" and depth < 3 and not looksLikeItem(value) then
+        -- A function is the module's API, never an item. Harvesting these is
+        -- what turned the first read into a list of "Get" and "GetAll".
+        if type(value) == "function" then
+            -- skipped
+        elseif type(value) == "table" and depth < 3 and not looksLikeItem(value) then
             collect(value, names, seen, depth + 1)
         else
             local name = nil
@@ -5034,25 +5038,86 @@ local function fromTable(source)
     return names
 end
 
+-- What the top level actually holds, so a bad read can be diagnosed from the
+-- reply instead of another blind round trip.
+local function describe(source)
+    local parts, count = {}, 0
+    for key, value in pairs(source) do
+        count = count + 1
+        if count <= 12 then
+            table.insert(parts, tostring(key) .. ":" .. typeof(value))
+        end
+    end
+    if count > 12 then
+        table.insert(parts, "... " .. (count - 12) .. " more")
+    end
+    return table.concat(parts, ", ")
+end
+
+-- These modules keep their catalog in a local and expose an accessor, so the
+-- table itself carries nothing but functions. Call the accessor instead.
+local GETTERS = {"GetAll", "All", "GetItems", "GetList", "GetCatalog",
+                 "GetEffects", "GetTags", "GetSkins", "Get"}
+local FIELDS = {"Items", "List", "Catalog", "Data", "All", "Effects", "Tags",
+                "Skins", "Emotes", "Stickers", "DeathEffects",
+                "UsernameEffects", "ChatTags"}
+
+local function fromModule(source)
+    for _, getter in ipairs(GETTERS) do
+        local fn = rawget(source, getter)
+        if type(fn) == "function" then
+            -- Plain call first, then the method form for a colon-defined one.
+            local ok, result = pcall(fn)
+            if not ok or type(result) ~= "table" then
+                ok, result = pcall(fn, source)
+            end
+            if ok and type(result) == "table" then
+                local names = fromTable(result)
+                if #names > 0 then
+                    return names, "module." .. getter .. "()"
+                end
+            end
+        end
+    end
+
+    for _, field in ipairs(FIELDS) do
+        local value = rawget(source, field)
+        if type(value) == "table" then
+            local names = fromTable(value)
+            if #names > 0 then
+                return names, "module." .. field
+            end
+        end
+    end
+
+    local names = fromTable(source)
+    if #names > 0 then
+        return names, "module"
+    end
+    return nil, "module"
+end
+
 local function readAsset(id)
     -- A module asset can just be required.
     local ok, module = pcall(require, id)
     if ok and type(module) == "table" then
-        return fromTable(module), "module"
+        local names, source = fromModule(module)
+        return names, source, describe(module)
     end
 
     local loaded, model = pcall(function()
         return InsertService:LoadAsset(id)
     end)
     if not loaded or typeof(model) ~= "Instance" then
-        return nil, tostring(model)
+        return nil, tostring(model), ""
     end
 
     for _, descendant in ipairs(model:GetDescendants()) do
         if descendant:IsA("ModuleScript") then
-            local required, source = pcall(require, descendant)
-            if required and type(source) == "table" then
-                return fromTable(source), "model module"
+            local required, inner = pcall(require, descendant)
+            if required and type(inner) == "table" then
+                local names, source = fromModule(inner)
+                return names, "model " .. source, describe(inner)
             end
         end
     end
@@ -5068,20 +5133,27 @@ local function readAsset(id)
         root = children[1]
     end
 
-    local names, seen = {}, {}
+    local names, seen, shape = {}, {}, {}
     for _, child in ipairs(root:GetChildren()) do
         if not seen[child.Name] then
             seen[child.Name] = true
             table.insert(names, child.Name)
+            if #shape < 12 then
+                table.insert(shape, child.Name .. ":" .. child.ClassName)
+            end
         end
     end
-    return names, "model"
+    return names, "model " .. root.Name, table.concat(shape, ", ")
 end
 
 local catalogs = {}
 for category, id in pairs(assets) do
-    local names, source = readAsset(id)
-    catalogs[category] = { items = names or {}, source = source }
+    local names, source, shape = readAsset(id)
+    catalogs[category] = {
+        items = names or {},
+        source = source,
+        shape = shape or "",
+    }
 end
 
 return { status = "ok", catalogs = catalogs }
@@ -5122,22 +5194,36 @@ async def _read_reward_catalogs(universe, now):
     if luau_result_status(result) != "ok":
         return "error", "the catalog task returned nothing usable"
 
-    catalogs = {}
+    catalogs, details = {}, {}
     for category in REWARD_CATALOG_ASSETS:
         items = dig(result, "catalogs", category, "items")
         catalogs[category] = (
             [item for item in items if isinstance(item, str)]
             if isinstance(items, list) else []
         )
+        # Where the names came from, and what the asset's top level holds --
+        # the difference between "no items" and "read the wrong thing".
+        details[category] = {
+            "source": dig(result, "catalogs", category, "source") or "?",
+            "shape": dig(result, "catalogs", category, "shape") or "",
+        }
 
     if not any(catalogs.values()):
         return "error", "none of the catalog assets could be read in game"
 
-    _reward_catalog_cache[universe] = (now, catalogs)
-    print("reward catalogs read: " + ", ".join(
-        f"{category}={len(items)}" for category, items in catalogs.items()
-    ))
+    _reward_catalog_cache[universe] = (now, catalogs, details)
+    for category, items in catalogs.items():
+        print(f"catalog {category}: {len(items)} via "
+              f"{details[category]['source']} — top level: "
+              f"{details[category]['shape'] or '(nothing)'}")
     return "ok", catalogs
+
+def reward_catalog_details(category):
+    """How the last read of one category went, for the admin listing."""
+    cached = _reward_catalog_cache.get(current_universe())
+    if not cached or len(cached) < 3:
+        return {}
+    return (cached[2] or {}).get(category) or {}
 
 def match_catalog_value(names, value):
     """The catalog's own spelling of value, or None when it holds no such item."""
@@ -5319,18 +5405,20 @@ async def reward_catalog_reply(ctx, kind, *, refresh=False, footer=None,
             return
 
         names = catalogs.get(category) or []
+        detail = reward_catalog_details(category)
         if not names:
-            await ctx.send(view=simple_card(
-                f"The {label} catalog came back empty. Asset `{asset_id}` may "
-                f"not be readable in game — check the logs.",
-                colour=discord.Color.red(),
-            ))
+            text = (f"The {label} catalog came back empty. Asset `{asset_id}` "
+                    f"may not be readable in game.")
+            if detail.get("shape"):
+                text += (f"\n-# Read via `{detail.get('source')}`, whose top "
+                         f"level holds: `{detail['shape']}`")
+            await ctx.send(view=simple_card(text, colour=discord.Color.red()))
             return
         lines = [
             f"`{position:>3}.` **{name}**"
             for position, name in enumerate(names, 1)
         ]
-        source = f"asset `{asset_id}`"
+        source = f"asset `{asset_id}` via `{detail.get('source', '?')}`"
 
     subtitle = f"{len(lines)} in {source}" if show_source else f"{len(lines)} total"
     view = PagedListView(
