@@ -245,8 +245,11 @@ TOURNAMENT_ROLE_ID = os.getenv("TOURNAMENT_ROLE_ID")
 # Bracket logic is fiddly and already solved; more to the point, a host can fix
 # a DQ or a reseed in Challonge's own UI at 2am without the bot growing an
 # admin panel for it.
-CHALLONGE_USERNAME = os.getenv("CHALLONGE_USERNAME")
-CHALLONGE_API_KEY = os.getenv("CHALLONGE_API_KEY")
+# API v2.1 authenticates an application, not a user: the client_credentials
+# grant is scoped to the app plus its owner, so brackets are created under
+# the developer account with no browser round trip.
+CHALLONGE_CLIENT_ID = os.getenv("CHALLONGE_CLIENT_ID")
+CHALLONGE_CLIENT_SECRET = os.getenv("CHALLONGE_CLIENT_SECRET")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -7880,11 +7883,6 @@ TOURNAMENT_FLAG_FIELDS = {
 }
 TOURNAMENT_COLOR = discord.Color(0xE67E22)
 
-CHALLONGE_API = "https://api.challonge.com/v1"
-CHALLONGE_FORMATS = {
-    "single": "single elimination",
-    "double": "double elimination",
-}
 
 TOURNAMENT_USAGE = (
     '**`!tournament create "Name" <register_start> <matches_start>`**\n'
@@ -8077,49 +8075,156 @@ async def active_tournament():
     return None
 
 # --- Challonge -------------------------------------------------------------
+# API v2.1, authenticated with the client_credentials grant. That grant is
+# scoped to the application "plus its owner for user-scoped endpoints", which
+# is what lets the bot create brackets that belong to the developer account
+# rather than to nobody -- and it needs no browser round trip, unlike the
+# authorization_code flow. Everything therefore goes through the app-scoped
+# /application/ endpoints.
+
+CHALLONGE_API = "https://api.challonge.com/v2.1"
+CHALLONGE_TOKEN_URL = "https://api.challonge.com/oauth/token"
+# Full access to every tournament connected to the app. Only the
+# client_credentials flow can be granted it.
+CHALLONGE_SCOPE = "application:manage"
+# Tokens last a week. Renew a little early rather than finding out on the
+# call that builds the bracket.
+CHALLONGE_TOKEN_MARGIN = 300
+# JSON:API, per the v2 docs: requests are vnd.api+json, replies are json.
+CHALLONGE_HEADERS = {
+    "Content-Type": "application/vnd.api+json",
+    "Accept": "application/json",
+}
+CHALLONGE_FORMATS = {
+    "single": "single elimination",
+    "double": "double elimination",
+}
+
+_challonge_token = {"value": None, "expires": 0}
+
+async def challonge_token(*, renew=False):
+    """A cached bearer token for the app. Returns (token, error)."""
+    if not (CHALLONGE_CLIENT_ID and CHALLONGE_CLIENT_SECRET):
+        return None, ("`CHALLONGE_CLIENT_ID` and `CHALLONGE_CLIENT_SECRET` "
+                      "aren't set on the server.")
+
+    if (not renew and _challonge_token["value"]
+            and now_epoch() < _challonge_token["expires"]):
+        return _challonge_token["value"], None
+
+    try:
+        session = await get_session()
+        async with session.post(
+            CHALLONGE_TOKEN_URL,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": CHALLONGE_CLIENT_ID,
+                "client_secret": CHALLONGE_CLIENT_SECRET,
+                "scope": CHALLONGE_SCOPE,
+            },
+        ) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                print(f"challonge token -> {resp.status}: {body[:200]}")
+                return None, (f"Challonge refused the credentials "
+                              f"({challonge_error(body, resp.status)}).")
+            payload = json.loads(body)
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        print(f"challonge token -> {type(e).__name__}: {e}")
+        return None, f"Couldn't reach Challonge ({type(e).__name__})."
+    except ValueError:
+        return None, "Challonge sent back a token response that isn't JSON."
+
+    token = payload.get("access_token")
+    if not token:
+        return None, "Challonge returned no access token."
+
+    lifetime = payload.get("expires_in")
+    lifetime = lifetime if isinstance(lifetime, int) else 3600
+    _challonge_token["value"] = token
+    _challonge_token["expires"] = (
+        now_epoch() + max(lifetime - CHALLONGE_TOKEN_MARGIN, 60)
+    )
+    return token, None
 
 def challonge_error(body, status):
-    """Challonge reports failures as {"errors": [...]}; surface them."""
+    """Surface whatever Challonge said. v2 reports JSON:API `errors`."""
     try:
         parsed = json.loads(body)
     except (ValueError, TypeError):
-        parsed = None
+        return f"HTTP {status}"
+
     if isinstance(parsed, dict):
         errors = parsed.get("errors")
         if isinstance(errors, list) and errors:
-            return "; ".join(str(error) for error in errors)
+            messages = []
+            for error in errors:
+                if isinstance(error, dict):
+                    messages.append(str(error.get("detail")
+                                        or error.get("title") or error))
+                else:
+                    messages.append(str(error))
+            return "; ".join(messages)
+        # The token endpoint uses the plain OAuth shape instead.
+        described = parsed.get("error_description") or parsed.get("error")
+        if described:
+            return str(described)
     return f"HTTP {status}"
 
-async def challonge_request(path, *, method="GET", payload=None, params=None):
+async def challonge_request(path, *, method="GET", payload=None, params=None,
+                            _retried=False):
     """Call Challonge. Returns (True, data) or (False, message).
 
     request_json drops the response body on failure, and a bracket call that
     fails is something the host has to read, so this one keeps it.
     """
-    if not CHALLONGE_API_KEY:
-        return False, "`CHALLONGE_API_KEY` isn't set on the server."
+    token, error = await challonge_token()
+    if token is None:
+        return False, error
 
     url = f"{CHALLONGE_API}/{path}"
-    query = {"api_key": CHALLONGE_API_KEY, **(params or {})}
+    headers = {**CHALLONGE_HEADERS, "Authorization": f"Bearer {token}"}
     try:
         session = await get_session()
         async with session.request(
-            method, url, params=query, json=payload,
+            method, url, headers=headers, params=params,
+            data=(json.dumps(payload) if payload is not None else None),
         ) as resp:
             body = await resp.text()
+
+            # A token can be revoked before it expires; take one more run at
+            # it with a fresh one before reporting a failure.
+            if resp.status == 401 and not _retried:
+                _challonge_token["value"] = None
+                renewed, error = await challonge_token(renew=True)
+                if renewed is None:
+                    return False, error
+                return await challonge_request(
+                    path, method=method, payload=payload, params=params,
+                    _retried=True,
+                )
+
             if resp.status >= 400:
                 print(f"challonge {method} {path} -> "
-                      f"{resp.status}: {body[:200]}")
+                      f"{resp.status}: {body[:300]}")
                 return False, challonge_error(body, resp.status)
             if not body.strip():
                 return True, None
             try:
                 return True, json.loads(body)
             except ValueError:
-                return False, f"Challonge sent back non-JSON (HTTP {resp.status})."
+                return False, (f"Challonge sent back non-JSON "
+                               f"(HTTP {resp.status}).")
     except (asyncio.TimeoutError, aiohttp.ClientError) as e:
         print(f"challonge {method} {path} -> {type(e).__name__}: {e}")
         return False, f"Couldn't reach Challonge ({type(e).__name__})."
+
+def challonge_attributes(resource):
+    """The attributes off one JSON:API resource object."""
+    if not isinstance(resource, dict):
+        return {}
+    attributes = resource.get("attributes")
+    return attributes if isinstance(attributes, dict) else {}
 
 async def challonge_create_tournament(record):
     """Create the bracket. Participants are added later, at check-in close.
@@ -8129,37 +8234,43 @@ async def challonge_create_tournament(record):
     field is only pushed once check-in has settled who actually turned up.
     """
     starts = datetime.fromtimestamp(record["MatchesStart"], timezone.utc)
-    payload = {"tournament": {
-        "name": record["Name"],
-        "url": record["Id"],
-        "tournament_type": CHALLONGE_FORMATS[record["Format"]],
-        "open_signup": False,
-        # Only meaningful for single elimination -- Challonge rejects it
-        # against a double-elimination bracket.
-        "hold_third_place_match": record["Format"] == "single",
-        # The pool is secret until check-in and this page is public from the
-        # moment it exists, so nothing about maps goes in the description.
-        "description": (f"Best of {record['BestOf']}. Matches start "
-                        f"{starts:%d/%m/%Y %H:%M} UTC."),
+    payload = {"data": {
+        "type": "tournaments",
+        "attributes": {
+            "name": record["Name"],
+            "url": record["Id"],
+            "tournament_type": CHALLONGE_FORMATS[record["Format"]],
+            "open_signup": False,
+            # The pool is secret until check-in and this page is public from
+            # the moment it exists, so no maps go in the description.
+            "description": (f"Best of {record['BestOf']}. Matches start "
+                            f"{starts:%d/%m/%Y %H:%M} UTC."),
+            "match_options": {
+                "hold_third_place_match": record["Format"] == "single",
+            },
+        },
     }}
     ok, data = await challonge_request(
-        "tournaments.json", method="POST", payload=payload
+        "application/tournaments.json", method="POST", payload=payload
     )
     if not ok:
         return False, data
 
-    tournament = (data or {}).get("tournament") or {}
-    if not tournament.get("id"):
+    resource = (data or {}).get("data") or {}
+    tournament_id = resource.get("id")
+    if not tournament_id:
         return False, "Challonge created it but sent back no tournament id."
+
+    attributes = challonge_attributes(resource)
     return True, {
-        "Id": tournament["id"],
-        "Url": (tournament.get("full_challonge_url")
+        "Id": str(tournament_id),
+        "Url": (attributes.get("full_challonge_url")
                 or f"https://challonge.com/{record['Id']}"),
     }
 
 async def challonge_delete_tournament(challonge_id):
     return await challonge_request(
-        f"tournaments/{challonge_id}.json", method="DELETE"
+        f"application/tournaments/{challonge_id}.json", method="DELETE"
     )
 
 # --- Map pool --------------------------------------------------------------
@@ -9129,38 +9240,79 @@ async def seed_players(players):
     return [player for _wins, player in seeded]
 
 async def challonge_push_field(record, players):
-    """Fill the bracket with the checked-in field, then start it."""
-    payload = {"participants": [
-        {
-            "name": player["Name"],
-            "seed": position,
-            # Carries the Discord ID back on every match, so a Challonge
-            # participant can be resolved without matching on display name.
-            "misc": player["DiscordId"],
-        }
-        for position, player in enumerate(players, 1)
-    ]}
+    """Fill the bracket with the checked-in field, then start it.
+
+    v2.1 registers participants one at a time, so a partial failure is
+    possible; the caller is told which name broke rather than being left to
+    guess from a half-filled bracket.
+    """
+    challonge_id = record["Challonge"]["Id"]
+    by_discord = {}
+
+    for position, player in enumerate(players, 1):
+        payload = {"data": {
+            "type": "Participant",
+            "attributes": {
+                "name": player["Name"],
+                "seed": position,
+                # Carries the Discord ID back on every read, so a participant
+                # resolves without matching on display name.
+                "misc": player["DiscordId"],
+            },
+        }}
+        ok, data = await challonge_request(
+            f"application/tournaments/{challonge_id}/participants.json",
+            method="POST", payload=payload,
+        )
+        if not ok:
+            return False, (f"{data} (while adding **{player['Name']}**, "
+                           f"seed {position} of {len(players)})")
+
+        resource = (data or {}).get("data") or {}
+        if resource.get("id"):
+            by_discord[player["DiscordId"]] = str(resource["id"])
+
+    ok, data = await challonge_request(
+        f"application/tournaments/{challonge_id}/change_state.json",
+        method="PUT",
+        payload={"data": {
+            "type": "TournamentState",
+            "attributes": {"state": "start"},
+        }},
+    )
+    if not ok:
+        return False, f"{data} (the field is in, but it wouldn't start)"
+    return True, by_discord
+
+async def challonge_standings(record):
+    """The bracket's state and its participants. Returns (state, players).
+
+    Two calls rather than one: the include syntax for pulling participants
+    alongside a tournament is the kind of thing that differs per endpoint,
+    and this cannot afford to guess -- it is what decides when a tournament
+    is over.
+    """
     challonge_id = record["Challonge"]["Id"]
     ok, data = await challonge_request(
-        f"tournaments/{challonge_id}/participants/bulk_add.json",
-        method="POST", payload=payload,
+        f"application/tournaments/{challonge_id}.json"
     )
     if not ok:
-        return False, data
+        return None, data
 
-    # Map each Challonge participant back onto the player it came from.
-    by_discord = {}
-    for wrapper in data or []:
-        participant = (wrapper or {}).get("participant") or {}
-        if participant.get("misc") and participant.get("id"):
-            by_discord[str(participant["misc"])] = participant["id"]
+    state = challonge_attributes((data or {}).get("data") or {}).get("state")
 
     ok, data = await challonge_request(
-        f"tournaments/{challonge_id}/start.json", method="POST",
+        f"application/tournaments/{challonge_id}/participants.json"
     )
     if not ok:
-        return False, data
-    return True, by_discord
+        return None, data
+
+    participants = []
+    for resource in (data or {}).get("data") or []:
+        attributes = challonge_attributes(resource)
+        if attributes:
+            participants.append(attributes)
+    return state, participants
 
 async def start_bracket(record):
     """Close check-in and build the bracket from whoever turned up."""
@@ -9548,23 +9700,6 @@ async def crown_winner(record, discord_id):
         return False
 
 # --- Watching the bracket finish -------------------------------------------
-
-async def challonge_standings(record):
-    """The bracket's state and its participants. Returns (state, players)."""
-    ok, data = await challonge_request(
-        f"tournaments/{record['Challonge']['Id']}.json",
-        params={"include_participants": 1},
-    )
-    if not ok:
-        return None, data
-
-    tournament = (data or {}).get("tournament") or {}
-    participants = []
-    for wrapper in tournament.get("participants") or []:
-        participant = (wrapper or {}).get("participant") or {}
-        if participant:
-            participants.append(participant)
-    return tournament.get("state"), participants
 
 def final_standings(participants):
     """Everyone who placed, best first."""
