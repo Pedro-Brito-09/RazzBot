@@ -7874,6 +7874,8 @@ TOURNAMENT_DEFAULTS = {
     # opens. This is also when the map pool is revealed.
     "CheckinMinutes": 60,
 }
+# Stand-alone flags: they take no value, so they must not eat the next token.
+TOURNAMENT_BOOL_FLAGS = ("--private", "--public")
 TOURNAMENT_FLAG_FIELDS = {
     "--format": "Format",
     "--bo": "BestOf",
@@ -8360,14 +8362,23 @@ async def send_privately(ctx, view):
 
 # --- !tournament -----------------------------------------------------------
 
-def split_flags(tokens):
-    """Pull `--key value` pairs out. Returns (positional, flags)."""
+def split_flags(tokens, bool_flags=()):
+    """Pull `--key value` pairs out. Returns (positional, flags).
+
+    Flags named in bool_flags stand alone and take no value, so they don't
+    swallow the token after them.
+    """
     positional, flags = [], {}
     index = 0
     while index < len(tokens):
         token = tokens[index]
         if token.startswith("--"):
-            flags[token.lower()] = (
+            key = token.lower()
+            if key in bool_flags:
+                flags[key] = True
+                index += 1
+                continue
+            flags[key] = (
                 tokens[index + 1] if index + 1 < len(tokens) else None
             )
             index += 2
@@ -8419,6 +8430,8 @@ def tournament_card(record, *, heading=None):
     container.add_item(discord.ui.TextDisplay(
         f"## {heading or '🏆 ' + record['Name']}\n"
         f"-# `{record['Id']}` · {record['Phase']}"
+        + ("  ·  🔒 private — only you can see the channels"
+           if record.get("Private") else "")
     ))
     container.add_item(discord.ui.Separator())
 
@@ -8490,7 +8503,14 @@ async def tournament_create(ctx, tokens):
         ))
         return
 
-    positional, flags = split_flags(tokens)
+    positional, flags = split_flags(tokens, TOURNAMENT_BOOL_FLAGS)
+    # A !dev_ run is a rehearsal by definition, so it builds a category only
+    # the admin can see unless told otherwise. A live run is public unless
+    # --private says so.
+    private = bool(flags.pop("--private", False))
+    public = bool(flags.pop("--public", False))
+    private = private or (on_dev_universe() and not public)
+
     # A quoted name arrives as one token. The two times after it are read
     # greedily, since each may be one token or two.
     if len(positional) < 2:
@@ -8537,6 +8557,7 @@ async def tournament_create(ctx, tokens):
         "Matches": {},
         "Challonge": None,
         "Discord": {},
+        "Private": False,
         "HostChannelId": ctx.channel.id,
         "CreatedAt": now_epoch(),
         # Which phase transitions have already fired, so the scheduler can
@@ -8544,6 +8565,7 @@ async def tournament_create(ctx, tokens):
         "Fired": [],
         **TOURNAMENT_DEFAULTS,
     }
+    record["Private"] = private
     problems.extend(apply_tournament_flags(record, flags))
 
     if register_start is not None and matches_start is not None:
@@ -8583,7 +8605,7 @@ async def tournament_create(ctx, tokens):
             )
         else:
             record["Discord"], space_problems = await create_tournament_space(
-                ctx.guild, record
+                ctx.guild, record, private=private,
             )
 
         status = await save_tournament(record)
@@ -9561,11 +9583,15 @@ def tournament_guild(record):
     except (TypeError, ValueError):
         return None
 
-async def create_tournament_space(guild, record):
+async def create_tournament_space(guild, record, *, private=False):
     """Build the category, its three channels and the two roles.
 
     Returns (space, problems). A partial build is still returned: half a
     category is more useful than none, and the host is told what's missing.
+
+    A private build is hidden from everyone but the admin and the bot. Nobody
+    can register into one, which is the point -- it's for rehearsing the
+    pipeline without an audience.
     """
     space, problems = {"GuildId": str(guild.id)}, []
     me = guild.me
@@ -9596,11 +9622,14 @@ async def create_tournament_space(guild, record):
                         "champion roles.")
 
     everyone = guild.default_role
+    # Each channel restates view_channel rather than inheriting it, so a
+    # private category can't be undone by a channel overwrite re-granting it.
+    visible = not private
     read_only = discord.PermissionOverwrite(
-        view_channel=True, send_messages=False, add_reactions=True,
+        view_channel=visible, send_messages=False, add_reactions=True,
     )
     open_to_all = discord.PermissionOverwrite(
-        view_channel=True, send_messages=True,
+        view_channel=visible, send_messages=visible,
     )
     # Info and registration are the two channels the bot must post in, and
     # denying @everyone would silence it too if its own role has no channel
@@ -9611,9 +9640,24 @@ async def create_tournament_space(guild, record):
     )
     locked = {everyone: read_only, me: speaks}
 
+    # A private build still has to be visible to whoever is running it.
+    if private:
+        host = guild.get_member(ADMIN_USER_ID)
+        if host is not None:
+            watching = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True,
+            )
+            locked[host] = watching
+            open_to_all = {everyone: open_to_all, me: speaks, host: watching}
+        else:
+            open_to_all = {everyone: open_to_all, me: speaks}
+    else:
+        open_to_all = {everyone: open_to_all, me: speaks}
+
     try:
         category = await guild.create_category(
-            record["Name"], reason=f"Tournament {record['Id']}",
+            record["Name"], overwrites=locked,
+            reason=f"Tournament {record['Id']}",
         )
         space["CategoryId"] = str(category.id)
 
@@ -9630,7 +9674,7 @@ async def create_tournament_space(guild, record):
         space["RegistrationChannelId"] = str(registration.id)
 
         chat = await category.create_text_channel(
-            "tournament-chat", overwrites={everyone: open_to_all, me: speaks},
+            "tournament-chat", overwrites=open_to_all,
             topic=f"{record['Name']} — talk here.",
         )
         space["ChatChannelId"] = str(chat.id)
