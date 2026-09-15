@@ -7934,6 +7934,7 @@ TOURNAMENT_USAGE = (
     '**`!tournament create "Name" <register_start> <matches_start>`**\n'
     "-# Times take a Discord timestamp, an epoch, a UTC date, or an offset:\n"
     "-# `1790877600` · `<t:1790877600:F>` · `03/10/2026 20:00` · `+2h`\n"
+    "-# Private by default — `--public` opens the channels to everyone.\n"
     "-# Everything else defaults: `--format single|double` · `--bo 3` · "
     "`--cap 32` · `--min 4` · `--checkin 60`\n\n"
     "**`!tournament`** — where the active one stands\n"
@@ -8705,12 +8706,11 @@ async def tournament_create(ctx, tokens):
         return
 
     positional, flags = split_flags(tokens, TOURNAMENT_BOOL_FLAGS)
-    # A !dev_ run is a rehearsal by definition, so it builds a category only
-    # the admin can see unless told otherwise. A live run is public unless
-    # --private says so.
-    private = bool(flags.pop("--private", False))
+    # Private by default while this is still being shaken out: the category
+    # is visible to the admin and the bot alone. --public opens it up, and is
+    # what a real tournament will want.
     public = bool(flags.pop("--public", False))
-    private = private or (on_dev_universe() and not public)
+    private = bool(flags.pop("--private", False)) or not public
 
     # A quoted name arrives as one token. The two times after it are read
     # greedily, since each may be one token or two.
