@@ -8092,14 +8092,29 @@ async def ensure_tournament_store():
     _tournament_store_ready.add(universe)
     return True, None
 
-def wrap_record(record):
-    return [record]
+def encode_tournament_value(value):
+    """Serialise for storage. See decode_tournament_value for why."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
-def unwrap_record(stored):
-    """A stored record, whether it was wrapped or written bare."""
-    if isinstance(stored, list):
-        stored = stored[0] if stored else None
-    return stored if isinstance(stored, dict) else None
+def decode_tournament_value(stored):
+    """Read a stored value back, tolerating one written structured.
+
+    v2 will not take a structured value at all: an object or an array in the
+    entry body comes back as 400 "Value cannot be null. (Parameter 'value')",
+    confirmed against a data store that definitely exists, and matching
+    https://devforum.roblox.com/t/4734632 . A JSON string it accepts.
+
+    The cost of storing text is that Luau reads a string rather than a table,
+    which is free here -- nothing in the game reads these records, only the
+    bot does. Anything the game must read (match records, later) has to be
+    written through Luau instead, where a real table survives.
+    """
+    if isinstance(stored, str):
+        try:
+            return json.loads(stored)
+        except ValueError:
+            return None
+    return stored
 
 async def update_tournament_entry(key, transform, *, attempts=4):
     """Read-modify-write one entry in the tournament store.
@@ -8120,7 +8135,8 @@ async def update_tournament_entry(key, transform, *, attempts=4):
             if new_value is None:
                 return "skipped", None
             result = await create_entry_resource(
-                key, TOURNAMENTS_DATASTORE, new_value
+                key, TOURNAMENTS_DATASTORE,
+                encode_tournament_value(new_value),
             )
             # A create that fails on a store Open Cloud has never seen is the
             # store's absence, not the payload's fault. Register it from the
@@ -8133,14 +8149,18 @@ async def update_tournament_entry(key, transform, *, attempts=4):
                           f"{reason}")
                     return "bootstrap", None
                 result = await create_entry_resource(
-                    key, TOURNAMENTS_DATASTORE, new_value
+                    key, TOURNAMENTS_DATASTORE,
+                    encode_tournament_value(new_value),
                 )
         else:
-            new_value = transform(decode_entry_value(resource.get("value")))
+            new_value = transform(decode_tournament_value(
+                decode_entry_value(resource.get("value"))
+            ))
             if new_value is None:
                 return "skipped", None
             result = await update_entry_resource(
-                key, TOURNAMENTS_DATASTORE, new_value,
+                key, TOURNAMENTS_DATASTORE,
+                encode_tournament_value(new_value),
                 etag=resource.get("etag"),
             )
 
@@ -8155,8 +8175,9 @@ async def update_tournament_entry(key, transform, *, attempts=4):
     return "conflict", None
 
 async def read_tournament_index():
-    stored = await fetch_entry(TOURNAMENT_INDEX_KEY,
-                               datastore=TOURNAMENTS_DATASTORE)
+    stored = decode_tournament_value(await fetch_entry(
+        TOURNAMENT_INDEX_KEY, datastore=TOURNAMENTS_DATASTORE
+    ))
     return stored if isinstance(stored, list) else []
 
 def index_summary(record):
@@ -8195,10 +8216,10 @@ def normalize_tournament(record):
     return record
 
 async def read_tournament(tournament_id):
-    record = unwrap_record(await fetch_entry(
+    record = decode_tournament_value(await fetch_entry(
         tournament_key(tournament_id), datastore=TOURNAMENTS_DATASTORE
     ))
-    if record is None:
+    if not isinstance(record, dict):
         return None
     return normalize_tournament(record)
 
@@ -8210,7 +8231,7 @@ async def save_tournament(record):
     corrects, rather than an index pointing at a record that isn't there.
     """
     status, _saved = await update_tournament_entry(
-        tournament_key(record["Id"]), lambda _stored: wrap_record(record),
+        tournament_key(record["Id"]), lambda _stored: record,
     )
     if status != "ok":
         return status
@@ -8246,14 +8267,13 @@ async def update_tournament(tournament_id, transform):
     outcome = {"record": None}
 
     def apply(stored):
-        record = unwrap_record(stored)
-        if record is None:
+        if not isinstance(stored, dict):
             return None
-        changed = transform(normalize_tournament(record))
+        changed = transform(normalize_tournament(stored))
         if changed is None:
             return None
         outcome["record"] = changed
-        return wrap_record(changed)
+        return changed
 
     status, _saved = await update_tournament_entry(
         tournament_key(tournament_id), apply
