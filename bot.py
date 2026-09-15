@@ -8029,12 +8029,28 @@ def normalize_tournament(record):
         record.setdefault(field, fallback)
     return record
 
+# Open Cloud's v2 datastore PATCH refuses a bare JSON object as an entry
+# value -- it answers 400 "Value cannot be null. (Parameter 'value')" -- while
+# taking an array of the very same objects without complaint. The bug is
+# Roblox's, and PendingRewards proves the array path works, so a record is
+# stored as a one-element list and unwrapped on the way back out.
+# https://devforum.roblox.com/t/4734632
+def wrap_record(record):
+    return [record]
+
+def unwrap_record(stored):
+    """A stored tournament, whether it was wrapped or written bare."""
+    if isinstance(stored, list):
+        stored = stored[0] if stored else None
+    return stored if isinstance(stored, dict) else None
+
 async def read_tournament(tournament_id):
-    stored = await fetch_entry(tournament_key(tournament_id),
-                               datastore=TOURNAMENTS_DATASTORE)
-    if not isinstance(stored, dict):
+    record = unwrap_record(await fetch_entry(
+        tournament_key(tournament_id), datastore=TOURNAMENTS_DATASTORE
+    ))
+    if record is None:
         return None
-    return normalize_tournament(stored)
+    return normalize_tournament(record)
 
 async def save_tournament(record):
     """Write the record, then bring its index summary into step.
@@ -8045,7 +8061,7 @@ async def save_tournament(record):
     """
     status = await update_entry_with_retry(
         tournament_key(record["Id"]), TOURNAMENTS_DATASTORE,
-        lambda _stored: record, default={},
+        lambda _stored: wrap_record(record), default=[],
     )
     if status != "ok":
         return status
@@ -8821,14 +8837,14 @@ async def update_tournament(tournament_id, transform):
     outcome = {"record": None}
 
     def apply(stored):
-        if not isinstance(stored, dict):
+        record = unwrap_record(stored)
+        if record is None:
             return None
-        record = normalize_tournament(stored)
-        changed = transform(record)
+        changed = transform(normalize_tournament(record))
         if changed is None:
             return None
         outcome["record"] = changed
-        return changed
+        return wrap_record(changed)
 
     status = await update_entry_with_retry(
         tournament_key(tournament_id), TOURNAMENTS_DATASTORE, apply,
