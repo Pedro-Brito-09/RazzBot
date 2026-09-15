@@ -7944,7 +7944,8 @@ TOURNAMENT_USAGE = (
     "**`!tournament pool <5 map ids>`** — set the veto pool\n"
     "**`!tournament pool`** — show it, in DMs\n"
     "**`!tournament pool swap <old> <new>`** — replace one map\n"
-    "**`!tournament cancel`** — call it off\n"
+    "**`!tournament cancel`** — call it off, deleting its channels "
+    "(`--keep` to spare them)\n"
     "**`!tournament cleanup [id]`** — delete a finished one's channels "
     "and roles"
 )
@@ -8846,6 +8847,9 @@ async def tournament_create(ctx, tokens):
             ))
             return
 
+    await dress_tournament_space(record)
+    await save_tournament(record)
+
     await ctx.send(view=tournament_card(record, heading="🏆 Tournament created"))
     if space_problems:
         await ctx.send(view=simple_card(
@@ -8954,13 +8958,17 @@ async def tournament_pool(ctx, tokens):
         heading=f"🗺️ Pool set — {record['Name']}", colour=TOURNAMENT_COLOR,
     ))
 
-async def tournament_cancel(ctx):
+async def tournament_cancel(ctx, tokens=()):
     record = await active_tournament()
     if record is None:
         await ctx.send(view=simple_card(
             "No tournament is running.", colour=discord.Color.greyple(),
         ))
         return
+
+    _positional, flags = split_flags(list(tokens), TOURNAMENT_BOOL_FLAGS
+                                     + ("--keep",))
+    keep = bool(flags.get("--keep"))
 
     async with ctx.typing():
         # A bracket that never started is worth taking off the account; one
@@ -8972,6 +8980,22 @@ async def tournament_cancel(ctx):
             note = "The Challonge bracket was left up as a record."
 
         record["Phase"] = "cancelled"
+
+        # The channels go with it. This throws away whatever was said in
+        # #tournament-chat, so --keep is there for a cancellation that people
+        # were already talking in.
+        if keep:
+            teardown = "-# The channels and roles were left up."
+        else:
+            removed, failed = await delete_tournament_space(record)
+            record["Discord"] = {}
+            teardown = (
+                ("🗑️ Removed " + ", ".join(removed) if removed
+                 else "-# There were no channels to remove.")
+                + ("\n⚠️ Couldn't remove " + ", ".join(failed) if failed
+                   else "")
+            )
+
         status = await save_tournament(record)
 
     if status != "ok":
@@ -8982,7 +9006,7 @@ async def tournament_cancel(ctx):
         return
 
     await ctx.send(view=simple_card(
-        f"**{record['Name']}** is cancelled.\n-# {note}",
+        f"**{record['Name']}** is cancelled.\n-# {note}\n\n{teardown}",
         heading="🏆 Cancelled", colour=discord.Color.red(),
     ))
 
@@ -8999,7 +9023,7 @@ async def admin_tournament(ctx, action: str = None, *arguments: str):
     elif verb == "pool":
         await tournament_pool(ctx, tokens)
     elif verb == "cancel":
-        await tournament_cancel(ctx)
+        await tournament_cancel(ctx, tokens)
     elif verb == "cleanup":
         await tournament_cleanup(ctx, tokens)
     elif not verb:
@@ -9144,9 +9168,14 @@ async def dm_registrants(record, view):
 # --- Player-facing cards ---------------------------------------------------
 
 class TournamentRegisterView(discord.ui.LayoutView):
-    """Registration card. Persistent: signups stay open for days."""
+    """Registration card. Persistent: signups stay open for days.
 
-    def __init__(self, record=None):
+    open_now=False is the same card posted the moment the channels exist,
+    with the button inert until registration actually opens -- so the
+    channel isn't empty while people are waiting for it.
+    """
+
+    def __init__(self, record=None, *, open_now=True):
         super().__init__(timeout=None)
         container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
 
@@ -9181,8 +9210,12 @@ class TournamentRegisterView(discord.ui.LayoutView):
 
         row = discord.ui.ActionRow()
         button = discord.ui.Button(
-            label="Register", style=discord.ButtonStyle.success,
-            emoji="✅", custom_id=REGISTER_BUTTON_ID,
+            label=("Register" if open_now else "Registration not open yet"),
+            style=(discord.ButtonStyle.success if open_now
+                   else discord.ButtonStyle.secondary),
+            emoji="✅" if open_now else "⏳",
+            custom_id=REGISTER_BUTTON_ID,
+            disabled=not open_now,
         )
         button.callback = self.register
         row.add_item(button)
@@ -9393,8 +9426,19 @@ async def open_registration(record):
         return
     record = saved
 
-    await announce_tournament(record, TournamentRegisterView(record),
-                              kind="registration", ping=True)
+    space = tournament_space(record)
+    await delete_space_message(record, "RegistrationChannelId",
+                               space.get("RegistrationMessageId"))
+    posted = await announce_tournament(
+        record, TournamentRegisterView(record), kind="registration", ping=True,
+    )
+    if posted is not None:
+        # Keep pointing at whatever card is live, so a later phase can find it.
+        await update_tournament(record["Id"], lambda stored: {
+            **stored,
+            "Discord": {**(stored.get("Discord") or {}),
+                        "RegistrationMessageId": str(posted.id)},
+        })
     if not record["Pool"]:
         await tell_host(
             record,
@@ -9943,6 +9987,122 @@ async def crown_winner(record, discord_id):
     except discord.HTTPException:
         return False
 
+def tournament_info_card(record):
+    """The player-facing summary pinned in #info at creation.
+
+    Deliberately not tournament_card: that one is the host's view and carries
+    setup prompts, and this is read by everyone.
+    """
+    container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## 🏆 {record['Name']}\n"
+        f"-# {CHALLONGE_FORMATS[record['Format']]} · Bo{record['BestOf']}"
+        + (f" · capped at {record['Cap']}" if record["Cap"] else "")
+    ))
+    container.add_item(discord.ui.Separator())
+
+    checkin_at = checkin_opens_at(record)
+    container.add_item(discord.ui.TextDisplay(
+        f"**Registration opens** {when(record['RegisterStart'])} "
+        f"({when(record['RegisterStart'], 'R')})\n"
+        f"**Registration closes · check-in opens** {when(checkin_at)}\n"
+        f"**Matches start** {when(record['MatchesStart'])}"
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(
+        f"**How it runs**\n"
+        f"· Register in <#{tournament_space(record).get('RegistrationChannelId')}> "
+        f"— you need a linked Roblox account (`/link`).\n"
+        f"· **Check in** once registration closes, or you're not in the "
+        f"bracket. I'll DM you when it opens.\n"
+        f"· The **{TOURNAMENT_POOL_SIZE}-map pool** is revealed at check-in. "
+        f"Each match vetoes it down to one map.\n"
+        f"· Seeding is by career wins."
+    ))
+
+    if record["Challonge"]:
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            f"🔗 **Bracket** {record['Challonge']['Url']}"
+        ))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+async def post_to_space(record, channel_field, view):
+    """Post into one of the tournament's channels. Returns the message id."""
+    guild = tournament_guild(record)
+    if guild is None:
+        return None
+    channel = space_object(record, guild, channel_field)
+    if channel is None:
+        return None
+    try:
+        message = await channel.send(view=view, allowed_mentions=SILENT)
+    except discord.HTTPException as error:
+        print(f"tournament {record['Id']}: couldn't post to "
+              f"{channel_field} -- {error}")
+        return None
+    return str(message.id)
+
+async def delete_space_message(record, channel_field, message_id):
+    """Remove one of the bot's own posts. Quietly does nothing on a miss."""
+    guild = tournament_guild(record)
+    if guild is None or not message_id:
+        return
+    channel = space_object(record, guild, channel_field)
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(int(message_id))
+        await message.delete()
+    except (discord.HTTPException, ValueError, TypeError):
+        pass
+
+async def dress_tournament_space(record):
+    """Fill the new channels, so neither one opens empty.
+
+    #info gets the summary that stands for the whole tournament, and
+    #registration gets the card that becomes the live signup once it opens.
+    """
+    space = record.get("Discord") or {}
+    if not space.get("CategoryId"):
+        return
+
+    info_id = await post_to_space(
+        record, "InfoChannelId", tournament_info_card(record)
+    )
+    if info_id:
+        space["InfoMessageId"] = info_id
+
+    waiting_id = await post_to_space(
+        record, "RegistrationChannelId",
+        TournamentRegisterView(record, open_now=False),
+    )
+    if waiting_id:
+        space["RegistrationMessageId"] = waiting_id
+
+async def delete_tournament_space(record):
+    """Delete the category, its channels and its roles. (removed, failed)."""
+    guild = tournament_guild(record)
+    if guild is None:
+        return [], []
+
+    removed, failed = [], []
+    # Channels before the category that holds them, roles last.
+    for field in ("InfoChannelId", "RegistrationChannelId", "ChatChannelId",
+                  "CategoryId", "PlayerRoleId", "WinnerRoleId"):
+        target = space_object(record, guild, field)
+        if target is None:
+            continue
+        try:
+            await target.delete(reason=f"Tournament {record['Id']} removed")
+            removed.append(f"`{target.name}`")
+        except discord.HTTPException:
+            failed.append(f"`{target.name}`")
+    return removed, failed
+
 # --- Watching the bracket finish -------------------------------------------
 
 def final_standings(participants):
@@ -10058,21 +10218,8 @@ async def tournament_cleanup(ctx, tokens):
         ))
         return
 
-    removed, failed = [], []
     async with ctx.typing():
-        # Channels first, then the category they sat in.
-        for field in ("InfoChannelId", "RegistrationChannelId",
-                      "ChatChannelId", "CategoryId", "PlayerRoleId",
-                      "WinnerRoleId"):
-            target = space_object(record, guild, field)
-            if target is None:
-                continue
-            try:
-                await target.delete(reason=f"Tournament {record['Id']} cleanup")
-                removed.append(f"`{target.name}`")
-            except discord.HTTPException:
-                failed.append(f"`{target.name}`")
-
+        removed, failed = await delete_tournament_space(record)
         record["Discord"] = {}
         await save_tournament(record)
 
