@@ -8084,8 +8084,11 @@ async def active_tournament():
 
 CHALLONGE_API = "https://api.challonge.com/v2.1"
 CHALLONGE_TOKEN_URL = "https://api.challonge.com/oauth/token"
-# Full access to every tournament connected to the app. Only the
-# client_credentials flow can be granted it.
+# Full access to every tournament connected to the app, and the only scope
+# the client_credentials flow can be granted. It pairs with the /application/
+# endpoints: the user-scoped ones want tournaments:write, which this grant
+# does not carry, and which would mean an interactive authorization_code
+# flow to obtain.
 CHALLONGE_SCOPE = "application:manage"
 # Tokens last a week. Renew a little early rather than finding out on the
 # call that builds the bracket.
@@ -8263,7 +8266,7 @@ async def challonge_create_tournament(record):
         },
     }}
     ok, data = await challonge_request(
-        "tournaments.json", method="POST", payload=payload
+        "application/tournaments", method="POST", payload=payload
     )
     if not ok:
         return False, data
@@ -8282,7 +8285,7 @@ async def challonge_create_tournament(record):
 
 async def challonge_delete_tournament(challonge_id):
     return await challonge_request(
-        f"tournaments/{challonge_id}.json", method="DELETE"
+        f"application/tournaments/{challonge_id}", method="DELETE"
     )
 
 # --- Map pool --------------------------------------------------------------
@@ -9273,7 +9276,7 @@ async def challonge_push_field(record, players):
             },
         }}
         ok, data = await challonge_request(
-            f"tournaments/{challonge_id}/participants.json",
+            f"application/tournaments/{challonge_id}/participants",
             method="POST", payload=payload,
         )
         if not ok:
@@ -9285,7 +9288,7 @@ async def challonge_push_field(record, players):
             by_discord[player["DiscordId"]] = str(resource["id"])
 
     ok, data = await challonge_request(
-        f"tournaments/{challonge_id}/change_state.json",
+        f"application/tournaments/{challonge_id}/change_state",
         method="PUT",
         payload={"data": {
             "type": "TournamentState",
@@ -9306,7 +9309,7 @@ async def challonge_standings(record):
     """
     challonge_id = record["Challonge"]["Id"]
     ok, data = await challonge_request(
-        f"tournaments/{challonge_id}.json"
+        f"application/tournaments/{challonge_id}"
     )
     if not ok:
         return None, data
@@ -9314,7 +9317,7 @@ async def challonge_standings(record):
     state = challonge_attributes((data or {}).get("data") or {}).get("state")
 
     ok, data = await challonge_request(
-        f"tournaments/{challonge_id}/participants.json"
+        f"application/tournaments/{challonge_id}/participants"
     )
     if not ok:
         return None, data
