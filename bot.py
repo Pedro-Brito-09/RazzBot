@@ -7888,9 +7888,10 @@ CHALLONGE_FORMATS = {
 
 TOURNAMENT_USAGE = (
     '**`!tournament create "Name" <register_start> <matches_start>`**\n'
-    "-# Both times are `DD/MM/YYYY HH:MM`, UTC. Everything else defaults:\n"
-    "-# `--format single|double` · `--bo 3` · `--cap 32` · `--min 4` · "
-    "`--checkin 60`\n\n"
+    "-# Times take a Discord timestamp, an epoch, a UTC date, or an offset:\n"
+    "-# `1790877600` · `<t:1790877600:F>` · `03/10/2026 20:00` · `+2h`\n"
+    "-# Everything else defaults: `--format single|double` · `--bo 3` · "
+    "`--cap 32` · `--min 4` · `--checkin 60`\n\n"
     "**`!tournament`** — where the active one stands\n"
     "**`!tournament pool <5 map ids>`** — set the veto pool\n"
     "**`!tournament pool`** — show it, in DMs\n"
@@ -7900,6 +7901,23 @@ TOURNAMENT_USAGE = (
 
 def tournament_key(tournament_id):
     return f"Tournament_{tournament_id}"
+
+# Every way a tournament time can be written. Epoch seconds are the point:
+# Discord's own timestamp pickers hand one over, so the host picks a time in
+# their own zone and pastes the result instead of converting to UTC by hand.
+TOURNAMENT_TIME_HELP = (
+    "`1790877600` · `<t:1790877600:F>` · `03/10/2026 20:00` (UTC) · "
+    "`03/10/2026` (midnight UTC) · `+2h`"
+)
+# Anything outside these is a typo rather than a date. The usual culprit is
+# epoch milliseconds, which land a thousand times too far out.
+EPOCH_FLOOR = 1_577_836_800     # 01/01/2020
+EPOCH_CEILING = 4_102_444_800   # 01/01/2100
+# `<t:1790877600:F>`, as pasted straight out of Discord.
+DISCORD_TIMESTAMP = re.compile(r"^<t:(\d+)(?::[a-zA-Z])?>$")
+# `+90m`, `+2h`, `+3d` -- mostly for exercising a whole tournament on !dev_.
+RELATIVE_TIME = re.compile(r"^\+(\d+)([mhd])$", re.IGNORECASE)
+RELATIVE_UNITS = {"m": 60, "h": 3600, "d": 86400}
 
 def parse_tournament_time(text):
     """`DD/MM/YYYY HH:MM` read as UTC -> epoch seconds, or None.
@@ -7913,6 +7931,49 @@ def parse_tournament_time(text):
     except (ValueError, AttributeError):
         return None
     return int(moment.replace(tzinfo=timezone.utc).timestamp())
+
+def parse_epoch_token(text):
+    """A one-token time: epoch seconds, a pasted `<t:…>`, `+2h`, or a date."""
+    text = text.strip()
+
+    pasted = DISCORD_TIMESTAMP.match(text)
+    if pasted:
+        text = pasted.group(1)
+
+    relative = RELATIVE_TIME.match(text)
+    if relative:
+        unit = RELATIVE_UNITS[relative.group(2).lower()]
+        return now_epoch() + int(relative.group(1)) * unit
+
+    if text.isdigit():
+        value = int(text)
+        return value if EPOCH_FLOOR <= value <= EPOCH_CEILING else None
+
+    # A bare date means midnight UTC that day.
+    day = parse_cup_date(text)
+    if day is None:
+        return None
+    return int(datetime(day.year, day.month, day.day,
+                        tzinfo=timezone.utc).timestamp())
+
+def take_time(tokens, index):
+    """Read one time argument. Returns (epoch or None, tokens consumed).
+
+    Times are variable width -- an epoch is one token, `DD/MM/YYYY HH:MM` is
+    two -- so arguments are taken greedily rather than counted up front. The
+    two-token form is tried first, otherwise `01/10/2026 18:00` would read as
+    midnight with a stray `18:00` left over.
+    """
+    if index >= len(tokens):
+        return None, 0
+    if index + 1 < len(tokens):
+        paired = parse_tournament_time(f"{tokens[index]} {tokens[index + 1]}")
+        if paired is not None:
+            return paired, 2
+    return parse_epoch_token(tokens[index]), 1
+
+def looks_like_milliseconds(text):
+    return text.strip().isdigit() and int(text.strip()) > EPOCH_CEILING
 
 def now_epoch():
     return int(datetime.now(timezone.utc).timestamp())
@@ -8287,26 +8348,38 @@ async def tournament_create(ctx, tokens):
         return
 
     positional, flags = split_flags(tokens)
-    # A quoted name arrives as one token; each timestamp is two.
-    if len(positional) != 5:
+    # A quoted name arrives as one token. The two times after it are read
+    # greedily, since each may be one token or two.
+    if len(positional) < 2:
         await ctx.send(view=simple_card(
             TOURNAMENT_USAGE, heading="🏆 Tournament",
         ))
         return
 
     name = positional[0].strip()
-    register_start = parse_tournament_time(f"{positional[1]} {positional[2]}")
-    matches_start = parse_tournament_time(f"{positional[3]} {positional[4]}")
+    register_start, used = take_time(positional, 1)
+    matches_start, used_again = take_time(positional, 1 + used)
+    leftover = positional[1 + used + used_again:]
 
     problems = []
     if not name:
         problems.append("The name can't be empty.")
-    if register_start is None:
-        problems.append(f"`{positional[1]} {positional[2]}` isn't a "
-                        f"`DD/MM/YYYY HH:MM` time.")
-    if matches_start is None:
-        problems.append(f"`{positional[3]} {positional[4]}` isn't a "
-                        f"`DD/MM/YYYY HH:MM` time.")
+    for label, value, at in (
+        ("registration opens", register_start, 1),
+        ("matches start", matches_start, 1 + used),
+    ):
+        if value is not None:
+            continue
+        given = positional[at] if at < len(positional) else ""
+        hint = ("That looks like epoch **milliseconds** — drop the last three "
+                "digits." if looks_like_milliseconds(given)
+                else f"Write it as one of: {TOURNAMENT_TIME_HELP}")
+        problems.append(
+            f"Couldn't read when **{label}**"
+            + (f" from `{given}`. " if given else ". ") + hint
+        )
+    if leftover:
+        problems.append(f"Didn't expect `{' '.join(leftover)}` on the end.")
 
     record = {
         "Id": slugify_tournament(name),
