@@ -236,6 +236,17 @@ except (TypeError, ValueError):
 # Daily Cup rollover (09:00 UTC, matching cup_day_today()).
 DAILY_CUP_CHANNEL_ID = os.getenv("DAILY_CUP_CHANNEL_ID")
 DAILY_CUP_ROLE_ID = os.getenv("DAILY_CUP_ROLE_ID")
+# Channel for tournament announcements: registration, check-in and results.
+TOURNAMENT_CHANNEL_ID = os.getenv("TOURNAMENT_CHANNEL_ID")
+# Pinged when registration opens and again when check-in starts.
+TOURNAMENT_ROLE_ID = os.getenv("TOURNAMENT_ROLE_ID")
+# Challonge owns the bracket -- seeding, byes and advancement. The bot creates
+# the tournament there, fills it once check-in closes, and pushes results back.
+# Bracket logic is fiddly and already solved; more to the point, a host can fix
+# a DQ or a reseed in Challonge's own UI at 2am without the bot growing an
+# admin panel for it.
+CHALLONGE_USERNAME = os.getenv("CHALLONGE_USERNAME")
+CHALLONGE_API_KEY = os.getenv("CHALLONGE_API_KEY")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -7805,6 +7816,699 @@ async def test_submissions_warning(
 
     if posted.id != ctx.channel.id:
         await ctx.send(f"Posted to {posted.mention}.", allowed_mentions=SILENT)
+
+# --- Tournaments -----------------------------------------------------------
+# Three owners, and only the middle one lives here: Challonge holds the
+# bracket, the game runs the matches, and the bot covers everything in
+# between -- registration, check-in, the map veto, and the handoff into a
+# match. Nothing here tries to seed or advance a bracket itself.
+
+TOURNAMENTS_DATASTORE = "Tournaments"
+# One small summary per tournament, so the scheduler can tell what is due
+# without loading every record it has ever written.
+TOURNAMENT_INDEX_KEY = "Index"
+# Maps in a pool. Both formats spend exactly four bans, so one always
+# survives: 1v1 is two players banning twice, duos are four banning once.
+TOURNAMENT_POOL_SIZE = 5
+# draft        -- created, nothing announced yet
+# registration -- signups open
+# checkin      -- registration closed, check-in open, pool revealed
+# live         -- bracket started, matches running
+TOURNAMENT_PHASES = ("draft", "registration", "checkin", "live",
+                     "done", "cancelled")
+# Phases the scheduler still has work to do in.
+TOURNAMENT_OPEN_PHASES = ("draft", "registration", "checkin", "live")
+TOURNAMENT_DEFAULTS = {
+    "Format": "single",
+    "BestOf": 3,
+    # No entry cap by default; a number caps registration.
+    "Cap": None,
+    # Below this at check-in close the bracket is cancelled rather than built.
+    # An unattended tournament that quietly makes a three-person bracket is a
+    # worse outcome than one that says it fell through.
+    "MinPlayers": 4,
+    # Minutes before matches_start that registration closes and check-in
+    # opens. This is also when the map pool is revealed.
+    "CheckinMinutes": 60,
+}
+TOURNAMENT_FLAG_FIELDS = {
+    "--format": "Format",
+    "--bo": "BestOf",
+    "--cap": "Cap",
+    "--min": "MinPlayers",
+    "--checkin": "CheckinMinutes",
+}
+TOURNAMENT_COLOR = discord.Color(0xE67E22)
+
+CHALLONGE_API = "https://api.challonge.com/v1"
+CHALLONGE_FORMATS = {
+    "single": "single elimination",
+    "double": "double elimination",
+}
+
+TOURNAMENT_USAGE = (
+    '**`!tournament create "Name" <register_start> <matches_start>`**\n'
+    "-# Both times are `DD/MM/YYYY HH:MM`, UTC. Everything else defaults:\n"
+    "-# `--format single|double` · `--bo 3` · `--cap 32` · `--min 4` · "
+    "`--checkin 60`\n\n"
+    "**`!tournament`** — where the active one stands\n"
+    "**`!tournament pool <5 map ids>`** — set the veto pool\n"
+    "**`!tournament pool`** — show it, in DMs\n"
+    "**`!tournament pool swap <old> <new>`** — replace one map\n"
+    "**`!tournament cancel`** — call it off"
+)
+
+def tournament_key(tournament_id):
+    return f"Tournament_{tournament_id}"
+
+def parse_tournament_time(text):
+    """`DD/MM/YYYY HH:MM` read as UTC -> epoch seconds, or None.
+
+    UTC because the daily cup already runs on it, and because every time the
+    bot prints goes back out as a Discord timestamp, which each viewer sees
+    in their own zone regardless.
+    """
+    try:
+        moment = datetime.strptime(text.strip(), "%d/%m/%Y %H:%M")
+    except (ValueError, AttributeError):
+        return None
+    return int(moment.replace(tzinfo=timezone.utc).timestamp())
+
+def now_epoch():
+    return int(datetime.now(timezone.utc).timestamp())
+
+def when(epoch, style="F"):
+    """A Discord timestamp, so nobody has to convert a timezone by hand."""
+    return f"<t:{int(epoch)}:{style}>"
+
+def slugify_tournament(name):
+    """A Challonge URL slug. Must be unique per account, so it gets a tail."""
+    base = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:24]
+    return f"{base or 'tournament'}_{secrets.token_hex(2)}"
+
+def checkin_opens_at(record):
+    """When registration closes, check-in opens and the pool is revealed."""
+    return record["MatchesStart"] - record["CheckinMinutes"] * 60
+
+# --- Tournament storage ----------------------------------------------------
+# The index is a list of small summaries; each tournament's full record lives
+# under its own key. One tournament's players and matches never have to be
+# read to find out whether another one is due.
+
+async def read_tournament_index():
+    stored = await fetch_entry(TOURNAMENT_INDEX_KEY,
+                               datastore=TOURNAMENTS_DATASTORE)
+    return stored if isinstance(stored, list) else []
+
+def index_summary(record):
+    """The slice of a tournament the scheduler needs before loading it."""
+    return {
+        "Id": record["Id"],
+        "Name": record["Name"],
+        "Phase": record["Phase"],
+        "MatchesStart": record["MatchesStart"],
+    }
+
+# Lua has one table type, so an empty dict written here comes back from the
+# datastore as an empty list. Every collection on a record gets coerced back
+# to the shape the code expects rather than guarded at each use.
+TOURNAMENT_LIST_FIELDS = ("Pool", "Players", "CheckedIn", "Fired")
+TOURNAMENT_DICT_FIELDS = ("Matches",)
+
+def normalize_tournament(record):
+    for field in TOURNAMENT_LIST_FIELDS:
+        if not isinstance(record.get(field), list):
+            record[field] = []
+    for field in TOURNAMENT_DICT_FIELDS:
+        if not isinstance(record.get(field), dict):
+            record[field] = {}
+    for field, fallback in TOURNAMENT_DEFAULTS.items():
+        record.setdefault(field, fallback)
+    return record
+
+async def read_tournament(tournament_id):
+    stored = await fetch_entry(tournament_key(tournament_id),
+                               datastore=TOURNAMENTS_DATASTORE)
+    if not isinstance(stored, dict):
+        return None
+    return normalize_tournament(stored)
+
+async def save_tournament(record):
+    """Write the record, then bring its index summary into step.
+
+    The index is a cache of the records, so it is always written second: a
+    crash between the two leaves a stale summary, which the next phase change
+    corrects, rather than an index pointing at a record that isn't there.
+    """
+    status = await update_entry_with_retry(
+        tournament_key(record["Id"]), TOURNAMENTS_DATASTORE,
+        lambda _stored: record, default={},
+    )
+    if status != "ok":
+        return status
+
+    def transform(stored):
+        entries = stored if isinstance(stored, list) else []
+        summary = index_summary(record)
+        for position, entry in enumerate(entries):
+            if isinstance(entry, dict) and entry.get("Id") == record["Id"]:
+                entries[position] = summary
+                return entries
+        return entries + [summary]
+
+    return await update_entry_with_retry(
+        TOURNAMENT_INDEX_KEY, TOURNAMENTS_DATASTORE, transform, default=[],
+    )
+
+async def active_tournament():
+    """The one tournament still running, or None.
+
+    Only one runs at a time on purpose -- check-in, the veto and the match
+    pipeline all address "your match" without qualification, and two live
+    tournaments would make that ambiguous in every DM the bot sends.
+    """
+    for entry in reversed(await read_tournament_index()):
+        if (isinstance(entry, dict)
+                and entry.get("Phase") in TOURNAMENT_OPEN_PHASES):
+            return await read_tournament(entry["Id"])
+    return None
+
+# --- Challonge -------------------------------------------------------------
+
+def challonge_error(body, status):
+    """Challonge reports failures as {"errors": [...]}; surface them."""
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        errors = parsed.get("errors")
+        if isinstance(errors, list) and errors:
+            return "; ".join(str(error) for error in errors)
+    return f"HTTP {status}"
+
+async def challonge_request(path, *, method="GET", payload=None):
+    """Call Challonge. Returns (True, data) or (False, message).
+
+    request_json drops the response body on failure, and a bracket call that
+    fails is something the host has to read, so this one keeps it.
+    """
+    if not CHALLONGE_API_KEY:
+        return False, "`CHALLONGE_API_KEY` isn't set on the server."
+
+    url = f"{CHALLONGE_API}/{path}"
+    try:
+        session = await get_session()
+        async with session.request(
+            method, url, params={"api_key": CHALLONGE_API_KEY}, json=payload,
+        ) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                print(f"challonge {method} {path} -> "
+                      f"{resp.status}: {body[:200]}")
+                return False, challonge_error(body, resp.status)
+            if not body.strip():
+                return True, None
+            try:
+                return True, json.loads(body)
+            except ValueError:
+                return False, f"Challonge sent back non-JSON (HTTP {resp.status})."
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        print(f"challonge {method} {path} -> {type(e).__name__}: {e}")
+        return False, f"Couldn't reach Challonge ({type(e).__name__})."
+
+async def challonge_create_tournament(record):
+    """Create the bracket. Participants are added later, at check-in close.
+
+    Creating it now is what gives the registration announcement a link to
+    share; filling it now would turn every no-show into a dead slot, so the
+    field is only pushed once check-in has settled who actually turned up.
+    """
+    starts = datetime.fromtimestamp(record["MatchesStart"], timezone.utc)
+    payload = {"tournament": {
+        "name": record["Name"],
+        "url": record["Id"],
+        "tournament_type": CHALLONGE_FORMATS[record["Format"]],
+        "open_signup": False,
+        # Only meaningful for single elimination -- Challonge rejects it
+        # against a double-elimination bracket.
+        "hold_third_place_match": record["Format"] == "single",
+        # The pool is secret until check-in and this page is public from the
+        # moment it exists, so nothing about maps goes in the description.
+        "description": (f"Best of {record['BestOf']}. Matches start "
+                        f"{starts:%d/%m/%Y %H:%M} UTC."),
+    }}
+    ok, data = await challonge_request(
+        "tournaments.json", method="POST", payload=payload
+    )
+    if not ok:
+        return False, data
+
+    tournament = (data or {}).get("tournament") or {}
+    if not tournament.get("id"):
+        return False, "Challonge created it but sent back no tournament id."
+    return True, {
+        "Id": tournament["id"],
+        "Url": (tournament.get("full_challonge_url")
+                or f"https://challonge.com/{record['Id']}"),
+    }
+
+async def challonge_delete_tournament(challonge_id):
+    return await challonge_request(
+        f"tournaments/{challonge_id}.json", method="DELETE"
+    )
+
+# --- Map pool --------------------------------------------------------------
+
+async def validate_pool(ids):
+    """Check map IDs against the community index.
+
+    Returns (maps, problems). A pool is only ever set by hand and stays
+    secret until check-in, so nobody else is going to catch a bad ID first --
+    worth being noisy. Problems starting with `-#` are warnings, not refusals.
+    """
+    problems = []
+    if len(ids) != TOURNAMENT_POOL_SIZE:
+        problems.append(f"A pool is exactly **{TOURNAMENT_POOL_SIZE}** maps — "
+                        f"got {len(ids)}.")
+    if len(set(ids)) != len(ids):
+        problems.append("The same map is in there more than once.")
+
+    maps_by_id = await get_community_maps() or {}
+    resolved = []
+    for map_id in ids:
+        entry = maps_by_id.get(map_id)
+        if entry is None:
+            problems.append(f"No community map with ID `{map_id}`.")
+            continue
+        resolved.append({
+            "Id": map_id,
+            "Name": entry.get("Name") or "Unnamed Map",
+            "Creator": entry.get("Creator"),
+        })
+
+    # Soft warning, not a refusal: whoever ground today's cup walks in with a
+    # real edge on its map, but the host may well want it in there anyway.
+    current_map_id = await resolve_current_map_id()
+    if current_map_id is not None and current_map_id in ids:
+        problems.append(
+            f"-# ⚠️ `{current_map_id}` is the current Daily Cup map — anyone "
+            f"who played today's cup has had a head start on it."
+        )
+    return resolved, problems
+
+def pool_lines(pool):
+    lines = []
+    for position, entry in enumerate(pool, 1):
+        row = f"`{position}.` **{entry['Name']}** · `{entry['Id']}`"
+        if entry.get("Creator"):
+            row += f" · by {entry['Creator']}"
+        lines.append(row)
+    return "\n".join(lines)
+
+async def send_privately(ctx, view):
+    """Reply in DMs, because the channel this was typed in may be public.
+
+    The pool is secret until check-in, so the reply that prints it can't go
+    wherever the command happened to land. Same treatment !help already gives
+    the admin command list.
+    """
+    try:
+        await ctx.author.send(view=view)
+    except discord.HTTPException:
+        await ctx.send(view=simple_card(
+            "Your DMs are closed, and the pool is secret until check-in — so "
+            "I'm not printing it here. Open DMs and run it again.",
+            colour=discord.Color.red(),
+        ))
+        return
+    if ctx.guild is not None:
+        await ctx.send(view=simple_card(
+            "📬 Sent to your DMs — the pool stays out of public channels.",
+            colour=discord.Color.greyple(),
+        ))
+
+# --- !tournament -----------------------------------------------------------
+
+def split_flags(tokens):
+    """Pull `--key value` pairs out. Returns (positional, flags)."""
+    positional, flags = [], {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("--"):
+            flags[token.lower()] = (
+                tokens[index + 1] if index + 1 < len(tokens) else None
+            )
+            index += 2
+            continue
+        positional.append(token)
+        index += 1
+    return positional, flags
+
+def apply_tournament_flags(record, flags):
+    """Fold --flags into a record. Returns a list of problems."""
+    problems = []
+    for flag, value in flags.items():
+        field = TOURNAMENT_FLAG_FIELDS.get(flag)
+        if field is None:
+            problems.append(f"`{flag}` isn't an option.")
+            continue
+        if value is None:
+            problems.append(f"`{flag}` needs a value.")
+            continue
+
+        if field == "Format":
+            wanted = value.strip().lower()
+            if wanted not in CHALLONGE_FORMATS:
+                problems.append(
+                    f"`--format` is `single` or `double`, not `{value}`."
+                )
+                continue
+            record["Format"] = wanted
+            continue
+
+        try:
+            number = int(value)
+        except ValueError:
+            problems.append(f"`{flag}` takes a number, not `{value}`.")
+            continue
+        if number < 1:
+            problems.append(f"`{flag}` has to be at least 1.")
+            continue
+        record[field] = number
+    return problems
+
+def tournament_card(record, *, heading=None):
+    """The host's view of where a tournament stands.
+
+    Never prints the pool: this reply lands wherever the command was typed,
+    and the maps stay secret until check-in.
+    """
+    container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## {heading or '🏆 ' + record['Name']}\n"
+        f"-# `{record['Id']}` · {record['Phase']}"
+    ))
+    container.add_item(discord.ui.Separator())
+
+    checkin_at = checkin_opens_at(record)
+    container.add_item(discord.ui.TextDisplay(
+        f"**Registration** {when(record['RegisterStart'])} "
+        f"({when(record['RegisterStart'], 'R')})\n"
+        f"**Check-in + pool reveal** {when(checkin_at)} "
+        f"({when(checkin_at, 'R')})\n"
+        f"**Matches** {when(record['MatchesStart'])} "
+        f"({when(record['MatchesStart'], 'R')})"
+    ))
+    container.add_item(discord.ui.Separator())
+
+    settings = (
+        f"**Format** {CHALLONGE_FORMATS[record['Format']]} · "
+        f"Bo{record['BestOf']}\n"
+        f"**Entrants** {len(record['Players'])} registered · "
+        f"{record['Cap'] or 'no cap'} · min {record['MinPlayers']}"
+    )
+    if record["Phase"] == "checkin":
+        settings += f"\n**Checked in** {len(record['CheckedIn'])}"
+    container.add_item(discord.ui.TextDisplay(settings))
+
+    container.add_item(discord.ui.TextDisplay(
+        "**Map pool** " + (
+            f"✅ set, {'revealed' if record['PoolRevealed'] else 'secret'}"
+            if record["Pool"] else
+            f"⚠️ **not set** — `!tournament pool "
+            f"<{TOURNAMENT_POOL_SIZE} map ids>`"
+        )
+    ))
+
+    if record["Challonge"]:
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            f"🔗 {record['Challonge']['Url']}"
+        ))
+
+    note = dev_universe_note()
+    if note:
+        container.add_item(discord.ui.TextDisplay(note))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+async def tournament_create(ctx, tokens):
+    existing = await active_tournament()
+    if existing is not None:
+        await ctx.send(view=simple_card(
+            f"**{existing['Name']}** is still running "
+            f"(`{existing['Phase']}`). Finish or cancel it first.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    positional, flags = split_flags(tokens)
+    # A quoted name arrives as one token; each timestamp is two.
+    if len(positional) != 5:
+        await ctx.send(view=simple_card(
+            TOURNAMENT_USAGE, heading="🏆 Tournament",
+        ))
+        return
+
+    name = positional[0].strip()
+    register_start = parse_tournament_time(f"{positional[1]} {positional[2]}")
+    matches_start = parse_tournament_time(f"{positional[3]} {positional[4]}")
+
+    problems = []
+    if not name:
+        problems.append("The name can't be empty.")
+    if register_start is None:
+        problems.append(f"`{positional[1]} {positional[2]}` isn't a "
+                        f"`DD/MM/YYYY HH:MM` time.")
+    if matches_start is None:
+        problems.append(f"`{positional[3]} {positional[4]}` isn't a "
+                        f"`DD/MM/YYYY HH:MM` time.")
+
+    record = {
+        "Id": slugify_tournament(name),
+        "Name": name,
+        "Phase": "draft",
+        "RegisterStart": register_start,
+        "MatchesStart": matches_start,
+        "Pool": [],
+        "PoolRevealed": False,
+        "Players": [],
+        "CheckedIn": [],
+        "Matches": {},
+        "Challonge": None,
+        "HostChannelId": ctx.channel.id,
+        "CreatedAt": now_epoch(),
+        # Which phase transitions have already fired, so the scheduler can
+        # re-run a tick without repeating an announcement.
+        "Fired": [],
+        **TOURNAMENT_DEFAULTS,
+    }
+    problems.extend(apply_tournament_flags(record, flags))
+
+    if register_start is not None and matches_start is not None:
+        checkin_at = matches_start - record["CheckinMinutes"] * 60
+        if matches_start <= register_start:
+            problems.append("Matches have to start after registration opens.")
+        elif checkin_at <= register_start:
+            problems.append(
+                f"Check-in would open {when(checkin_at)}, before registration "
+                f"even closes. Move the start later, or lower `--checkin`."
+            )
+        if matches_start <= now_epoch():
+            problems.append("Matches would start in the past.")
+
+    if problems:
+        await ctx.send(view=simple_card(
+            "\n".join(f"• {problem}" for problem in problems),
+            heading="🏆 Can't create that", colour=discord.Color.red(),
+        ))
+        return
+
+    async with ctx.typing():
+        ok, challonge = await challonge_create_tournament(record)
+        if not ok:
+            await ctx.send(view=simple_card(
+                f"Couldn't create the bracket on Challonge — {challonge}",
+                colour=discord.Color.red(),
+            ))
+            return
+        record["Challonge"] = challonge
+
+        status = await save_tournament(record)
+        if status != "ok":
+            # The bracket exists but the record doesn't, so take it back down
+            # rather than leaving an orphan on the account.
+            await challonge_delete_tournament(challonge["Id"])
+            await ctx.send(view=simple_card(
+                f"Couldn't save the tournament (`{status}`), so the bracket "
+                f"was removed again. Nothing was kept.",
+                colour=discord.Color.red(),
+            ))
+            return
+
+    await ctx.send(view=tournament_card(record, heading="🏆 Tournament created"))
+
+async def tournament_pool(ctx, tokens):
+    record = await active_tournament()
+    if record is None:
+        await ctx.send(view=simple_card(
+            "No tournament is running. `!tournament create` first.",
+            colour=discord.Color.greyple(),
+        ))
+        return
+
+    positional, _ = split_flags(tokens)
+
+    # No arguments: show what's set, privately.
+    if not positional:
+        if not record["Pool"]:
+            await ctx.send(view=simple_card(
+                f"No pool set for **{record['Name']}** yet.\n"
+                f"-# `!tournament pool <{TOURNAMENT_POOL_SIZE} map ids>`",
+                colour=discord.Color.greyple(),
+            ))
+            return
+        state = ("revealed" if record["PoolRevealed"] else
+                 f"secret until check-in opens "
+                 f"{when(checkin_opens_at(record), 'R')}")
+        await send_privately(ctx, simple_card(
+            f"{pool_lines(record['Pool'])}\n\n-# {state}",
+            heading=f"🗺️ Pool — {record['Name']}", colour=TOURNAMENT_COLOR,
+        ))
+        return
+
+    if record["PoolRevealed"]:
+        await ctx.send(view=simple_card(
+            "The pool is already out — players have seen it and may have "
+            "practised on it. Changing it now would be unfair to them.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    if positional[0].lower() == "swap":
+        if len(positional) != 3:
+            await ctx.send(view=simple_card(
+                "**`!tournament pool swap <old id> <new id>`**",
+                colour=discord.Color.red(),
+            ))
+            return
+        try:
+            old_id, new_id = int(positional[1]), int(positional[2])
+        except ValueError:
+            await ctx.send(view=simple_card(
+                "Both have to be map IDs.", colour=discord.Color.red(),
+            ))
+            return
+        current = [entry["Id"] for entry in record["Pool"]]
+        if old_id not in current:
+            await ctx.send(view=simple_card(
+                f"`{old_id}` isn't in the pool.", colour=discord.Color.red(),
+            ))
+            return
+        ids = [new_id if value == old_id else value for value in current]
+    else:
+        try:
+            ids = [int(token) for token in positional]
+        except ValueError:
+            await ctx.send(view=simple_card(
+                f"Give me {TOURNAMENT_POOL_SIZE} map IDs, numbers only.",
+                colour=discord.Color.red(),
+            ))
+            return
+
+    async with ctx.typing():
+        resolved, problems = await validate_pool(ids)
+        blocking = [problem for problem in problems
+                    if not problem.startswith("-#")]
+        if blocking:
+            await ctx.send(view=simple_card(
+                "\n".join(f"• {problem}" for problem in blocking),
+                heading="🗺️ Pool not set", colour=discord.Color.red(),
+            ))
+            return
+
+        record["Pool"] = resolved
+        status = await save_tournament(record)
+
+    if status != "ok":
+        await ctx.send(view=simple_card(
+            f"Couldn't save the pool (`{status}`).",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    warnings = [problem for problem in problems if problem.startswith("-#")]
+    await send_privately(ctx, simple_card(
+        f"{pool_lines(resolved)}\n\n"
+        + ("\n".join(warnings) + "\n\n" if warnings else "")
+        + f"-# Stays secret until check-in opens "
+          f"{when(checkin_opens_at(record), 'R')}.",
+        heading=f"🗺️ Pool set — {record['Name']}", colour=TOURNAMENT_COLOR,
+    ))
+
+async def tournament_cancel(ctx):
+    record = await active_tournament()
+    if record is None:
+        await ctx.send(view=simple_card(
+            "No tournament is running.", colour=discord.Color.greyple(),
+        ))
+        return
+
+    async with ctx.typing():
+        # A bracket that never started is worth taking off the account; one
+        # with matches played in it is a record, so it stays up.
+        if record["Challonge"] and record["Phase"] != "live":
+            await challonge_delete_tournament(record["Challonge"]["Id"])
+            note = "The Challonge bracket was removed too."
+        else:
+            note = "The Challonge bracket was left up as a record."
+
+        record["Phase"] = "cancelled"
+        status = await save_tournament(record)
+
+    if status != "ok":
+        await ctx.send(view=simple_card(
+            f"Couldn't save the cancellation (`{status}`).",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    await ctx.send(view=simple_card(
+        f"**{record['Name']}** is cancelled.\n-# {note}",
+        heading="🏆 Cancelled", colour=discord.Color.red(),
+    ))
+
+@bot.command(name="tournament", hidden=True, usage="<create|pool|cancel>")
+@is_admin()
+async def admin_tournament(ctx, action: str = None, *arguments: str):
+    """!tournament — run a bracket: create it, curate its pool, track it."""
+    verb = (action or "").strip().lower()
+    tokens = list(arguments)
+
+    if verb == "create":
+        await tournament_create(ctx, tokens)
+    elif verb == "pool":
+        await tournament_pool(ctx, tokens)
+    elif verb == "cancel":
+        await tournament_cancel(ctx)
+    elif not verb:
+        record = await active_tournament()
+        if record is None:
+            await ctx.send(view=simple_card(
+                f"No tournament is running.\n\n{TOURNAMENT_USAGE}",
+                heading="🏆 Tournament",
+            ))
+            return
+        await ctx.send(view=tournament_card(record))
+    else:
+        await ctx.send(view=simple_card(
+            f"`{verb}` isn't a tournament command.\n\n{TOURNAMENT_USAGE}",
+            colour=discord.Color.red(),
+        ))
 
 def register_dev_variants():
     """Give every command a prefix-only !dev_ twin bound to DEV_UNIVERSE_ID.
