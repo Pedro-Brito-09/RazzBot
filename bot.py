@@ -268,6 +268,8 @@ bot = commands.Bot(
 )
 
 _synced = False
+# Persistent tournament views are bound once per process, in on_ready.
+_tournament_views_bound = False
 _session = None
 
 # Which universe the command currently running should talk to. A ContextVar
@@ -3936,6 +3938,24 @@ async def on_ready():
     if DAILY_CUP_CHANNEL_ID and not daily_cup_announcement.is_running():
         daily_cup_announcement.start()
         print("Daily Cup announcements scheduled for 09:00 UTC")
+
+    # Registration and check-in buttons outlive a redeploy, so their views
+    # are re-registered by custom_id rather than rebuilt from the message.
+    if not _tournament_views_bound:
+        try:
+            bot.add_view(TournamentRegisterView())
+            bot.add_view(TournamentCheckinView())
+            globals()["_tournament_views_bound"] = True
+        except Exception:
+            # Without this the buttons on an already-posted announcement go
+            # dead after a redeploy, so it is worth shouting about.
+            print("Binding the persistent tournament views failed:")
+            traceback.print_exc()
+
+    if not tournament_tick.is_running():
+        tournament_tick.start()
+        print(f"Tournament scheduler ticking every "
+              f"{TOURNAMENT_TICK_SECONDS}s")
 
     # on_ready fires again on every reconnect; only sync once per process.
     if _synced:
@@ -8509,6 +8529,684 @@ async def admin_tournament(ctx, action: str = None, *arguments: str):
             f"`{verb}` isn't a tournament command.\n\n{TOURNAMENT_USAGE}",
             colour=discord.Color.red(),
         ))
+
+# --- Tournament lifecycle --------------------------------------------------
+# Everything from here runs unattended, so each transition is driven off the
+# clock and recorded in Fired[]. A tick that arrives late -- or twice, after
+# a redeploy -- fires the overdue step once and never repeats one. That is
+# why this is a tick loop rather than a timer per phase: a missed wake-up in
+# a timer model silently skips a phase, and the host finds out from an angry
+# ping rather than from the bot.
+
+TOURNAMENT_TICK_SECONDS = 60
+# Reminders, as (Fired key, seconds before the deadline they belong to).
+REGISTRATION_REMINDERS = ((24 * 3600, "reg:24h"), (3600, "reg:1h"))
+CHECKIN_REMINDERS = ((900, "checkin:15m"),)
+# Buttons have to survive a redeploy, so both views are persistent and
+# addressed by a fixed custom_id. Only one tournament runs at a time, so the
+# handler can look up the active one instead of carrying an ID around.
+REGISTER_BUTTON_ID = "tournament:register"
+CHECKIN_BUTTON_ID = "tournament:checkin"
+
+async def update_tournament(tournament_id, transform):
+    """Read-modify-write one tournament under its ETag.
+
+    save_tournament overwrites wholesale, which is fine for a host command
+    but not for a button two people can press in the same second. Anything
+    driven by a player goes through here so a registration can't land on top
+    of another one.
+    """
+    outcome = {"record": None}
+
+    def apply(stored):
+        if not isinstance(stored, dict):
+            return None
+        record = normalize_tournament(stored)
+        changed = transform(record)
+        if changed is None:
+            return None
+        outcome["record"] = changed
+        return changed
+
+    status = await update_entry_with_retry(
+        tournament_key(tournament_id), TOURNAMENTS_DATASTORE, apply,
+    )
+    if status == "ok" and outcome["record"] is not None:
+        record = outcome["record"]
+
+        def index_transform(stored):
+            entries = stored if isinstance(stored, list) else []
+            for position, entry in enumerate(entries):
+                if isinstance(entry, dict) and entry.get("Id") == record["Id"]:
+                    entries[position] = index_summary(record)
+                    return entries
+            return entries + [index_summary(record)]
+
+        await update_entry_with_retry(
+            TOURNAMENT_INDEX_KEY, TOURNAMENTS_DATASTORE, index_transform,
+            default=[],
+        )
+    return status, outcome["record"]
+
+def tournament_channel():
+    try:
+        return bot.get_channel(int(TOURNAMENT_CHANNEL_ID))
+    except (TypeError, ValueError):
+        return None
+
+def tournament_role_mention():
+    if not TOURNAMENT_ROLE_ID:
+        return None
+    try:
+        return f"<@&{int(TOURNAMENT_ROLE_ID)}>"
+    except (TypeError, ValueError):
+        return None
+
+def attach_mention(view, mention):
+    """Put a mention inside the card, and say whether it landed.
+
+    A Components V2 message carries no plain content at all, so a ping can't
+    ride along in `content` the way the Daily Cup's does -- that one is a
+    classic View. It goes in the container instead, which pings just the
+    same once allowed_mentions permits it.
+    """
+    if not mention:
+        return False
+    for item in view.children:
+        if isinstance(item, discord.ui.Container):
+            item.add_item(discord.ui.Separator())
+            item.add_item(discord.ui.TextDisplay(mention))
+            return True
+    return False
+
+async def announce_tournament(view, *, ping=False, crosspost=True):
+    """Post to the tournament channel. Returns the message, or None."""
+    channel = tournament_channel()
+    if channel is None:
+        print("Tournament announcement skipped: TOURNAMENT_CHANNEL_ID is "
+              "unset or points at a channel I can't see")
+        return None
+
+    pinged = attach_mention(view, tournament_role_mention() if ping else None)
+    try:
+        message = await channel.send(
+            view=view,
+            allowed_mentions=(discord.AllowedMentions(
+                everyone=False, users=False, roles=True, replied_user=False,
+            ) if pinged else SILENT),
+        )
+    except discord.HTTPException as error:
+        print(f"Tournament announcement failed: {error}")
+        return None
+
+    if crosspost:
+        await crosspost_message(message)
+    return message
+
+async def tell_host(record, text):
+    """Nag the channel the tournament was created from."""
+    channel = bot.get_channel(record.get("HostChannelId") or 0)
+    if channel is None:
+        print(f"tournament {record['Id']}: {text}")
+        return
+    try:
+        await channel.send(
+            view=simple_card(f"<@{ADMIN_USER_ID}>\n\n{text}",
+                             heading="🏆 Tournament",
+                             colour=discord.Color.orange()),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, users=True, roles=False, replied_user=False,
+            ),
+        )
+    except discord.HTTPException as error:
+        print(f"Couldn't reach the host channel: {error}")
+
+async def dm_registrants(record, view):
+    """Best-effort DM to everyone registered. Returns how many landed."""
+    delivered = 0
+    for player in record["Players"]:
+        try:
+            user = bot.get_user(int(player["DiscordId"]))
+            if user is None:
+                user = await bot.fetch_user(int(player["DiscordId"]))
+            await user.send(view=view)
+            delivered += 1
+        except (discord.HTTPException, ValueError, TypeError):
+            # Closed DMs are ordinary; the announcement still reached them.
+            continue
+    return delivered
+
+# --- Player-facing cards ---------------------------------------------------
+
+class TournamentRegisterView(discord.ui.LayoutView):
+    """Registration card. Persistent: signups stay open for days."""
+
+    def __init__(self, record=None):
+        super().__init__(timeout=None)
+        container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
+
+        if record is None:
+            # Rebuilt on startup only to re-bind the button; the posted
+            # message keeps whatever it was sent with.
+            container.add_item(discord.ui.TextDisplay("## 🏆 Registration"))
+        else:
+            checkin_at = checkin_opens_at(record)
+            cap = (f"{len(record['Players'])}/{record['Cap']}"
+                   if record["Cap"] else f"{len(record['Players'])}")
+            container.add_item(discord.ui.TextDisplay(
+                f"## 🏆 {record['Name']}\n"
+                f"-# {CHALLONGE_FORMATS[record['Format']]} · "
+                f"Bo{record['BestOf']} · {cap} registered"
+            ))
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay(
+                f"**Registration closes** {when(checkin_at)} "
+                f"({when(checkin_at, 'R')})\n"
+                f"**Matches start** {when(record['MatchesStart'])}\n\n"
+                f"🗺️ **{TOURNAMENT_POOL_SIZE} maps**, revealed when check-in "
+                f"opens. Each match vetoes down to one.\n"
+                f"-# You must check in once registration closes, or your "
+                f"place goes to nobody. Link your Roblox account with "
+                f"`/link` before registering."
+            ))
+            if record["Challonge"]:
+                container.add_item(discord.ui.TextDisplay(
+                    f"🔗 {record['Challonge']['Url']}"
+                ))
+
+        row = discord.ui.ActionRow()
+        button = discord.ui.Button(
+            label="Register", style=discord.ButtonStyle.success,
+            emoji="✅", custom_id=REGISTER_BUTTON_ID,
+        )
+        button.callback = self.register
+        row.add_item(button)
+        container.add_item(row)
+        self.add_item(container)
+
+    async def register(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        await handle_registration(interaction)
+
+class TournamentCheckinView(discord.ui.LayoutView):
+    """Check-in card, carrying the pool reveal. Persistent."""
+
+    def __init__(self, record=None):
+        super().__init__(timeout=None)
+        container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
+
+        if record is None:
+            container.add_item(discord.ui.TextDisplay("## ✋ Check-in"))
+        else:
+            container.add_item(discord.ui.TextDisplay(
+                f"## ✋ Check-in — {record['Name']}\n"
+                f"-# closes {when(record['MatchesStart'], 'R')}, when the "
+                f"bracket is built"
+            ))
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay(
+                f"Registration is closed. **Check in by "
+                f"{when(record['MatchesStart'])}** or you won't be in the "
+                f"bracket."
+            ))
+            if record["Pool"]:
+                container.add_item(discord.ui.Separator())
+                container.add_item(discord.ui.TextDisplay(
+                    f"## 🗺️ The pool\n{pool_lines(record['Pool'])}\n\n"
+                    f"-# Every match vetoes these down to one. You have until "
+                    f"matches start to practise."
+                ))
+
+        row = discord.ui.ActionRow()
+        button = discord.ui.Button(
+            label="Check in", style=discord.ButtonStyle.success,
+            emoji="✋", custom_id=CHECKIN_BUTTON_ID,
+        )
+        button.callback = self.check_in
+        row.add_item(button)
+        container.add_item(row)
+        self.add_item(container)
+
+    async def check_in(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        await handle_checkin(interaction)
+
+async def reply_quietly(interaction, text, *, colour=None):
+    await interaction.followup.send(
+        view=simple_card(text, colour=colour or discord.Color.greyple()),
+        ephemeral=True,
+    )
+
+async def handle_registration(interaction):
+    record = await active_tournament()
+    if record is None or record["Phase"] != "registration":
+        await reply_quietly(interaction, "Registration isn't open.")
+        return
+
+    discord_id = str(interaction.user.id)
+    if any(player["DiscordId"] == discord_id for player in record["Players"]):
+        await reply_quietly(
+            interaction,
+            f"You're already registered for **{record['Name']}**.\n"
+            f"-# Check in when registration closes "
+            f"{when(checkin_opens_at(record), 'R')}.",
+        )
+        return
+
+    # A bracket entry has to resolve to a Roblox account: it's what seeds the
+    # player, what the game is handed at match time, and what everyone else
+    # knows them by.
+    roblox_id = await fetch_linked_user_id(interaction.user.id)
+    if roblox_id is None:
+        await reply_quietly(
+            interaction,
+            "Link your Roblox account first with `/link`, then register.",
+            colour=discord.Color.red(),
+        )
+        return
+
+    name = await fetch_username(roblox_id) or str(roblox_id)
+    entry = {
+        "DiscordId": discord_id,   # string: a snowflake loses precision as a
+        "RobloxId": roblox_id,     # Lua number, and the datastore stores Lua
+        "Name": name,
+        "At": now_epoch(),
+    }
+
+    state = {"result": None}
+
+    def transform(stored):
+        if stored["Phase"] != "registration":
+            state["result"] = "closed"
+            return None
+        if any(player["DiscordId"] == discord_id
+               for player in stored["Players"]):
+            state["result"] = "duplicate"
+            return None
+        if stored["Cap"] and len(stored["Players"]) >= stored["Cap"]:
+            state["result"] = "full"
+            return None
+        stored["Players"].append(entry)
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+
+    if state["result"] == "closed":
+        await reply_quietly(interaction, "Registration just closed.")
+        return
+    if state["result"] == "duplicate":
+        await reply_quietly(interaction, "You're already registered.")
+        return
+    if state["result"] == "full":
+        await reply_quietly(
+            interaction, "The bracket filled up.", colour=discord.Color.red(),
+        )
+        return
+    if status != "ok" or saved is None:
+        await reply_quietly(
+            interaction,
+            "Couldn't save your registration — try again in a moment.",
+            colour=discord.Color.red(),
+        )
+        return
+
+    checkin_at = checkin_opens_at(saved)
+    await reply_quietly(
+        interaction,
+        f"✅ Registered for **{saved['Name']}** as **{name}**.\n\n"
+        f"**Check-in opens** {when(checkin_at)} ({when(checkin_at, 'R')}) — "
+        f"you have to check in then, or you're out.\n"
+        f"-# I'll DM you when it does.",
+        colour=TOURNAMENT_COLOR,
+    )
+
+async def handle_checkin(interaction):
+    record = await active_tournament()
+    if record is None or record["Phase"] != "checkin":
+        await reply_quietly(interaction, "Check-in isn't open.")
+        return
+
+    discord_id = str(interaction.user.id)
+    state = {"result": None}
+
+    def transform(stored):
+        if stored["Phase"] != "checkin":
+            state["result"] = "closed"
+            return None
+        if not any(player["DiscordId"] == discord_id
+                   for player in stored["Players"]):
+            state["result"] = "unregistered"
+            return None
+        if discord_id in stored["CheckedIn"]:
+            state["result"] = "duplicate"
+            return None
+        stored["CheckedIn"].append(discord_id)
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+
+    if state["result"] == "closed":
+        await reply_quietly(interaction, "Check-in just closed.")
+        return
+    if state["result"] == "unregistered":
+        await reply_quietly(
+            interaction,
+            "You didn't register for this one, so there's nothing to check "
+            "in to.",
+            colour=discord.Color.red(),
+        )
+        return
+    if state["result"] == "duplicate":
+        await reply_quietly(interaction, "You're already checked in. 👍")
+        return
+    if status != "ok" or saved is None:
+        await reply_quietly(
+            interaction, "Couldn't check you in — try again in a moment.",
+            colour=discord.Color.red(),
+        )
+        return
+
+    await reply_quietly(
+        interaction,
+        f"✋ Checked in for **{saved['Name']}**.\n\n"
+        f"The bracket is built {when(saved['MatchesStart'], 'R')}. Stay in "
+        f"Discord — I'll DM you when your first match is up.",
+        colour=TOURNAMENT_COLOR,
+    )
+
+# --- Phase transitions -----------------------------------------------------
+
+async def open_registration(record):
+    status, saved = await update_tournament(
+        record["Id"], lambda stored: {**stored, "Phase": "registration"}
+    )
+    if status != "ok":
+        print(f"tournament {record['Id']}: couldn't open registration "
+              f"({status})")
+        return
+    record = saved
+
+    await announce_tournament(TournamentRegisterView(record), ping=True)
+    if not record["Pool"]:
+        await tell_host(
+            record,
+            f"Registration for **{record['Name']}** is open, but the map "
+            f"pool still isn't set.\n"
+            f"-# `!tournament pool <{TOURNAMENT_POOL_SIZE} map ids>` — it has "
+            f"to be in before check-in opens "
+            f"{when(checkin_opens_at(record), 'R')}.",
+        )
+
+async def open_checkin(record):
+    """Close registration, open check-in, reveal the pool.
+
+    The pool going out here is deliberate: everyone gets the same window to
+    look at the maps before matches start, and it makes the check-in ping
+    something people actually want to open.
+    """
+    if not record["Pool"]:
+        # Check-in doesn't need the pool -- only the veto does -- so this
+        # opens anyway rather than shoving the whole schedule. The hard stop
+        # is at matches_start.
+        await tell_host(
+            record,
+            f"⚠️ Check-in for **{record['Name']}** is opening with **no map "
+            f"pool set**, so there's nothing to reveal.\n"
+            f"-# Set it before {when(record['MatchesStart'])} or the "
+            f"tournament can't start: `!tournament pool <"
+            f"{TOURNAMENT_POOL_SIZE} map ids>`",
+        )
+
+    def transform(stored):
+        stored["Phase"] = "checkin"
+        stored["PoolRevealed"] = bool(stored["Pool"])
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if status != "ok":
+        print(f"tournament {record['Id']}: couldn't open check-in ({status})")
+        return
+    record = saved
+
+    # A fresh view per destination: announcing mutates the card to carry the
+    # role ping, which renders as a dead `<@&…>` once it reaches a DM.
+    await announce_tournament(TournamentCheckinView(record), ping=True)
+    delivered = await dm_registrants(record, TournamentCheckinView(record))
+    print(f"tournament {record['Id']}: check-in open, "
+          f"{delivered}/{len(record['Players'])} DMs delivered")
+
+async def seed_players(players):
+    """Order the field strongest first, by career wins.
+
+    Seeding off something real is what keeps the top of the bracket from
+    meeting in round one; the Wins board is the only ranking the game has
+    until ranked mode exists.
+    """
+    seeded = []
+    for player in players:
+        wins = await fetch_ordered_entry(
+            str(player["RobloxId"]), datastore="Data", scope="Wins"
+        )
+        seeded.append((wins if isinstance(wins, (int, float)) else -1, player))
+    # Stable, so equal records keep registration order.
+    seeded.sort(key=lambda pair: -pair[0])
+    return [player for _wins, player in seeded]
+
+async def challonge_push_field(record, players):
+    """Fill the bracket with the checked-in field, then start it."""
+    payload = {"participants": [
+        {
+            "name": player["Name"],
+            "seed": position,
+            # Carries the Discord ID back on every match, so a Challonge
+            # participant can be resolved without matching on display name.
+            "misc": player["DiscordId"],
+        }
+        for position, player in enumerate(players, 1)
+    ]}
+    challonge_id = record["Challonge"]["Id"]
+    ok, data = await challonge_request(
+        f"tournaments/{challonge_id}/participants/bulk_add.json",
+        method="POST", payload=payload,
+    )
+    if not ok:
+        return False, data
+
+    # Map each Challonge participant back onto the player it came from.
+    by_discord = {}
+    for wrapper in data or []:
+        participant = (wrapper or {}).get("participant") or {}
+        if participant.get("misc") and participant.get("id"):
+            by_discord[str(participant["misc"])] = participant["id"]
+
+    ok, data = await challonge_request(
+        f"tournaments/{challonge_id}/start.json", method="POST",
+    )
+    if not ok:
+        return False, data
+    return True, by_discord
+
+async def start_bracket(record):
+    """Close check-in and build the bracket from whoever turned up."""
+    checked_in = [player for player in record["Players"]
+                  if player["DiscordId"] in record["CheckedIn"]]
+
+    if not record["Pool"]:
+        await cancel_tournament(
+            record,
+            f"**{record['Name']}** can't start: no map pool was ever set, so "
+            f"there's nothing to veto.",
+        )
+        return
+
+    if len(checked_in) < record["MinPlayers"]:
+        await cancel_tournament(
+            record,
+            f"**{record['Name']}** is off — only **{len(checked_in)}** of "
+            f"{len(record['Players'])} registered players checked in, and it "
+            f"needs {record['MinPlayers']}.",
+        )
+        return
+
+    seeded = await seed_players(checked_in)
+    ok, result = await challonge_push_field(record, seeded)
+    if not ok:
+        # Everything is still recoverable by hand from here: the field is
+        # saved, the bracket exists, and the host can start it on Challonge.
+        await tell_host(
+            record,
+            f"❌ Couldn't start **{record['Name']}** on Challonge — {result}\n"
+            f"-# {len(seeded)} players checked in. The bracket is at "
+            f"{record['Challonge']['Url']} — start it there and the bot will "
+            f"pick the matches up.",
+        )
+        return
+
+    def transform(stored):
+        stored["Phase"] = "live"
+        stored["Seeded"] = [player["DiscordId"] for player in seeded]
+        for player in stored["Players"]:
+            participant_id = result.get(player["DiscordId"])
+            if participant_id:
+                player["ChallongeId"] = participant_id
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if status != "ok":
+        await tell_host(
+            record,
+            f"⚠️ **{record['Name']}** started on Challonge but the bot "
+            f"couldn't save that (`{status}`). Matches won't pipeline until "
+            f"it does.",
+        )
+        return
+
+    await announce_tournament(simple_card(
+        f"**{len(seeded)}** players are in. First round is up.\n\n"
+        f"🔗 {saved['Challonge']['Url']}\n\n"
+        f"-# I'll DM you when your match is ready — check in, veto the maps, "
+        f"then play.",
+        heading=f"🏆 {saved['Name']} — bracket is live",
+        colour=TOURNAMENT_COLOR,
+    ), ping=True)
+
+async def cancel_tournament(record, reason):
+    """End a tournament that can't run, and say so where people registered."""
+    status, _saved = await update_tournament(
+        record["Id"], lambda stored: {**stored, "Phase": "cancelled"}
+    )
+    if status != "ok":
+        print(f"tournament {record['Id']}: couldn't record cancellation "
+              f"({status})")
+
+    if record["Challonge"]:
+        await challonge_delete_tournament(record["Challonge"]["Id"])
+
+    await announce_tournament(simple_card(
+        reason, heading="🏆 Cancelled", colour=discord.Color.red(),
+    ), ping=True)
+    await tell_host(record, reason)
+
+async def fire_reminders(record, deadline, schedule, build):
+    """Post any reminder now due. Returns the Fired keys that went out."""
+    now, fired = now_epoch(), []
+    for lead, key in schedule:
+        if key in record["Fired"]:
+            continue
+        # Only fire inside the window: a tournament created with less than
+        # `lead` to go shouldn't emit a reminder it already missed.
+        if deadline - lead <= now < deadline:
+            view = build(record, deadline)
+            if view is not None and await announce_tournament(
+                view, crosspost=False
+            ):
+                fired.append(key)
+    return fired
+
+def registration_reminder(record, deadline):
+    remaining = len(record["Players"])
+    return simple_card(
+        f"Registration for **{record['Name']}** closes {when(deadline, 'R')} "
+        f"({when(deadline)}).\n\n"
+        f"**{remaining}** registered so far.\n"
+        f"-# Check-in and the map reveal happen the moment it closes.",
+        heading="🏆 Registration closing", colour=TOURNAMENT_COLOR,
+    )
+
+def checkin_reminder(record, deadline):
+    waiting = [player for player in record["Players"]
+               if player["DiscordId"] not in record["CheckedIn"]]
+    if not waiting:
+        return None
+    names = ", ".join(f"<@{player['DiscordId']}>" for player in waiting[:20])
+    return simple_card(
+        f"Check-in closes {when(deadline, 'R')} — the bracket is built from "
+        f"whoever's in at that point.\n\n"
+        f"**Still not checked in ({len(waiting)}):**\n{names}"
+        + ("\n-# …and more." if len(waiting) > 20 else ""),
+        heading="✋ Last call", colour=discord.Color.orange(),
+    )
+
+async def advance_tournament(record):
+    """Fire whatever this tournament is now due for. Safe to re-run."""
+    now = now_epoch()
+    phase = record["Phase"]
+    fired = []
+
+    if phase == "draft":
+        if now >= record["RegisterStart"]:
+            await open_registration(record)
+        return
+
+    if phase == "registration":
+        deadline = checkin_opens_at(record)
+        if now >= deadline:
+            await open_checkin(record)
+            return
+        fired = await fire_reminders(
+            record, deadline, REGISTRATION_REMINDERS, registration_reminder
+        )
+
+    elif phase == "checkin":
+        deadline = record["MatchesStart"]
+        if now >= deadline:
+            await start_bracket(record)
+            return
+        fired = await fire_reminders(
+            record, deadline, CHECKIN_REMINDERS, checkin_reminder
+        )
+
+    if fired:
+        def transform(stored):
+            stored["Fired"] = list(dict.fromkeys(stored["Fired"] + fired))
+            return stored
+        await update_tournament(record["Id"], transform)
+
+@tasks.loop(seconds=TOURNAMENT_TICK_SECONDS)
+async def tournament_tick():
+    try:
+        index = await read_tournament_index()
+    except Exception:
+        print("Tournament tick couldn't read the index:")
+        traceback.print_exc()
+        return
+
+    for entry in index:
+        if (not isinstance(entry, dict)
+                or entry.get("Phase") not in TOURNAMENT_OPEN_PHASES):
+            continue
+        try:
+            record = await read_tournament(entry["Id"])
+            if record is not None:
+                await advance_tournament(record)
+        except Exception:
+            # One broken tournament must not stop the loop for the rest.
+            print(f"Tournament tick failed for {entry.get('Id')}:")
+            traceback.print_exc()
+
+@tournament_tick.before_loop
+async def before_tournament_tick():
+    await bot.wait_until_ready()
 
 def register_dev_variants():
     """Give every command a prefix-only !dev_ twin bound to DEV_UNIVERSE_ID.
