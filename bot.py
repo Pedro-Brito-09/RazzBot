@@ -8094,6 +8094,9 @@ CHALLONGE_TOKEN_MARGIN = 300
 CHALLONGE_HEADERS = {
     "Content-Type": "application/vnd.api+json",
     "Accept": "application/json",
+    # Without this Challonge reads the Authorization header as a legacy v1
+    # API key and rejects the bearer token as an invalid one.
+    "Authorization-Type": "v2",
 }
 CHALLONGE_FORMATS = {
     "single": "single elimination",
@@ -8246,7 +8249,7 @@ async def challonge_create_tournament(record):
     """
     starts = datetime.fromtimestamp(record["MatchesStart"], timezone.utc)
     payload = {"data": {
-        "type": "tournaments",
+        "type": "tournament",
         "attributes": {
             "name": record["Name"],
             "url": record["Id"],
@@ -8256,13 +8259,11 @@ async def challonge_create_tournament(record):
             # the moment it exists, so no maps go in the description.
             "description": (f"Best of {record['BestOf']}. Matches start "
                             f"{starts:%d/%m/%Y %H:%M} UTC."),
-            "match_options": {
-                "hold_third_place_match": record["Format"] == "single",
-            },
+            "private": False,
         },
     }}
     ok, data = await challonge_request(
-        "application/tournaments", method="POST", payload=payload
+        "tournaments.json", method="POST", payload=payload
     )
     if not ok:
         return False, data
@@ -8281,7 +8282,7 @@ async def challonge_create_tournament(record):
 
 async def challonge_delete_tournament(challonge_id):
     return await challonge_request(
-        f"application/tournaments/{challonge_id}", method="DELETE"
+        f"tournaments/{challonge_id}.json", method="DELETE"
     )
 
 # --- Map pool --------------------------------------------------------------
@@ -9262,7 +9263,7 @@ async def challonge_push_field(record, players):
 
     for position, player in enumerate(players, 1):
         payload = {"data": {
-            "type": "Participant",
+            "type": "participant",
             "attributes": {
                 "name": player["Name"],
                 "seed": position,
@@ -9272,7 +9273,7 @@ async def challonge_push_field(record, players):
             },
         }}
         ok, data = await challonge_request(
-            f"application/tournaments/{challonge_id}/participants",
+            f"tournaments/{challonge_id}/participants.json",
             method="POST", payload=payload,
         )
         if not ok:
@@ -9284,7 +9285,7 @@ async def challonge_push_field(record, players):
             by_discord[player["DiscordId"]] = str(resource["id"])
 
     ok, data = await challonge_request(
-        f"application/tournaments/{challonge_id}/change_state",
+        f"tournaments/{challonge_id}/change_state.json",
         method="PUT",
         payload={"data": {
             "type": "TournamentState",
@@ -9305,7 +9306,7 @@ async def challonge_standings(record):
     """
     challonge_id = record["Challonge"]["Id"]
     ok, data = await challonge_request(
-        f"application/tournaments/{challonge_id}"
+        f"tournaments/{challonge_id}.json"
     )
     if not ok:
         return None, data
@@ -9313,7 +9314,7 @@ async def challonge_standings(record):
     state = challonge_attributes((data or {}).get("data") or {}).get("state")
 
     ok, data = await challonge_request(
-        f"application/tournaments/{challonge_id}/participants"
+        f"tournaments/{challonge_id}/participants.json"
     )
     if not ok:
         return None, data
