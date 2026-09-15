@@ -8053,6 +8053,44 @@ def checkin_opens_at(record):
 #     same objects is accepted -- PendingRewards writes exactly that and has
 #     always worked. So a record is stored as a one-element list.
 
+# Open Cloud cannot bring a data store into existence -- neither PATCH with
+# allowMissing nor the create endpoint will do it, and both report the
+# attempt as 400 "Value cannot be null. (Parameter 'value')" rather than
+# saying so. Only the game can register a store, so the first write bootstraps
+# it through Luau and then retries over the ordinary v2 path. This costs
+# 10-30s exactly once per universe; every write after it is a normal API call.
+LUAU_CREATE_DATASTORE = """
+local DataStoreService = game:GetService("DataStoreService")
+local store = DataStoreService:GetDataStore(%s)
+local key = %s
+
+store:SetAsync(key, os.time())
+return { status = "ok", stored = store:GetAsync(key) }
+"""
+# The marker key the bootstrap writes. Nothing reads it; its existence is the
+# point, since a store with no keys is a store that doesn't exist.
+TOURNAMENT_READY_KEY = "__created"
+_tournament_store_ready = set()
+
+async def ensure_tournament_store():
+    """Make sure the data store exists. Returns (ok, reason)."""
+    universe = current_universe()
+    if universe in _tournament_store_ready:
+        return True, None
+
+    print(f"bootstrapping the {TOURNAMENTS_DATASTORE} data store on universe "
+          f"{universe} through Luau")
+    state, result = await run_luau(LUAU_CREATE_DATASTORE % (
+        json.dumps(TOURNAMENTS_DATASTORE), json.dumps(TOURNAMENT_READY_KEY),
+    ))
+    if state != "COMPLETE":
+        return False, f"{state}: {result}"
+    if luau_result_status(result) != "ok":
+        return False, f"the task returned {result!r}"
+
+    _tournament_store_ready.add(universe)
+    return True, None
+
 def wrap_record(record):
     return [record]
 
@@ -8069,6 +8107,7 @@ async def update_tournament_entry(key, transform, *, attempts=4):
     error, with the ETag guarding the write -- but it creates the entry, and
     the store, when they aren't there yet.
     """
+    bootstrapped = False
     for attempt in range(1, attempts + 1):
         status, resource = await fetch_entry_resource(key,
                                                       TOURNAMENTS_DATASTORE)
@@ -8082,6 +8121,19 @@ async def update_tournament_entry(key, transform, *, attempts=4):
             result = await create_entry_resource(
                 key, TOURNAMENTS_DATASTORE, new_value
             )
+            # A create that fails on a store Open Cloud has never seen is the
+            # store's absence, not the payload's fault. Register it from the
+            # game and take one more run at the same write.
+            if result == "error" and not bootstrapped:
+                bootstrapped = True
+                ready, reason = await ensure_tournament_store()
+                if not ready:
+                    print(f"couldn't bootstrap {TOURNAMENTS_DATASTORE}: "
+                          f"{reason}")
+                    return "bootstrap", None
+                result = await create_entry_resource(
+                    key, TOURNAMENTS_DATASTORE, new_value
+                )
         else:
             new_value = transform(decode_entry_value(resource.get("value")))
             if new_value is None:
@@ -8166,6 +8218,21 @@ async def save_tournament(record):
         TOURNAMENT_INDEX_KEY, lambda stored: merge_index(stored, record),
     )
     return status
+
+def save_failure_text(status):
+    """Why a save failed, in terms the host can act on."""
+    if status == "bootstrap":
+        where = ("`DEV_LUAU_PLACE_ID`" if on_dev_universe()
+                 else "`LUAU_PLACE_ID`")
+        return (
+            f"The `{TOURNAMENTS_DATASTORE}` data store doesn't exist yet, and "
+            f"Open Cloud can't create one — only the game can. I tried to do "
+            f"that through Luau and couldn't.\n"
+            f"-# Check {where} is set and that the API key carries "
+            f"`universe.place.luau-execution-session:write` for it. The bot "
+            f"log has the reason."
+        )
+    return f"Couldn't save the tournament (`{status}`)."
 
 async def update_tournament(tournament_id, transform):
     """Read-modify-write one tournament under its ETag.
@@ -8749,8 +8816,9 @@ async def tournament_create(ctx, tokens):
             # deleting them is never automatic.
             await challonge_delete_tournament(challonge["Id"])
             await ctx.send(view=simple_card(
-                f"Couldn't save the tournament (`{status}`), so the bracket "
-                f"was removed again. Nothing was kept.",
+                f"{save_failure_text(status)}\n\n"
+                f"-# The Challonge bracket was removed again, so nothing was "
+                f"left half-made.",
                 colour=discord.Color.red(),
             ))
             return
