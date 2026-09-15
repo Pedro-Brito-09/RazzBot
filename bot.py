@@ -1095,8 +1095,11 @@ async def create_entry_resource(entry_key, datastore, value, *,
 
     session = await get_session()
     try:
+        # The key goes in the query string, not the path -- and the parameter
+        # is `id`, matching every other v2 create. The docs index calls it
+        # entry_id, which the API ignores, answering "Entry id required."
         async with session.post(
-            url, headers=headers, params={"entry_id": str(entry_key)},
+            url, headers=headers, params={"id": str(entry_key)},
             json={"value": value},
         ) as resp:
             if resp.status in (200, 201):
