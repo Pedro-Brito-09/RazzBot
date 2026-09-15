@@ -7896,7 +7896,9 @@ TOURNAMENT_USAGE = (
     "**`!tournament pool <5 map ids>`** — set the veto pool\n"
     "**`!tournament pool`** — show it, in DMs\n"
     "**`!tournament pool swap <old> <new>`** — replace one map\n"
-    "**`!tournament cancel`** — call it off"
+    "**`!tournament cancel`** — call it off\n"
+    "**`!tournament cleanup [id]`** — delete a finished one's channels "
+    "and roles"
 )
 
 def tournament_key(tournament_id):
@@ -8014,7 +8016,7 @@ def index_summary(record):
 # datastore as an empty list. Every collection on a record gets coerced back
 # to the shape the code expects rather than guarded at each use.
 TOURNAMENT_LIST_FIELDS = ("Pool", "Players", "CheckedIn", "Fired")
-TOURNAMENT_DICT_FIELDS = ("Matches",)
+TOURNAMENT_DICT_FIELDS = ("Matches", "Discord")
 
 def normalize_tournament(record):
     for field in TOURNAMENT_LIST_FIELDS:
@@ -8088,7 +8090,7 @@ def challonge_error(body, status):
             return "; ".join(str(error) for error in errors)
     return f"HTTP {status}"
 
-async def challonge_request(path, *, method="GET", payload=None):
+async def challonge_request(path, *, method="GET", payload=None, params=None):
     """Call Challonge. Returns (True, data) or (False, message).
 
     request_json drops the response body on failure, and a bracket call that
@@ -8098,10 +8100,11 @@ async def challonge_request(path, *, method="GET", payload=None):
         return False, "`CHALLONGE_API_KEY` isn't set on the server."
 
     url = f"{CHALLONGE_API}/{path}"
+    query = {"api_key": CHALLONGE_API_KEY, **(params or {})}
     try:
         session = await get_session()
         async with session.request(
-            method, url, params={"api_key": CHALLONGE_API_KEY}, json=payload,
+            method, url, params=query, json=payload,
         ) as resp:
             body = await resp.text()
             if resp.status >= 400:
@@ -8323,6 +8326,20 @@ def tournament_card(record, *, heading=None):
         )
     ))
 
+    space = tournament_space(record)
+    if space.get("CategoryId"):
+        roles = " · ".join(
+            f"<@&{space[field]}>"
+            for field in ("PlayerRoleId", "WinnerRoleId")
+            if space.get(field)
+        )
+        container.add_item(discord.ui.TextDisplay(
+            f"**Channels** <#{space['InfoChannelId']}> · "
+            f"<#{space['RegistrationChannelId']}> · "
+            f"<#{space['ChatChannelId']}>"
+            + (f"\n**Roles** {roles}" if roles else "")
+        ))
+
     if record["Challonge"]:
         container.add_item(discord.ui.Separator())
         container.add_item(discord.ui.TextDisplay(
@@ -8393,6 +8410,7 @@ async def tournament_create(ctx, tokens):
         "CheckedIn": [],
         "Matches": {},
         "Challonge": None,
+        "Discord": {},
         "HostChannelId": ctx.channel.id,
         "CreatedAt": now_epoch(),
         # Which phase transitions have already fired, so the scheduler can
@@ -8431,10 +8449,22 @@ async def tournament_create(ctx, tokens):
             return
         record["Challonge"] = challonge
 
+        space_problems = []
+        if ctx.guild is None:
+            space_problems.append(
+                "Run this in the server to get the category, channels and "
+                "roles — there's nothing to build them in from a DM."
+            )
+        else:
+            record["Discord"], space_problems = await create_tournament_space(
+                ctx.guild, record
+            )
+
         status = await save_tournament(record)
         if status != "ok":
             # The bracket exists but the record doesn't, so take it back down
-            # rather than leaving an orphan on the account.
+            # rather than leaving an orphan on the account. The channels stay:
+            # deleting them is never automatic.
             await challonge_delete_tournament(challonge["Id"])
             await ctx.send(view=simple_card(
                 f"Couldn't save the tournament (`{status}`), so the bracket "
@@ -8444,6 +8474,14 @@ async def tournament_create(ctx, tokens):
             return
 
     await ctx.send(view=tournament_card(record, heading="🏆 Tournament created"))
+    if space_problems:
+        await ctx.send(view=simple_card(
+            "\n".join(f"• {problem}" for problem in space_problems)
+            + "\n-# The tournament itself is fine — announcements fall back "
+              "to the standing tournament channel.",
+            heading="⚠️ Server setup was incomplete",
+            colour=discord.Color.orange(),
+        ))
 
 async def tournament_pool(ctx, tokens):
     record = await active_tournament()
@@ -8575,7 +8613,8 @@ async def tournament_cancel(ctx):
         heading="🏆 Cancelled", colour=discord.Color.red(),
     ))
 
-@bot.command(name="tournament", hidden=True, usage="<create|pool|cancel>")
+@bot.command(name="tournament", hidden=True,
+             usage="<create|pool|cancel|cleanup>")
 @is_admin()
 async def admin_tournament(ctx, action: str = None, *arguments: str):
     """!tournament — run a bracket: create it, curate its pool, track it."""
@@ -8588,6 +8627,8 @@ async def admin_tournament(ctx, action: str = None, *arguments: str):
         await tournament_pool(ctx, tokens)
     elif verb == "cancel":
         await tournament_cancel(ctx)
+    elif verb == "cleanup":
+        await tournament_cleanup(ctx, tokens)
     elif not verb:
         record = await active_tournament()
         if record is None:
@@ -8675,6 +8716,23 @@ def tournament_role_mention():
     except (TypeError, ValueError):
         return None
 
+def tournament_ping(record, ping):
+    """Which role an announcement should reach.
+
+    `"players"` narrows it to this tournament's own role, so a check-in call
+    doesn't ping the whole server -- but falls back to the standing
+    tournament role when the player role never got created.
+    """
+    if not ping:
+        return None
+    if ping == "players":
+        guild = tournament_guild(record)
+        role = (space_object(record, guild, "PlayerRoleId")
+                if guild is not None else None)
+        if role is not None:
+            return role.mention
+    return tournament_role_mention()
+
 def attach_mention(view, mention):
     """Put a mention inside the card, and say whether it landed.
 
@@ -8692,15 +8750,16 @@ def attach_mention(view, mention):
             return True
     return False
 
-async def announce_tournament(view, *, ping=False, crosspost=True):
-    """Post to the tournament channel. Returns the message, or None."""
-    channel = tournament_channel()
+async def announce_tournament(record, view, *, kind="info", ping=False,
+                              crosspost=True):
+    """Post to this tournament's own channel. Returns the message, or None."""
+    channel = tournament_destination(record, kind)
     if channel is None:
-        print("Tournament announcement skipped: TOURNAMENT_CHANNEL_ID is "
-              "unset or points at a channel I can't see")
+        print("Tournament announcement skipped: no tournament channel, and "
+              "TOURNAMENT_CHANNEL_ID is unset or unreachable")
         return None
 
-    pinged = attach_mention(view, tournament_role_mention() if ping else None)
+    pinged = attach_mention(view, tournament_ping(record, ping))
     try:
         message = await channel.send(
             view=view,
@@ -8923,6 +8982,8 @@ async def handle_registration(interaction):
         )
         return
 
+    await give_player_role(saved, discord_id)
+
     checkin_at = checkin_opens_at(saved)
     await reply_quietly(
         interaction,
@@ -8999,7 +9060,8 @@ async def open_registration(record):
         return
     record = saved
 
-    await announce_tournament(TournamentRegisterView(record), ping=True)
+    await announce_tournament(record, TournamentRegisterView(record),
+                              kind="registration", ping=True)
     if not record["Pool"]:
         await tell_host(
             record,
@@ -9043,7 +9105,8 @@ async def open_checkin(record):
 
     # A fresh view per destination: announcing mutates the card to carry the
     # role ping, which renders as a dead `<@&…>` once it reaches a DM.
-    await announce_tournament(TournamentCheckinView(record), ping=True)
+    await announce_tournament(record, TournamentCheckinView(record),
+                              ping="players")
     delivered = await dm_registrants(record, TournamentCheckinView(record))
     print(f"tournament {record['Id']}: check-in open, "
           f"{delivered}/{len(record['Players'])} DMs delivered")
@@ -9121,6 +9184,13 @@ async def start_bracket(record):
         )
         return
 
+    stripped = await strip_no_shows(
+        record, {player["DiscordId"] for player in checked_in}
+    )
+    if stripped:
+        print(f"tournament {record['Id']}: took the player role off "
+              f"{stripped} no-show(s)")
+
     seeded = await seed_players(checked_in)
     ok, result = await challonge_push_field(record, seeded)
     if not ok:
@@ -9154,14 +9224,14 @@ async def start_bracket(record):
         )
         return
 
-    await announce_tournament(simple_card(
+    await announce_tournament(saved, simple_card(
         f"**{len(seeded)}** players are in. First round is up.\n\n"
         f"🔗 {saved['Challonge']['Url']}\n\n"
         f"-# I'll DM you when your match is ready — check in, veto the maps, "
         f"then play.",
         heading=f"🏆 {saved['Name']} — bracket is live",
         colour=TOURNAMENT_COLOR,
-    ), ping=True)
+    ), ping="players")
 
 async def cancel_tournament(record, reason):
     """End a tournament that can't run, and say so where people registered."""
@@ -9175,12 +9245,13 @@ async def cancel_tournament(record, reason):
     if record["Challonge"]:
         await challonge_delete_tournament(record["Challonge"]["Id"])
 
-    await announce_tournament(simple_card(
+    await announce_tournament(record, simple_card(
         reason, heading="🏆 Cancelled", colour=discord.Color.red(),
-    ), ping=True)
+    ), ping="players")
     await tell_host(record, reason)
 
-async def fire_reminders(record, deadline, schedule, build):
+async def fire_reminders(record, deadline, schedule, build, *,
+                         kind="info", ping=False):
     """Post any reminder now due. Returns the Fired keys that went out."""
     now, fired = now_epoch(), []
     for lead, key in schedule:
@@ -9191,7 +9262,7 @@ async def fire_reminders(record, deadline, schedule, build):
         if deadline - lead <= now < deadline:
             view = build(record, deadline)
             if view is not None and await announce_tournament(
-                view, crosspost=False
+                record, view, kind=kind, ping=ping, crosspost=False
             ):
                 fired.append(key)
     return fired
@@ -9231,13 +9302,18 @@ async def advance_tournament(record):
             await open_registration(record)
         return
 
+    if phase == "live":
+        await check_bracket_complete(record)
+        return
+
     if phase == "registration":
         deadline = checkin_opens_at(record)
         if now >= deadline:
             await open_checkin(record)
             return
         fired = await fire_reminders(
-            record, deadline, REGISTRATION_REMINDERS, registration_reminder
+            record, deadline, REGISTRATION_REMINDERS, registration_reminder,
+            kind="registration",
         )
 
     elif phase == "checkin":
@@ -9246,7 +9322,8 @@ async def advance_tournament(record):
             await start_bracket(record)
             return
         fired = await fire_reminders(
-            record, deadline, CHECKIN_REMINDERS, checkin_reminder
+            record, deadline, CHECKIN_REMINDERS, checkin_reminder,
+            ping="players",
         )
 
     if fired:
@@ -9280,6 +9357,355 @@ async def tournament_tick():
 @tournament_tick.before_loop
 async def before_tournament_tick():
     await bot.wait_until_ready()
+
+# --- The tournament's corner of the server ---------------------------------
+# A tournament gets its own category, channels and roles so everything about
+# it is in one place and disappears from view when it's over. Nothing here is
+# ever deleted automatically: channels hold the conversation people had, so
+# tearing them down is an explicit `!tournament cleanup`.
+
+# Role names are capped well under Discord's 100, since the tournament name
+# goes in front of them.
+TOURNAMENT_NAME_IN_ROLE = 80
+WINNER_ROLE_COLOR = discord.Color(0xFFCC4D)
+
+def tournament_space(record):
+    return record.get("Discord") or {}
+
+def space_object(record, guild, field):
+    """One stored snowflake, resolved against the guild. None if it's gone."""
+    raw = tournament_space(record).get(field)
+    if not raw:
+        return None
+    try:
+        identifier = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if field.endswith("RoleId"):
+        return guild.get_role(identifier)
+    return guild.get_channel(identifier)
+
+def tournament_guild(record):
+    raw = tournament_space(record).get("GuildId")
+    if not raw:
+        return None
+    try:
+        return bot.get_guild(int(raw))
+    except (TypeError, ValueError):
+        return None
+
+async def create_tournament_space(guild, record):
+    """Build the category, its three channels and the two roles.
+
+    Returns (space, problems). A partial build is still returned: half a
+    category is more useful than none, and the host is told what's missing.
+    """
+    space, problems = {"GuildId": str(guild.id)}, []
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_channels:
+        return space, ["I need **Manage Channels** to build the category."]
+
+    short = record["Name"][:TOURNAMENT_NAME_IN_ROLE]
+
+    if me.guild_permissions.manage_roles:
+        try:
+            player_role = await guild.create_role(
+                name=f"{short} Player", colour=TOURNAMENT_COLOR,
+                mentionable=True,
+                reason=f"Tournament {record['Id']}: registered players",
+            )
+            space["PlayerRoleId"] = str(player_role.id)
+
+            winner_role = await guild.create_role(
+                name=f"{short} Champion", colour=WINNER_ROLE_COLOR,
+                hoist=True, mentionable=True,
+                reason=f"Tournament {record['Id']}: winner",
+            )
+            space["WinnerRoleId"] = str(winner_role.id)
+        except discord.HTTPException as error:
+            problems.append(f"Couldn't create the roles — {error}.")
+    else:
+        problems.append("I need **Manage Roles** to create the player and "
+                        "champion roles.")
+
+    everyone = guild.default_role
+    read_only = discord.PermissionOverwrite(
+        view_channel=True, send_messages=False, add_reactions=True,
+    )
+    open_to_all = discord.PermissionOverwrite(
+        view_channel=True, send_messages=True,
+    )
+    # Info and registration are the two channels the bot must post in, and
+    # denying @everyone would silence it too if its own role has no channel
+    # permission of its own.
+    speaks = discord.PermissionOverwrite(
+        view_channel=True, send_messages=True, embed_links=True,
+        manage_messages=True,
+    )
+    locked = {everyone: read_only, me: speaks}
+
+    try:
+        category = await guild.create_category(
+            record["Name"], reason=f"Tournament {record['Id']}",
+        )
+        space["CategoryId"] = str(category.id)
+
+        info = await category.create_text_channel(
+            "info", overwrites=locked,
+            topic=f"{record['Name']} — schedule, check-in and results.",
+        )
+        space["InfoChannelId"] = str(info.id)
+
+        registration = await category.create_text_channel(
+            "registration", overwrites=locked,
+            topic=f"{record['Name']} — sign up here.",
+        )
+        space["RegistrationChannelId"] = str(registration.id)
+
+        chat = await category.create_text_channel(
+            "tournament-chat", overwrites={everyone: open_to_all, me: speaks},
+            topic=f"{record['Name']} — talk here.",
+        )
+        space["ChatChannelId"] = str(chat.id)
+    except discord.HTTPException as error:
+        problems.append(f"Couldn't finish the category — {error}.")
+
+    return space, problems
+
+def tournament_destination(record, kind="info"):
+    """Where an announcement of this kind belongs.
+
+    Falls back to TOURNAMENT_CHANNEL_ID, so a tournament whose category
+    failed to build still announces somewhere.
+    """
+    guild = tournament_guild(record)
+    if guild is not None:
+        field = ("RegistrationChannelId" if kind == "registration"
+                 else "InfoChannelId")
+        channel = space_object(record, guild, field)
+        if channel is not None:
+            return channel
+    return tournament_channel()
+
+async def members_with_role(record, role_field):
+    """(guild, role) for one of the tournament's roles, or (None, None)."""
+    guild = tournament_guild(record)
+    if guild is None:
+        return None, None
+    role = space_object(record, guild, role_field)
+    if role is None or not manageable_role(guild, role.id):
+        return guild, None
+    return guild, role
+
+async def give_player_role(record, discord_id):
+    """Best effort: a role that doesn't land must not fail a registration."""
+    guild, role = await members_with_role(record, "PlayerRoleId")
+    if role is None:
+        return False
+    member = guild.get_member(int(discord_id))
+    if member is None:
+        return False
+    try:
+        await member.add_roles(role, reason="Registered for the tournament")
+        return True
+    except discord.HTTPException:
+        return False
+
+async def strip_no_shows(record, checked_in_ids):
+    """Take the player role off everyone who registered but never checked in.
+
+    After this the role means "is actually in the bracket", which is what
+    makes it worth pinging.
+    """
+    guild, role = await members_with_role(record, "PlayerRoleId")
+    if role is None:
+        return 0
+    removed = 0
+    for player in record["Players"]:
+        if player["DiscordId"] in checked_in_ids:
+            continue
+        member = guild.get_member(int(player["DiscordId"]))
+        if member is None or role not in member.roles:
+            continue
+        try:
+            await member.remove_roles(role, reason="Did not check in")
+            removed += 1
+        except discord.HTTPException:
+            continue
+    return removed
+
+async def crown_winner(record, discord_id):
+    guild, role = await members_with_role(record, "WinnerRoleId")
+    if role is None:
+        return False
+    member = guild.get_member(int(discord_id))
+    if member is None:
+        return False
+    try:
+        await member.add_roles(role, reason="Won the tournament")
+        return True
+    except discord.HTTPException:
+        return False
+
+# --- Watching the bracket finish -------------------------------------------
+
+async def challonge_standings(record):
+    """The bracket's state and its participants. Returns (state, players)."""
+    ok, data = await challonge_request(
+        f"tournaments/{record['Challonge']['Id']}.json",
+        params={"include_participants": 1},
+    )
+    if not ok:
+        return None, data
+
+    tournament = (data or {}).get("tournament") or {}
+    participants = []
+    for wrapper in tournament.get("participants") or []:
+        participant = (wrapper or {}).get("participant") or {}
+        if participant:
+            participants.append(participant)
+    return tournament.get("state"), participants
+
+def final_standings(participants):
+    """Everyone who placed, best first."""
+    ranked = [p for p in participants
+              if isinstance(p.get("final_rank"), int)]
+    ranked.sort(key=lambda p: p["final_rank"])
+    return ranked
+
+async def check_bracket_complete(record):
+    """Award the champion role once Challonge says the bracket is finished.
+
+    Polling for this is what lets a tournament run end to end today: results
+    can be entered on Challonge by hand and everything around them still
+    happens on its own.
+    """
+    state, participants = await challonge_standings(record)
+    if state is None:
+        print(f"tournament {record['Id']}: couldn't read the bracket "
+              f"({participants})")
+        return
+    if state != "complete":
+        return
+
+    standings = final_standings(participants)
+    if not standings:
+        await tell_host(
+            record,
+            f"**{record['Name']}** is complete on Challonge, but it came "
+            f"back with no final ranks, so nobody could be crowned.",
+        )
+        return
+
+    champion = standings[0]
+    winner_discord_id = str(champion.get("misc") or "")
+    crowned = (await crown_winner(record, winner_discord_id)
+               if winner_discord_id else False)
+
+    def transform(stored):
+        stored["Phase"] = "done"
+        stored["Winner"] = {
+            "Name": champion.get("name"),
+            "DiscordId": winner_discord_id or None,
+        }
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if status != "ok":
+        print(f"tournament {record['Id']}: couldn't record the winner "
+              f"({status})")
+        saved = record
+
+    # Plain medals rather than the game's own emoji, whose top place is a
+    # diamond -- a podium is read at a glance and shouldn't need decoding.
+    podium = []
+    for participant in standings[:3]:
+        rank = participant["final_rank"]
+        medal = ("🥇", "🥈", "🥉")[rank - 1] if 1 <= rank <= 3 else f"`#{rank}`"
+        who = participant.get("misc")
+        name = participant.get("name") or "Unknown"
+        podium.append(f"{medal} **{name}**" + (f" · <@{who}>" if who else ""))
+
+    note = ""
+    if winner_discord_id and not crowned:
+        note = ("\n-# Couldn't hand out the champion role — check that mine "
+                "sits above it and that they're still in the server.")
+
+    await announce_tournament(saved, simple_card(
+        "\n".join(podium)
+        + f"\n\n🔗 {saved['Challonge']['Url']}{note}",
+        heading=f"🏆 {saved['Name']} — we have a winner",
+        colour=WINNER_ROLE_COLOR,
+    ), ping=True)
+
+# --- !tournament cleanup ---------------------------------------------------
+
+async def tournament_cleanup(ctx, tokens):
+    """Delete a finished tournament's category, channels and roles."""
+    positional, _ = split_flags(tokens)
+    wanted = positional[0] if positional else None
+
+    if wanted:
+        record = await read_tournament(wanted)
+        if record is None:
+            await ctx.send(view=simple_card(
+                f"No tournament with ID `{wanted}`.",
+                colour=discord.Color.red(),
+            ))
+            return
+    else:
+        record = await active_tournament()
+        if record is None:
+            await ctx.send(view=simple_card(
+                "No tournament is running. Name one by ID to clean up a "
+                "finished one: `!tournament cleanup <id>`.",
+                colour=discord.Color.greyple(),
+            ))
+            return
+        if record["Phase"] in ("registration", "checkin", "live"):
+            await ctx.send(view=simple_card(
+                f"**{record['Name']}** is still `{record['Phase']}` — that "
+                f"would delete the channels people are using. Cancel or "
+                f"finish it first.",
+                colour=discord.Color.red(),
+            ))
+            return
+
+    guild = tournament_guild(record)
+    if guild is None:
+        await ctx.send(view=simple_card(
+            "That tournament has no channels on record.",
+            colour=discord.Color.greyple(),
+        ))
+        return
+
+    removed, failed = [], []
+    async with ctx.typing():
+        # Channels first, then the category they sat in.
+        for field in ("InfoChannelId", "RegistrationChannelId",
+                      "ChatChannelId", "CategoryId", "PlayerRoleId",
+                      "WinnerRoleId"):
+            target = space_object(record, guild, field)
+            if target is None:
+                continue
+            try:
+                await target.delete(reason=f"Tournament {record['Id']} cleanup")
+                removed.append(f"`{target.name}`")
+            except discord.HTTPException:
+                failed.append(f"`{target.name}`")
+
+        record["Discord"] = {}
+        await save_tournament(record)
+
+    lines = []
+    if removed:
+        lines.append("🗑️ Removed " + ", ".join(removed))
+    if failed:
+        lines.append("⚠️ Couldn't remove " + ", ".join(failed))
+    await ctx.send(view=simple_card(
+        "\n".join(lines) or "There was nothing left to remove.",
+        heading=f"🧹 {record['Name']}",
+    ))
 
 def register_dev_variants():
     """Give every command a prefix-only !dev_ twin bound to DEV_UNIVERSE_ID.
