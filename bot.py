@@ -8139,6 +8139,11 @@ async def challonge_token(*, renew=False):
     if not token:
         return None, "Challonge returned no access token."
 
+    # The granted scope is the first thing to check behind a 401 from an
+    # app-scoped endpoint: a token can be issued with less than was asked for.
+    print(f"challonge token issued: scope={payload.get('scope')!r} "
+          f"expires_in={payload.get('expires_in')!r}")
+
     lifetime = payload.get("expires_in")
     lifetime = lifetime if isinstance(lifetime, int) else 3600
     _challonge_token["value"] = token
@@ -8148,11 +8153,17 @@ async def challonge_token(*, renew=False):
     return token, None
 
 def challonge_error(body, status):
-    """Surface whatever Challonge said. v2 reports JSON:API `errors`."""
+    """Surface whatever Challonge said. v2 reports JSON:API `errors`.
+
+    Falls back to the raw body, because a bare "HTTP 401" says nothing about
+    which of credentials, scope or path was actually wrong.
+    """
+    fallback = f"HTTP {status}" + (f" — `{body.strip()[:200]}`"
+                                   if body and body.strip() else "")
     try:
         parsed = json.loads(body)
     except (ValueError, TypeError):
-        return f"HTTP {status}"
+        return fallback
 
     if isinstance(parsed, dict):
         errors = parsed.get("errors")
@@ -8164,12 +8175,12 @@ def challonge_error(body, status):
                                         or error.get("title") or error))
                 else:
                     messages.append(str(error))
-            return "; ".join(messages)
+            return "; ".join(messages) or fallback
         # The token endpoint uses the plain OAuth shape instead.
         described = parsed.get("error_description") or parsed.get("error")
         if described:
             return str(described)
-    return f"HTTP {status}"
+    return fallback
 
 async def challonge_request(path, *, method="GET", payload=None, params=None,
                             _retried=False):
@@ -8251,7 +8262,7 @@ async def challonge_create_tournament(record):
         },
     }}
     ok, data = await challonge_request(
-        "application/tournaments.json", method="POST", payload=payload
+        "application/tournaments", method="POST", payload=payload
     )
     if not ok:
         return False, data
@@ -8270,7 +8281,7 @@ async def challonge_create_tournament(record):
 
 async def challonge_delete_tournament(challonge_id):
     return await challonge_request(
-        f"application/tournaments/{challonge_id}.json", method="DELETE"
+        f"application/tournaments/{challonge_id}", method="DELETE"
     )
 
 # --- Map pool --------------------------------------------------------------
@@ -9261,7 +9272,7 @@ async def challonge_push_field(record, players):
             },
         }}
         ok, data = await challonge_request(
-            f"application/tournaments/{challonge_id}/participants.json",
+            f"application/tournaments/{challonge_id}/participants",
             method="POST", payload=payload,
         )
         if not ok:
@@ -9273,7 +9284,7 @@ async def challonge_push_field(record, players):
             by_discord[player["DiscordId"]] = str(resource["id"])
 
     ok, data = await challonge_request(
-        f"application/tournaments/{challonge_id}/change_state.json",
+        f"application/tournaments/{challonge_id}/change_state",
         method="PUT",
         payload={"data": {
             "type": "TournamentState",
@@ -9294,7 +9305,7 @@ async def challonge_standings(record):
     """
     challonge_id = record["Challonge"]["Id"]
     ok, data = await challonge_request(
-        f"application/tournaments/{challonge_id}.json"
+        f"application/tournaments/{challonge_id}"
     )
     if not ok:
         return None, data
@@ -9302,7 +9313,7 @@ async def challonge_standings(record):
     state = challonge_attributes((data or {}).get("data") or {}).get("state")
 
     ok, data = await challonge_request(
-        f"application/tournaments/{challonge_id}/participants.json"
+        f"application/tournaments/{challonge_id}/participants"
     )
     if not ok:
         return None, data
