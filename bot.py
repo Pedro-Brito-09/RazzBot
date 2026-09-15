@@ -5,7 +5,6 @@ import os
 import aiohttp
 import json
 import base64
-import hashlib
 import zstandard as zstd
 import traceback
 import asyncio
@@ -1070,6 +1069,50 @@ async def update_entry_resource(
     except (asyncio.TimeoutError, aiohttp.ClientError) as error:
         print(
             f"update_entry_resource({datastore}/{entry_key}) failed: "
+            f"{type(error).__name__}: {error}"
+        )
+        return "error"
+
+async def create_entry_resource(entry_key, datastore, value, *,
+                                universe_id=None, api_key=None):
+    """Create an entry that doesn't exist yet. Returns ok/conflict/error.
+
+    v2 has a distinct create endpoint, and PATCH with allowMissing is not a
+    substitute for it: against a data store that has never been written to,
+    the PATCH answers 400 "Value cannot be null. (Parameter 'value')", naming
+    the payload when the store is what's absent. The POST creates both.
+    """
+    url = (
+        f"https://apis.roblox.com/cloud/v2/universes/"
+        f"{universe_id or current_universe()}/"
+        f"data-stores/{quote(datastore, safe='')}/entries"
+    )
+    headers = {
+        "x-api-key": api_key or API_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    session = await get_session()
+    try:
+        async with session.post(
+            url, headers=headers, params={"entry_id": str(entry_key)},
+            json={"value": value},
+        ) as resp:
+            if resp.status in (200, 201):
+                return "ok"
+            # Someone created it between the read and here.
+            if resp.status in (409, 412):
+                return "conflict"
+            body = (await resp.text())[:200]
+            print(
+                f"create_entry_resource({datastore}/{entry_key}) "
+                f"-> HTTP {resp.status}: {body}"
+            )
+            return "error"
+    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+        print(
+            f"create_entry_resource({datastore}/{entry_key}) failed: "
             f"{type(error).__name__}: {error}"
         )
         return "error"
@@ -7999,132 +8042,69 @@ def checkin_opens_at(record):
 # under its own key. One tournament's players and matches never have to be
 # read to find out whether another one is due.
 #
-# These go through the *v1* datastore API rather than the v2 one the rest of
-# the bot uses, for two reasons that both only bite a datastore being written
-# for the first time:
-#   * v2 cannot create a datastore. It answers a write into a missing one with
-#     400 "Value cannot be null. (Parameter 'value')", which names the wrong
-#     thing entirely; the read alongside it is the honest one, 404 "Data store
-#     not found". v1 creates the datastore on first write.
-#   * v2 rejects a bare JSON object as an entry value even once the datastore
-#     exists (https://devforum.roblox.com/t/4734632), while v1 stores it as a
-#     proper Luau table.
-# Every other datastore here already exists and holds lists or buffers, which
-# is why nothing else has needed this.
+# Two things about the v2 datastore API shape this, and both only bite the
+# first write to a store that has never existed:
+#   * PATCH cannot create. Against a missing data store it answers 400 "Value
+#     cannot be null. (Parameter 'value')", which blames the payload when the
+#     store is what's absent -- the 404 "Data store not found" on the read
+#     beside it is the honest half. Creation goes through POST instead.
+#   * A bare JSON object as an entry value is rejected even once the store
+#     exists (https://devforum.roblox.com/t/4734632), while an array of those
+#     same objects is accepted -- PendingRewards writes exactly that and has
+#     always worked. So a record is stored as a one-element list.
 
-DATASTORE_V1_ENTRY = (
-    "https://apis.roblox.com/datastores/v1/universes/{universe}"
-    "/standard-datastores/datastore/entries/entry"
-)
+def wrap_record(record):
+    return [record]
 
-def datastore_v1_headers(body=None):
-    headers = {"x-api-key": API_KEY, "Accept": "application/json"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-        # v1 verifies the body against this and 400s without it.
-        headers["content-md5"] = base64.b64encode(
-            hashlib.md5(body.encode("utf-8")).digest()
-        ).decode("ascii")
-    return headers
+def unwrap_record(stored):
+    """A stored record, whether it was wrapped or written bare."""
+    if isinstance(stored, list):
+        stored = stored[0] if stored else None
+    return stored if isinstance(stored, dict) else None
 
-async def read_entry_v1(datastore, key):
-    """Returns (status, value, version). Status is ok / missing / error."""
-    url = DATASTORE_V1_ENTRY.format(universe=current_universe())
-    params = {"datastoreName": datastore, "entryKey": key}
-    try:
-        session = await get_session()
-        async with session.get(
-            url, headers=datastore_v1_headers(), params=params,
-        ) as resp:
-            body = await resp.text()
-            if resp.status == 204 or resp.status == 404:
-                return "missing", None, None
-            if resp.status != 200:
-                print(f"read_entry_v1({datastore}/{key}) -> "
-                      f"HTTP {resp.status}: {body[:200]}")
-                return "error", None, None
-            version = resp.headers.get("roblox-entry-version")
-            try:
-                return "ok", json.loads(body), version
-            except ValueError:
-                return "error", None, None
-    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
-        print(f"read_entry_v1({datastore}/{key}) failed: "
-              f"{type(error).__name__}: {error}")
-        return "error", None, None
+async def update_tournament_entry(key, transform, *, attempts=4):
+    """Read-modify-write one entry in the tournament store.
 
-async def write_entry_v1(datastore, key, value, *, match_version=None,
-                         exclusive_create=False):
-    """Write one entry. Returns ok / conflict / error.
-
-    The datastore is created if it isn't there yet, which is the whole point
-    of using v1 for this.
-    """
-    url = DATASTORE_V1_ENTRY.format(universe=current_universe())
-    params = {"datastoreName": datastore, "entryKey": key}
-    if match_version:
-        params["matchVersion"] = match_version
-    elif exclusive_create:
-        params["exclusiveCreate"] = "true"
-
-    body = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    try:
-        session = await get_session()
-        async with session.post(
-            url, headers=datastore_v1_headers(body), params=params,
-            data=body.encode("utf-8"),
-        ) as resp:
-            if resp.status in (200, 201):
-                return "ok"
-            # Someone wrote underneath us, or exclusiveCreate lost the race.
-            if resp.status in (409, 412):
-                return "conflict"
-            text = (await resp.text())[:200]
-            print(f"write_entry_v1({datastore}/{key}) -> "
-                  f"HTTP {resp.status}: {text}")
-            return "error"
-    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
-        print(f"write_entry_v1({datastore}/{key}) failed: "
-              f"{type(error).__name__}: {error}")
-        return "error"
-
-async def update_entry_v1(datastore, key, transform, *, attempts=4):
-    """Read-modify-write one v1 entry, guarded by its version.
-
-    The same contract as update_entry_with_retry, so a lost update can't slip
-    through when two people press Register in the same second.
+    Same contract as update_entry_with_retry -- ok / skipped / conflict /
+    error, with the ETag guarding the write -- but it creates the entry, and
+    the store, when they aren't there yet.
     """
     for attempt in range(1, attempts + 1):
-        status, stored, version = await read_entry_v1(datastore, key)
-        if status == "error":
-            return "error", None
+        status, resource = await fetch_entry_resource(key,
+                                                      TOURNAMENTS_DATASTORE)
+        if status not in ("ok", "missing"):
+            return status, None
 
-        new_value = transform(stored if status == "ok" else None)
-        if new_value is None:
-            return "skipped", None
+        if status == "missing":
+            new_value = transform(None)
+            if new_value is None:
+                return "skipped", None
+            result = await create_entry_resource(
+                key, TOURNAMENTS_DATASTORE, new_value
+            )
+        else:
+            new_value = transform(decode_entry_value(resource.get("value")))
+            if new_value is None:
+                return "skipped", None
+            result = await update_entry_resource(
+                key, TOURNAMENTS_DATASTORE, new_value,
+                etag=resource.get("etag"),
+            )
 
-        result = await write_entry_v1(
-            datastore, key, new_value,
-            match_version=version if status == "ok" else None,
-            exclusive_create=status == "missing",
-        )
         if result == "ok":
             return "ok", new_value
         if result != "conflict":
             return result, None
 
-        print(f"update_entry_v1({datastore}/{key}) conflict on attempt "
-              f"{attempt}")
+        # Written underneath us -- re-read and reapply.
+        print(f"update_tournament_entry({key}) conflict on attempt {attempt}")
         await asyncio.sleep(0.5 * attempt)
     return "conflict", None
 
 async def read_tournament_index():
-    status, stored, _version = await read_entry_v1(
-        TOURNAMENTS_DATASTORE, TOURNAMENT_INDEX_KEY
-    )
-    if status != "ok" or not isinstance(stored, list):
-        return []
-    return stored
+    stored = await fetch_entry(TOURNAMENT_INDEX_KEY,
+                               datastore=TOURNAMENTS_DATASTORE)
+    return stored if isinstance(stored, list) else []
 
 def index_summary(record):
     """The slice of a tournament the scheduler needs before loading it."""
@@ -8162,12 +8142,12 @@ def normalize_tournament(record):
     return record
 
 async def read_tournament(tournament_id):
-    status, stored, _version = await read_entry_v1(
-        TOURNAMENTS_DATASTORE, tournament_key(tournament_id)
-    )
-    if status != "ok" or not isinstance(stored, dict):
+    record = unwrap_record(await fetch_entry(
+        tournament_key(tournament_id), datastore=TOURNAMENTS_DATASTORE
+    ))
+    if record is None:
         return None
-    return normalize_tournament(stored)
+    return normalize_tournament(record)
 
 async def save_tournament(record):
     """Write the record, then bring its index summary into step.
@@ -8176,18 +8156,46 @@ async def save_tournament(record):
     crash between the two leaves a stale summary, which the next phase change
     corrects, rather than an index pointing at a record that isn't there.
     """
-    status, _saved = await update_entry_v1(
-        TOURNAMENTS_DATASTORE, tournament_key(record["Id"]),
-        lambda _stored: record,
+    status, _saved = await update_tournament_entry(
+        tournament_key(record["Id"]), lambda _stored: wrap_record(record),
     )
     if status != "ok":
         return status
 
-    status, _index = await update_entry_v1(
-        TOURNAMENTS_DATASTORE, TOURNAMENT_INDEX_KEY,
-        lambda stored: merge_index(stored, record),
+    status, _index = await update_tournament_entry(
+        TOURNAMENT_INDEX_KEY, lambda stored: merge_index(stored, record),
     )
     return status
+
+async def update_tournament(tournament_id, transform):
+    """Read-modify-write one tournament under its ETag.
+
+    save_tournament overwrites wholesale, which is fine for a host command
+    but not for a button two people can press in the same second. Anything
+    driven by a player goes through here so a registration can't land on top
+    of another one.
+    """
+    outcome = {"record": None}
+
+    def apply(stored):
+        record = unwrap_record(stored)
+        if record is None:
+            return None
+        changed = transform(normalize_tournament(record))
+        if changed is None:
+            return None
+        outcome["record"] = changed
+        return wrap_record(changed)
+
+    status, _saved = await update_tournament_entry(
+        tournament_key(tournament_id), apply
+    )
+    if status == "ok" and outcome["record"] is not None:
+        await update_tournament_entry(
+            TOURNAMENT_INDEX_KEY,
+            lambda stored: merge_index(stored, outcome["record"]),
+        )
+    return status, outcome["record"]
 
 async def active_tournament():
     """The one tournament still running, or None.
@@ -8935,35 +8943,6 @@ CHECKIN_REMINDERS = ((900, "checkin:15m"),)
 # handler can look up the active one instead of carrying an ID around.
 REGISTER_BUTTON_ID = "tournament:register"
 CHECKIN_BUTTON_ID = "tournament:checkin"
-
-async def update_tournament(tournament_id, transform):
-    """Read-modify-write one tournament, guarded by its entry version.
-
-    save_tournament overwrites wholesale, which is fine for a host command
-    but not for a button two people can press in the same second. Anything
-    driven by a player goes through here so a registration can't land on top
-    of another one.
-    """
-    outcome = {"record": None}
-
-    def apply(stored):
-        if not isinstance(stored, dict):
-            return None
-        changed = transform(normalize_tournament(stored))
-        if changed is None:
-            return None
-        outcome["record"] = changed
-        return changed
-
-    status, _saved = await update_entry_v1(
-        TOURNAMENTS_DATASTORE, tournament_key(tournament_id), apply,
-    )
-    if status == "ok" and outcome["record"] is not None:
-        await update_entry_v1(
-            TOURNAMENTS_DATASTORE, TOURNAMENT_INDEX_KEY,
-            lambda stored: merge_index(stored, outcome["record"]),
-        )
-    return status, outcome["record"]
 
 def tournament_channel():
     try:
