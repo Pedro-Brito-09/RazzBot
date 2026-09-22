@@ -7954,6 +7954,10 @@ TOURNAMENT_USAGE = (
     "**`!tournament pool <5 map ids>`** — set the veto pool\n"
     "**`!tournament pool`** — show it, in DMs\n"
     "**`!tournament pool swap <old> <new>`** — replace one map\n"
+    "**`!tournament edit <field> <value>`** — change a date, cap or name\n"
+    "**`!tournament seed`** — the order as it stands · "
+    "`seed <player> <n>` pins one\n"
+    "**`!tournament add|drop <player>`** — register or remove someone\n"
     "**`!tournament result <match> <a>-<b>`** — enter a score, higher seed "
     "first as the thread shows it\n"
     "**`!tournament ff <match> <player>`** — that player forfeits\n"
@@ -8220,7 +8224,7 @@ def merge_index(stored, record):
 # back to the shape the code expects rather than guarded at each use.
 TOURNAMENT_LIST_FIELDS = ("Pool", "Players", "CheckedIn", "Fired",
                           "Seeded", "Standings")
-TOURNAMENT_DICT_FIELDS = ("Matches", "Discord")
+TOURNAMENT_DICT_FIELDS = ("Matches", "Discord", "SeedOverrides")
 
 def normalize_tournament(record):
     for field in TOURNAMENT_LIST_FIELDS:
@@ -9032,7 +9036,8 @@ async def tournament_cancel(ctx, tokens=()):
     ))
 
 @bot.command(name="tournament", hidden=True,
-             usage="<create|pool|result|ff|sync|cancel|cleanup>")
+             usage="<create|pool|edit|seed|add|drop|result|ff|sync|"
+                   "cancel|cleanup>")
 @is_admin()
 async def admin_tournament(ctx, action: str = None, *arguments: str):
     """!tournament — run a bracket: create it, curate its pool, track it."""
@@ -9053,6 +9058,14 @@ async def admin_tournament(ctx, action: str = None, *arguments: str):
         await tournament_forfeit(ctx, tokens)
     elif verb == "sync":
         await tournament_sync(ctx)
+    elif verb == "edit":
+        await tournament_edit(ctx, tokens)
+    elif verb == "seed":
+        await tournament_seed(ctx, tokens)
+    elif verb == "add":
+        await tournament_add(ctx, tokens)
+    elif verb == "drop":
+        await tournament_drop(ctx, tokens)
     elif not verb:
         record = await active_tournament()
         if record is None:
@@ -9589,7 +9602,7 @@ def form_score(scores):
     weights = SEED_HISTORY_WEIGHTS[:len(scores)]
     return sum(w * s for w, s in zip(weights, scores)) / sum(weights)
 
-async def seed_players(players):
+async def seed_players(players, overrides=None):
     """Order the field strongest first, by recent form and career wins.
 
     Seeding off something real is what keeps the top of the bracket from
@@ -9627,7 +9640,36 @@ async def seed_players(players):
 
     # Stable, so a dead heat on both keeps registration order.
     scored.sort(key=lambda item: (-item[0], -item[1]))
-    return [player for _total, _wins, player in scored]
+    ordered = [player for _total, _wins, player in scored]
+    return apply_seed_overrides(ordered, overrides)
+
+def apply_seed_overrides(ordered, overrides):
+    """Drop hand-pinned players into the seeds the host asked for.
+
+    Everyone else keeps their computed order and slides around the pins, so
+    pinning one player doesn't reshuffle the rest of the bracket.
+    """
+    if not overrides:
+        return ordered
+
+    by_id = {player["DiscordId"]: player for player in ordered}
+    pinned = sorted(
+        ((int(seed), discord_id) for discord_id, seed in overrides.items()
+         if discord_id in by_id),
+        key=lambda pair: pair[0],
+    )
+    if not pinned:
+        return ordered
+
+    taken = {discord_id for _seed, discord_id in pinned}
+    rest = [player for player in ordered if player["DiscordId"] not in taken]
+    placed = []
+    for seed, discord_id in pinned:
+        while len(placed) < seed - 1 and rest:
+            placed.append(rest.pop(0))
+        placed.append(by_id[discord_id])
+    placed.extend(rest)
+    return placed
 
 async def challonge_push_field(record, players):
     """Fill the bracket with the checked-in field, then start it.
@@ -9717,7 +9759,7 @@ async def start_bracket(record):
         print(f"tournament {record['Id']}: took the player role off "
               f"{stripped} no-show(s)")
 
-    seeded = await seed_players(checked_in)
+    seeded = await seed_players(checked_in, record.get("SeedOverrides"))
     for position, player in enumerate(seeded, 1):
         score = player["SeedScore"]
         print(f"tournament {record['Id']}: seed {position} {player['Name']} "
@@ -11347,6 +11389,412 @@ async def match_command(ctx):
                 f"best of {record['BestOf']}.")
     await reply(f"**{match_label(record, match)}**\n"
                 f"vs **{player_name(record, opponent)}**\n\n{step}\n{thread}")
+
+# --- Editing a tournament after it exists ----------------------------------
+# One field per call, because a time is one token or two ("+2h" against
+# "03/10/2026 20:00") and flag parsing can't tell where the value ends.
+# Each field says which phases still accept it: a cap means nothing once
+# registration has closed, and times mean nothing once matches have started.
+TOURNAMENT_EDITABLE = {
+    "name": ("draft", "registration", "checkin", "live"),
+    "register": ("draft", "registration"),
+    "matches": ("draft", "registration", "checkin"),
+    "checkin": ("draft", "registration"),
+    "match-checkin": ("draft", "registration", "checkin", "live"),
+    "cap": ("draft", "registration"),
+    "min": ("draft", "registration", "checkin"),
+    "bo": ("draft", "registration", "checkin"),
+    "format": ("draft", "registration"),
+    "private": ("draft", "registration", "checkin", "live"),
+    "public": ("draft", "registration", "checkin", "live"),
+}
+TOURNAMENT_EDIT_USAGE = (
+    "**`!tournament edit <field> <value>`**\n"
+    "-# `name` · `register` · `matches` · `checkin` · `match-checkin` · "
+    "`cap` · `min` · `bo` · `format` · `private` · `public`\n"
+    "-# `!tournament edit matches 03/10/2026 20:00` · "
+    "`!tournament edit cap 32` · `!tournament edit private`"
+)
+
+async def challonge_update_tournament(record, attributes):
+    """Push renamed/reshaped details to the bracket. One request."""
+    return await challonge_request(
+        f"application/tournaments/{record['Challonge']['Id']}",
+        method="PUT",
+        payload={"data": {"type": "tournament", "attributes": attributes}},
+    )
+
+async def rename_tournament_space(record, name):
+    """Best effort: the category and the two roles follow the new name."""
+    guild = tournament_guild(record)
+    if guild is None:
+        return
+    short = name[:TOURNAMENT_NAME_IN_ROLE]
+    for field, new_name in (("CategoryId", name),
+                            ("PlayerRoleId", f"{short} Player"),
+                            ("WinnerRoleId", f"{short} Champion")):
+        target = space_object(record, guild, field)
+        if target is None:
+            continue
+        try:
+            await target.edit(name=new_name)
+        except discord.HTTPException:
+            continue
+
+async def tournament_edit(ctx, tokens):
+    record = await active_tournament()
+    if record is None:
+        await ctx.send(view=simple_card("No tournament is running.",
+                                        colour=discord.Color.greyple()))
+        return
+    if not tokens:
+        await ctx.send(view=simple_card(TOURNAMENT_EDIT_USAGE,
+                                        heading="✏️ Edit"))
+        return
+
+    field = tokens[0].strip().lower().lstrip("-")
+    value = " ".join(tokens[1:]).strip()
+    allowed = TOURNAMENT_EDITABLE.get(field)
+    if allowed is None:
+        await ctx.send(view=simple_card(
+            f"`{field}` isn't an editable field.\n\n{TOURNAMENT_EDIT_USAGE}",
+            colour=discord.Color.red()))
+        return
+    if record["Phase"] not in allowed:
+        await ctx.send(view=simple_card(
+            f"`{field}` can't be changed once a tournament is "
+            f"`{record['Phase']}`.",
+            colour=discord.Color.red()))
+        return
+    if field not in ("private", "public") and not value:
+        await ctx.send(view=simple_card(f"`{field}` needs a value.",
+                                        colour=discord.Color.red()))
+        return
+
+    changed = dict(record)
+    bracket = {}
+    note = ""
+
+    if field == "name":
+        changed["Name"] = value
+        bracket["name"] = value
+    elif field in ("private", "public"):
+        changed["Private"] = field == "private"
+        note = ("-# Existing channels keep the permissions they were built "
+                "with — this only labels the tournament.")
+    elif field in ("register", "matches"):
+        moment, used = take_time(tokens, 1)
+        if moment is None or used + 1 != len(tokens):
+            await ctx.send(view=simple_card(
+                f"Couldn't read that time. Use one of: "
+                f"{TOURNAMENT_TIME_HELP}", colour=discord.Color.red()))
+            return
+        changed["RegisterStart" if field == "register"
+                else "MatchesStart"] = moment
+    else:
+        numbers = {"checkin": "CheckinMinutes", "match-checkin":
+                   "MatchCheckinMinutes", "cap": "Cap", "min": "MinPlayers",
+                   "bo": "BestOf"}
+        if field == "format":
+            if value.lower() not in CHALLONGE_FORMATS:
+                await ctx.send(view=simple_card(
+                    "`format` is `single` or `double`.",
+                    colour=discord.Color.red()))
+                return
+            changed["Format"] = value.lower()
+            bracket["tournament_type"] = CHALLONGE_FORMATS[value.lower()]
+        else:
+            if value.lower() in ("none", "off") and field == "cap":
+                changed["Cap"] = None
+            else:
+                try:
+                    number = int(value)
+                except ValueError:
+                    await ctx.send(view=simple_card(
+                        f"`{field}` takes a number.",
+                        colour=discord.Color.red()))
+                    return
+                if number < 1:
+                    await ctx.send(view=simple_card(
+                        f"`{field}` has to be at least 1.",
+                        colour=discord.Color.red()))
+                    return
+                changed[numbers[field]] = number
+
+    # A schedule still has to make sense after the edit.
+    if field in ("register", "matches", "checkin"):
+        problems = []
+        checkin_at = checkin_opens_at(changed)
+        if changed["MatchesStart"] <= changed["RegisterStart"]:
+            problems.append("Matches would start before registration opens.")
+        elif checkin_at <= changed["RegisterStart"]:
+            problems.append(
+                f"Check-in would open {when(checkin_at)}, before registration "
+                f"even closes.")
+        if changed["MatchesStart"] <= now_epoch():
+            problems.append("Matches would start in the past.")
+        if problems:
+            await ctx.send(view=simple_card(
+                "\n".join(f"• {problem}" for problem in problems),
+                heading="✏️ Not changed", colour=discord.Color.red()))
+            return
+        # Reminders are recorded as fired; a moved deadline earns them again.
+        changed["Fired"] = []
+
+    async with ctx.typing():
+        if bracket and record["Challonge"]:
+            ok, reason = await challonge_update_tournament(record, bracket)
+            if not ok:
+                await ctx.send(view=simple_card(
+                    f"Challonge wouldn't take that — {reason}",
+                    colour=discord.Color.red()))
+                return
+        status = await save_tournament(changed)
+        if status == "ok" and field == "name":
+            await rename_tournament_space(changed, value)
+
+    if status != "ok":
+        await ctx.send(view=simple_card(f"Couldn't save that (`{status}`).",
+                                        colour=discord.Color.red()))
+        return
+    await ctx.send(view=tournament_card(
+        changed, heading=f"✏️ {field} updated"))
+    if note:
+        await ctx.send(view=simple_card(note,
+                                        colour=discord.Color.greyple()))
+
+# --- Seeding by hand -------------------------------------------------------
+
+async def seeding_preview(record):
+    """The order the bracket would be built in right now."""
+    field = [player for player in record["Players"]
+             if record["Phase"] != "checkin"
+             or player["DiscordId"] in record["CheckedIn"]]
+    if not field:
+        return None
+    return await seed_players(field, record.get("SeedOverrides"))
+
+async def tournament_seed(ctx, tokens):
+    record = await active_tournament()
+    if record is None:
+        await ctx.send(view=simple_card("No tournament is running.",
+                                        colour=discord.Color.greyple()))
+        return
+    if record["Phase"] in ("live", "done"):
+        await ctx.send(view=simple_card(
+            "The bracket is already built — seeding is fixed now.",
+            colour=discord.Color.red()))
+        return
+
+    overrides = dict(record.get("SeedOverrides") or {})
+    positional, _ = split_flags(tokens)
+
+    # No arguments: show what the bracket would look like.
+    if not positional:
+        async with ctx.typing():
+            order = await seeding_preview(record)
+        if not order:
+            await ctx.send(view=simple_card("Nobody's registered yet.",
+                                            colour=discord.Color.greyple()))
+            return
+        lines = []
+        for position, player in enumerate(order, 1):
+            score = player.get("SeedScore") or {}
+            pinned = " 📌" if player["DiscordId"] in overrides else ""
+            lines.append(
+                f"`{position:>2}.` **{player['Name']}**{pinned}\n"
+                f"-# form {score.get('Form', 0)} from {score.get('Played', 0)}"
+                f" · {score.get('Wins', 0)} wins")
+        await ctx.send(view=simple_card(
+            "\n".join(lines) + "\n\n-# `!tournament seed <player> <n>` pins "
+            "someone · `!tournament seed auto` clears every pin.",
+            heading="🎚️ Seeding as it stands", colour=TOURNAMENT_COLOR))
+        return
+
+    if positional[0].lower() == "auto":
+        record["SeedOverrides"] = {}
+        status = await save_tournament(record)
+        await ctx.send(view=simple_card(
+            "Every pin cleared — seeding is back to form and wins alone."
+            if status == "ok" else f"Couldn't save that (`{status}`).",
+            colour=TOURNAMENT_COLOR if status == "ok"
+            else discord.Color.red()))
+        return
+
+    clearing = positional[0].lower() == "clear"
+    rest = positional[1:] if clearing else positional
+    if not rest or (not clearing and len(rest) != 2):
+        await ctx.send(view=simple_card(
+            "**`!tournament seed <player> <n>`** · "
+            "**`!tournament seed clear <player>`** · "
+            "**`!tournament seed auto`**", colour=discord.Color.red()))
+        return
+
+    member = await find_discord_user(ctx, rest[0])
+    target = str(member.id) if member else None
+    if target is None or player_by_discord(record, target) is None:
+        await ctx.send(view=simple_card(
+            f"`{rest[0]}` isn't registered for this one.",
+            colour=discord.Color.red()))
+        return
+
+    if clearing:
+        overrides.pop(target, None)
+        message = f"**{player_name(record, target)}** is no longer pinned."
+    else:
+        try:
+            position = int(rest[1])
+        except ValueError:
+            await ctx.send(view=simple_card("The seed has to be a number.",
+                                            colour=discord.Color.red()))
+            return
+        if position < 1 or position > max(len(record["Players"]), 1):
+            await ctx.send(view=simple_card(
+                f"Seed has to be between 1 and {len(record['Players'])}.",
+                colour=discord.Color.red()))
+            return
+        overrides[target] = position
+        message = (f"**{player_name(record, target)}** is pinned to seed "
+                   f"**{position}**.")
+
+    record["SeedOverrides"] = overrides
+    status = await save_tournament(record)
+    await ctx.send(view=simple_card(
+        message + "\n-# `!tournament seed` shows the order."
+        if status == "ok" else f"Couldn't save that (`{status}`).",
+        colour=TOURNAMENT_COLOR if status == "ok" else discord.Color.red()))
+
+# --- Adding and dropping players -------------------------------------------
+
+async def tournament_add(ctx, tokens):
+    record = await active_tournament()
+    if record is None:
+        await ctx.send(view=simple_card("No tournament is running.",
+                                        colour=discord.Color.greyple()))
+        return
+    if record["Phase"] not in ("draft", "registration", "checkin"):
+        await ctx.send(view=simple_card(
+            "The bracket is already built — nobody can be added now.",
+            colour=discord.Color.red()))
+        return
+    if not tokens:
+        await ctx.send(view=simple_card("**`!tournament add <player>`**",
+                                        colour=discord.Color.red()))
+        return
+
+    member = await find_discord_user(ctx, tokens[0])
+    if member is None:
+        await ctx.send(view=simple_card(f"Couldn't find `{tokens[0]}`.",
+                                        colour=discord.Color.red()))
+        return
+
+    discord_id = str(member.id)
+    if player_by_discord(record, discord_id) is not None:
+        await ctx.send(view=simple_card(
+            f"**{member}** is already registered.",
+            colour=discord.Color.greyple()))
+        return
+
+    async with ctx.typing():
+        roblox_id = await fetch_linked_user_id(member.id)
+        if roblox_id is None:
+            await ctx.send(view=simple_card(
+                f"**{member}** hasn't linked a Roblox account, and a bracket "
+                f"entry needs one. They have to run `/link` first.",
+                colour=discord.Color.red()))
+            return
+
+        name = await fetch_username(roblox_id) or str(roblox_id)
+        entry = {"DiscordId": discord_id, "RobloxId": roblox_id,
+                 "Name": name, "At": now_epoch()}
+
+        def transform(stored):
+            if any(player["DiscordId"] == discord_id
+                   for player in stored["Players"]):
+                return None
+            stored["Players"].append(entry)
+            # Added during check-in, they're counted as present: a host
+            # adding someone then is vouching for them being there.
+            if (stored["Phase"] == "checkin"
+                    and discord_id not in stored["CheckedIn"]):
+                stored["CheckedIn"].append(discord_id)
+            return stored
+
+        status, saved = await update_tournament(record["Id"], transform)
+        if status == "ok" and saved is not None:
+            await give_player_role(saved, discord_id)
+
+    if status != "ok" or saved is None:
+        await ctx.send(view=simple_card(f"Couldn't add them (`{status}`).",
+                                        colour=discord.Color.red()))
+        return
+    await ctx.send(view=simple_card(
+        f"Added **{name}** ({member.mention}) to **{saved['Name']}**."
+        + ("\n-# Counted as checked in." if saved["Phase"] == "checkin"
+           else ""),
+        heading="➕ Added", colour=TOURNAMENT_COLOR),
+        allowed_mentions=SILENT)
+
+async def tournament_drop(ctx, tokens):
+    record = await active_tournament()
+    if record is None:
+        await ctx.send(view=simple_card("No tournament is running.",
+                                        colour=discord.Color.greyple()))
+        return
+    if record["Phase"] in ("live", "done"):
+        await ctx.send(view=simple_card(
+            "They're in the bracket now, so dropping them would leave a hole "
+            "in it.\n-# Use `!tournament ff <match> <player>` instead.",
+            colour=discord.Color.red()))
+        return
+    if not tokens:
+        await ctx.send(view=simple_card("**`!tournament drop <player>`**",
+                                        colour=discord.Color.red()))
+        return
+
+    member = await find_discord_user(ctx, tokens[0])
+    target = str(member.id) if member else None
+    # A player who has left the server can still be dropped by name.
+    if target is None or player_by_discord(record, target) is None:
+        target = next((player["DiscordId"] for player in record["Players"]
+                       if player["Name"].lower() == tokens[0].strip().lower()),
+                      None)
+    if target is None:
+        await ctx.send(view=simple_card(
+            f"`{tokens[0]}` isn't registered for this one.",
+            colour=discord.Color.red()))
+        return
+
+    name = player_name(record, target)
+
+    def transform(stored):
+        stored["Players"] = [player for player in stored["Players"]
+                             if player["DiscordId"] != target]
+        stored["CheckedIn"] = [who for who in stored["CheckedIn"]
+                               if who != target]
+        (stored.get("SeedOverrides") or {}).pop(target, None)
+        return stored
+
+    async with ctx.typing():
+        status, saved = await update_tournament(record["Id"], transform)
+        if status == "ok" and saved is not None:
+            guild, role = await members_with_role(saved, "PlayerRoleId")
+            member = guild.get_member(int(target)) if guild else None
+            if role is not None and member is not None:
+                try:
+                    await member.remove_roles(role, reason="Dropped from the "
+                                                          "tournament")
+                except discord.HTTPException:
+                    pass
+
+    if status != "ok" or saved is None:
+        await ctx.send(view=simple_card(f"Couldn't drop them (`{status}`).",
+                                        colour=discord.Color.red()))
+        return
+    await ctx.send(view=simple_card(
+        f"Dropped **{name}** from **{saved['Name']}**.\n"
+        f"-# {len(saved['Players'])} still registered.",
+        heading="➖ Dropped", colour=TOURNAMENT_COLOR))
 
 def register_dev_variants():
     """Give every command a prefix-only !dev_ twin bound to DEV_UNIVERSE_ID.
