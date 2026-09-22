@@ -4002,6 +4002,10 @@ async def on_ready():
             print("Binding the persistent tournament views failed:")
             traceback.print_exc()
 
+    if not match_tick.is_running():
+        match_tick.start()
+        print(f"Match loop ticking every {MATCH_TICK_SECONDS}s")
+
     if not tournament_tick.is_running():
         tournament_tick.start()
         print(f"Tournament scheduler ticking every "
@@ -4054,6 +4058,9 @@ async def on_message(message):
     Defining on_message replaces the default one, which is what dispatches
     prefix commands -- so process_commands has to be called by hand.
     """
+    if isinstance(message.channel, discord.Thread):
+        await enforce_match_thread(message)
+
     if not message.author.bot and bot.user is not None:
         # Only a mention on its own -- the prefix with no command after it.
         # A reply carries a mention too, and so does any message that happens
@@ -7920,6 +7927,8 @@ TOURNAMENT_DEFAULTS = {
     # Minutes before matches_start that registration closes and check-in
     # opens. This is also when the map pool is revealed.
     "CheckinMinutes": 60,
+    # Minutes each player gets to check in once their match is ready.
+    "MatchCheckinMinutes": 10,
 }
 # Stand-alone flags: they take no value, so they must not eat the next token.
 TOURNAMENT_BOOL_FLAGS = ("--private", "--public")
@@ -7929,6 +7938,7 @@ TOURNAMENT_FLAG_FIELDS = {
     "--cap": "Cap",
     "--min": "MinPlayers",
     "--checkin": "CheckinMinutes",
+    "--match-checkin": "MatchCheckinMinutes",
 }
 TOURNAMENT_COLOR = discord.Color(0xE67E22)
 
@@ -7944,6 +7954,9 @@ TOURNAMENT_USAGE = (
     "**`!tournament pool <5 map ids>`** — set the veto pool\n"
     "**`!tournament pool`** — show it, in DMs\n"
     "**`!tournament pool swap <old> <new>`** — replace one map\n"
+    "**`!tournament result <match> <a>-<b>`** — enter a score, higher seed "
+    "first as the thread shows it\n"
+    "**`!tournament ff <match> <player>`** — that player forfeits\n"
     "**`!tournament cancel`** — call it off, deleting its channels "
     "(`--keep` to spare them)\n"
     "**`!tournament cleanup [id]`** — delete a finished one's channels "
@@ -9012,7 +9025,7 @@ async def tournament_cancel(ctx, tokens=()):
     ))
 
 @bot.command(name="tournament", hidden=True,
-             usage="<create|pool|cancel|cleanup>")
+             usage="<create|pool|result|ff|cancel|cleanup>")
 @is_admin()
 async def admin_tournament(ctx, action: str = None, *arguments: str):
     """!tournament — run a bracket: create it, curate its pool, track it."""
@@ -9027,6 +9040,10 @@ async def admin_tournament(ctx, action: str = None, *arguments: str):
         await tournament_cancel(ctx, tokens)
     elif verb == "cleanup":
         await tournament_cleanup(ctx, tokens)
+    elif verb == "result":
+        await tournament_result(ctx, tokens)
+    elif verb in ("ff", "forfeit"):
+        await tournament_forfeit(ctx, tokens)
     elif not verb:
         record = await active_tournament()
         if record is None:
@@ -9964,17 +9981,35 @@ async def create_tournament_space(guild, record, *, private=False):
     read_only = discord.PermissionOverwrite(
         view_channel=visible, send_messages=False, add_reactions=True,
     )
+    # The main channel is open to talk in; its threads are not. Each match is
+    # a thread here, and a thread cannot carry permissions of its own -- it
+    # inherits the channel's -- so spectators are kept to reading every match
+    # thread by denying @everyone thread-sending on the channel itself.
     open_to_all = discord.PermissionOverwrite(
         view_channel=visible, send_messages=visible,
+        send_messages_in_threads=False,
+        create_public_threads=False, create_private_threads=False,
     )
     # Info and registration are the two channels the bot must post in, and
     # denying @everyone would silence it too if its own role has no channel
-    # permission of its own.
+    # permission of its own. It also opens the match threads.
     speaks = discord.PermissionOverwrite(
         view_channel=True, send_messages=True, embed_links=True,
-        manage_messages=True,
+        manage_messages=True, send_messages_in_threads=True,
+        create_public_threads=True, manage_threads=True,
     )
     locked = {everyone: read_only, me: speaks}
+    chat_overwrites = {everyone: open_to_all, me: speaks}
+
+    # Whoever holds the player role can type in match threads. That reaches
+    # every thread, not just their own; the bot removes messages from
+    # anyone outside the two players (see enforce_match_thread).
+    player_role = guild.get_role(int(space["PlayerRoleId"])) \
+        if space.get("PlayerRoleId") else None
+    if player_role is not None:
+        chat_overwrites[player_role] = discord.PermissionOverwrite(
+            send_messages_in_threads=True,
+        )
 
     # A private build still has to be visible to whoever is running it.
     if private:
@@ -9982,13 +10017,11 @@ async def create_tournament_space(guild, record, *, private=False):
         if host is not None:
             watching = discord.PermissionOverwrite(
                 view_channel=True, send_messages=True,
+                send_messages_in_threads=True,
             )
             locked[host] = watching
-            open_to_all = {everyone: open_to_all, me: speaks, host: watching}
-        else:
-            open_to_all = {everyone: open_to_all, me: speaks}
-    else:
-        open_to_all = {everyone: open_to_all, me: speaks}
+            chat_overwrites[host] = watching
+    open_to_all = chat_overwrites
 
     try:
         category = await guild.create_category(
@@ -10350,6 +10383,907 @@ async def tournament_cleanup(ctx, tokens):
         "\n".join(lines) or "There was nothing left to remove.",
         heading=f"🧹 {record['Name']}",
     ))
+
+# --- Matches ---------------------------------------------------------------
+# From here the bot runs each match: it notices Challonge has one ready,
+# opens a thread, checks both players in, runs the map veto, hands them the
+# map, and reports the result back. Challonge still decides who plays whom;
+# the bot only ever reports scores into it.
+#
+# A match record lives in record["Matches"], keyed by Challonge's match id:
+#   Code, Round        -- how Challonge labels it ("A", round 1)
+#   High, Low          -- Discord IDs, by seed; High is the better seed
+#   State              -- checkin -> veto -> playing -> done
+#   ThreadId, MessageId-- the match thread and the one card edited through
+#                         every state
+#   CheckedIn, Deadline, Bans, Map, Winner, Score, How
+
+# Deadlines inside a match are a minute long, which the 60s scheduler can't
+# keep, so matches get a loop of their own.
+MATCH_TICK_SECONDS = 15
+BAN_SECONDS = 60
+# Who takes each of the four bans. The lower seed opens and closes the veto,
+# the higher seed takes the two in the middle.
+BAN_ORDER = ("low", "high", "high", "low")
+# Buttons are routed by custom_id through one listener rather than a view
+# per message, so a veto survives a redeploy with nothing to re-register.
+MATCH_BUTTON_PREFIX = "tm:"
+# Match data the game reads, and the result it writes back. Both live in the
+# tournament store: the bot writes JSON text (all Open Cloud v2 will take),
+# the game decodes it with one JSONDecode; the game writes a plain table.
+MATCH_KEY = "Match_{id}"
+RESULT_KEY = "Result_{id}"
+
+# Match threads -> the Discord IDs allowed to speak in them. Kept in memory
+# so on_message can police a thread without a datastore read per message;
+# rebuilt from the record on every match tick, so it survives a restart.
+_match_threads = {}
+# The first raw match Challonge returns is logged once per process: v2.1
+# doesn't document the list response, and this is how a field mismatch gets
+# fixed from one log line instead of guesswork.
+_logged_match_shape = False
+
+def player_by_discord(record, discord_id):
+    for player in record["Players"]:
+        if player["DiscordId"] == str(discord_id):
+            return player
+    return None
+
+def player_name(record, discord_id):
+    player = player_by_discord(record, discord_id)
+    return player["Name"] if player else "Unknown"
+
+def seed_of(record, discord_id):
+    """1-based seed, or a large number for anyone the seeding missed."""
+    for position, entry in enumerate(record.get("Seeded") or [], 1):
+        if isinstance(entry, dict) and entry.get("DiscordId") == discord_id:
+            return position
+    return 10_000
+
+def pool_entry(record, map_id):
+    for entry in record["Pool"]:
+        if entry["Id"] == map_id:
+            return entry
+    return {"Id": map_id, "Name": f"Map {map_id}", "Creator": None}
+
+def remaining_maps(record, match):
+    banned = {ban["Map"] for ban in match.get("Bans") or []}
+    return [entry for entry in record["Pool"] if entry["Id"] not in banned]
+
+def ban_turn(match):
+    """The Discord ID due to ban next, or None once the veto is over."""
+    count = len(match.get("Bans") or [])
+    if count >= len(BAN_ORDER):
+        return None
+    return match["High"] if BAN_ORDER[count] == "high" else match["Low"]
+
+def match_label(record, match):
+    return (f"{match.get('Code') or '?'} · {player_name(record, match['High'])}"
+            f" vs {player_name(record, match['Low'])}")
+
+def find_match(record, reference):
+    """A match by Challonge's letter, its id, or None."""
+    wanted = str(reference).strip().lower()
+    for match_id, match in record["Matches"].items():
+        if (str(match.get("Code") or "").lower() == wanted
+                or str(match_id) == wanted):
+            return match_id, match
+    return None, None
+
+def match_of_player(record, discord_id):
+    """The player's match that isn't finished yet, as (id, match)."""
+    for match_id, match in record["Matches"].items():
+        if (match.get("State") != "done"
+                and discord_id in (match["High"], match["Low"])):
+            return match_id, match
+    return None, None
+
+# --- Reading matches off Challonge -----------------------------------------
+
+def match_participants(resource):
+    """The two Challonge participant IDs on a match, or None.
+
+    The v2.1 list response isn't documented, so this accepts every shape
+    Challonge has used: player1_id/player2_id attributes, a
+    points_by_participant list, or JSON:API relationships.
+    """
+    attributes = challonge_attributes(resource)
+    if attributes.get("player1_id") and attributes.get("player2_id"):
+        return [str(attributes["player1_id"]), str(attributes["player2_id"])]
+
+    points = attributes.get("points_by_participant")
+    if isinstance(points, list):
+        ids = [str(entry.get("participant_id")) for entry in points
+               if isinstance(entry, dict) and entry.get("participant_id")]
+        if len(ids) == 2:
+            return ids
+
+    relationships = resource.get("relationships") or {}
+    ids = []
+    for key in ("player1", "player2"):
+        data = (relationships.get(key) or {}).get("data") or {}
+        if data.get("id"):
+            ids.append(str(data["id"]))
+    return ids if len(ids) == 2 else None
+
+async def challonge_matches(record):
+    """Every match in the bracket. Returns (ok, [match dict]) or (False, why)."""
+    global _logged_match_shape
+    ok, data = await challonge_request(
+        f"application/tournaments/{record['Challonge']['Id']}/matches"
+    )
+    if not ok:
+        return False, data
+
+    matches = []
+    for resource in (data or {}).get("data") or []:
+        if not isinstance(resource, dict):
+            continue
+        if not _logged_match_shape:
+            _logged_match_shape = True
+            print(f"challonge match shape: {json.dumps(resource)[:600]}")
+        attributes = challonge_attributes(resource)
+        matches.append({
+            "Id": str(resource.get("id")),
+            "Code": attributes.get("identifier"),
+            "Round": attributes.get("round"),
+            "State": attributes.get("state"),
+            "Participants": match_participants(resource),
+            "Winner": (str(attributes["winner_id"])
+                       if attributes.get("winner_id") else None),
+        })
+    return True, matches
+
+async def challonge_report(record, match, winner_id, scores):
+    """Report a finished match. scores is {discord_id: int}."""
+    rows = []
+    for discord_id in (match["High"], match["Low"]):
+        player = player_by_discord(record, discord_id)
+        row = {
+            "participant_id": str((player or {}).get("ChallongeId") or ""),
+            "score_set": str(scores.get(discord_id, 0)),
+        }
+        # Challonge wants advancing set on the winner and absent otherwise.
+        if discord_id == winner_id:
+            row["advancing"] = True
+        rows.append(row)
+
+    return await challonge_request(
+        f"application/tournaments/{record['Challonge']['Id']}"
+        f"/matches/{match['Id']}",
+        method="PUT",
+        payload={"data": {"type": "Match", "attributes": {"match": rows}}},
+    )
+
+# --- The match card --------------------------------------------------------
+
+def match_button(action, match_id, *extra, label, style, emoji=None,
+                 disabled=False):
+    custom_id = ":".join([MATCH_BUTTON_PREFIX.rstrip(":"), action, match_id,
+                          *[str(part) for part in extra]])
+    return discord.ui.Button(label=label[:80], style=style, emoji=emoji,
+                             custom_id=custom_id, disabled=disabled)
+
+def match_card(record, match_id, match):
+    """The one message in a match thread, rendered for its current state."""
+    container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
+    high, low = match["High"], match["Low"]
+    container.add_item(discord.ui.TextDisplay(
+        f"## ⚔️ {match_label(record, match)}\n"
+        f"-# Round {match.get('Round') or '?'} · Bo{record['BestOf']} · "
+        f"<@{high}> (seed {seed_of(record, high)}) vs "
+        f"<@{low}> (seed {seed_of(record, low)})"
+    ))
+    container.add_item(discord.ui.Separator())
+    state = match.get("State")
+
+    if state == "checkin":
+        waiting = [who for who in (high, low)
+                   if who not in match.get("CheckedIn", [])]
+        container.add_item(discord.ui.TextDisplay(
+            f"**Check in** by {when(match['Deadline'])} "
+            f"({when(match['Deadline'], 'R')}).\n"
+            + ("Still waiting on " + " and ".join(f"<@{w}>" for w in waiting)
+               if waiting else "Both in — starting the veto.")
+            + "\n-# Miss it and your opponent takes the match."
+        ))
+        row = discord.ui.ActionRow()
+        row.add_item(match_button("checkin", match_id, label="Check in",
+                                  style=discord.ButtonStyle.success,
+                                  emoji="✋"))
+        container.add_item(row)
+
+    elif state == "veto":
+        turn = ban_turn(match)
+        lines = []
+        banned = {ban["Map"]: ban for ban in match.get("Bans") or []}
+        for entry in record["Pool"]:
+            ban = banned.get(entry["Id"])
+            if ban:
+                how = " (timed out)" if ban.get("Auto") else ""
+                lines.append(f"~~{entry['Name']}~~ — banned by "
+                             f"{player_name(record, ban['By'])}{how}")
+            else:
+                lines.append(f"**{entry['Name']}**")
+        container.add_item(discord.ui.TextDisplay(
+            "## 🗺️ Map veto\n" + "\n".join(lines) + "\n\n"
+            f"<@{turn}> to ban · {when(match['Deadline'], 'R')}\n"
+            f"-# Ban order: lower seed, higher, higher, lower. Out of time "
+            f"bans a random map."
+        ))
+        # Five buttons fit one row; every map stays listed, banned ones
+        # disabled, so the veto reads as a history.
+        row = discord.ui.ActionRow()
+        for entry in record["Pool"]:
+            row.add_item(match_button(
+                "ban", match_id, entry["Id"], label=entry["Name"],
+                style=discord.ButtonStyle.danger,
+                disabled=entry["Id"] in banned,
+            ))
+        container.add_item(row)
+
+    elif state == "playing":
+        chosen = pool_entry(record, match["Map"])
+        by = f" · by {chosen['Creator']}" if chosen.get("Creator") else ""
+        container.add_item(discord.ui.TextDisplay(
+            f"## 🎯 {chosen['Name']}\n-# `{chosen['Id']}`{by}\n\n"
+            f"<@{high}> <@{low}> — you're up. Best of {record['BestOf']} "
+            f"on this map.\n"
+            f"-# The result is picked up automatically once the game reports "
+            f"it. A host can also enter it."
+        ))
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(
+            label="Play", style=discord.ButtonStyle.link, emoji="▶️",
+            url=PLAY_URL_TEMPLATE.format(id=chosen["Id"]),
+        ))
+        container.add_item(row)
+
+    elif state == "done":
+        winner = match.get("Winner")
+        how = {
+            "walkover": "walkover — the other player didn't check in",
+            "forfeit": "forfeit",
+            "host": "entered by a host",
+            "challonge": "entered on Challonge",
+            "game": "reported by the game",
+        }.get(match.get("How"), match.get("How") or "")
+        headline = (f"## 🏁 <@{winner}> wins"
+                    + (f" {match['Score']}" if match.get("Score") else "")
+                    if winner else "## 🏁 Finished")
+        container.add_item(discord.ui.TextDisplay(
+            headline + (f"\n-# {how}" if how else "")
+        ))
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+async def match_thread(record, match):
+    guild = tournament_guild(record)
+    if guild is None or not match.get("ThreadId"):
+        return None
+    thread = guild.get_thread(int(match["ThreadId"]))
+    if thread is None:
+        try:
+            thread = await bot.fetch_channel(int(match["ThreadId"]))
+        except (discord.HTTPException, ValueError):
+            return None
+    return thread
+
+async def refresh_match_card(record, match_id, match, *, ping=False):
+    """Re-render the card in place. Returns True when it landed."""
+    thread = await match_thread(record, match)
+    if thread is None or not match.get("MessageId"):
+        return False
+    try:
+        message = await thread.fetch_message(int(match["MessageId"]))
+        await message.edit(view=match_card(record, match_id, match))
+    except (discord.HTTPException, ValueError):
+        return False
+    # An edit never pings, so a turn that needs someone's attention says so
+    # in a short message of its own.
+    if ping:
+        try:
+            await thread.send(ping, allowed_mentions=discord.AllowedMentions(
+                users=True, roles=False, everyone=False))
+        except discord.HTTPException:
+            pass
+    return True
+
+def sync_match_threads(record):
+    """Rebuild who may talk in each match thread."""
+    for match in record["Matches"].values():
+        thread_id = match.get("ThreadId")
+        if not thread_id:
+            continue
+        if match.get("State") == "done":
+            _match_threads.pop(int(thread_id), None)
+        else:
+            _match_threads[int(thread_id)] = {
+                match["High"], match["Low"], str(ADMIN_USER_ID),
+            }
+
+async def enforce_match_thread(message):
+    """Delete messages in a match thread from anyone but its two players.
+
+    Permissions already keep spectators out of every thread; this catches a
+    player -- who can type in threads -- wandering into someone else's match.
+    """
+    allowed = _match_threads.get(message.channel.id)
+    if allowed is None or message.author.bot:
+        return
+    if str(message.author.id) in allowed:
+        return
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+
+# --- Match lifecycle -------------------------------------------------------
+
+async def open_match(record, found):
+    """A match Challonge just made ready: record it and open its check-in."""
+    by_participant = {str(player.get("ChallongeId")): player
+                      for player in record["Players"]
+                      if player.get("ChallongeId")}
+    players = [by_participant.get(pid) for pid in found["Participants"]]
+    if not all(players):
+        print(f"tournament {record['Id']}: match {found['Id']} has a "
+              f"participant the bot doesn't know ({found['Participants']})")
+        return
+
+    first, second = (player["DiscordId"] for player in players)
+    high, low = sorted((first, second), key=lambda d: seed_of(record, d))
+    match = {
+        "Id": found["Id"], "Code": found.get("Code"),
+        "Round": found.get("Round"),
+        "High": high, "Low": low, "State": "checkin",
+        "CheckedIn": [], "Bans": [], "Map": None,
+        "Deadline": now_epoch() + record["MatchCheckinMinutes"] * 60,
+    }
+
+    guild = tournament_guild(record)
+    chat = (space_object(record, guild, "ChatChannelId")
+            if guild is not None else None) or tournament_channel()
+    if chat is None:
+        await tell_host(record, f"Match {match_label(record, match)} is ready "
+                                f"but there's no channel to open it in.")
+        return
+
+    try:
+        thread = await chat.create_thread(
+            name=match_label(record, match)[:100],
+            type=discord.ChannelType.public_thread,
+            auto_archive_duration=1440,
+        )
+        for discord_id in (high, low):
+            try:
+                await thread.add_user(discord.Object(id=int(discord_id)))
+            except discord.HTTPException:
+                pass
+        message = await thread.send(
+            view=match_card(record, found["Id"], match),
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.HTTPException as error:
+        await tell_host(record, f"Couldn't open a thread for "
+                                f"{match_label(record, match)} — {error}")
+        return
+
+    match["ThreadId"], match["MessageId"] = str(thread.id), str(message.id)
+
+    def transform(stored):
+        # Another tick may have opened it first; the first one wins.
+        if found["Id"] in stored["Matches"]:
+            return None
+        stored["Matches"][found["Id"]] = match
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if status != "ok" or saved is None:
+        # Lost the race: take the duplicate thread back down.
+        try:
+            await thread.delete()
+        except discord.HTTPException:
+            pass
+        return
+
+    _match_threads[thread.id] = {high, low, str(ADMIN_USER_ID)}
+    for discord_id in (high, low):
+        opponent = low if discord_id == high else high
+        try:
+            user = bot.get_user(int(discord_id)) or await bot.fetch_user(
+                int(discord_id))
+            await user.send(view=simple_card(
+                f"Your match against **{player_name(saved, opponent)}** is "
+                f"ready.\n\n**Check in** by {when(match['Deadline'])} "
+                f"({when(match['Deadline'], 'R')}): {thread.jump_url}",
+                heading=f"⚔️ {saved['Name']}", colour=TOURNAMENT_COLOR,
+            ))
+        except (discord.HTTPException, ValueError):
+            continue
+
+async def finish_match(record, match_id, winner_id, scores, how):
+    """Report a result and close the match. Returns (ok, message)."""
+    match = record["Matches"].get(match_id)
+    if match is None:
+        return False, "That match isn't on record."
+    if match.get("State") == "done":
+        return False, "That match is already finished."
+
+    # Challonge learns first: if it refuses, nothing here claims otherwise.
+    if how != "challonge":
+        ok, reason = await challonge_report(record, match, winner_id, scores)
+        if not ok:
+            return False, f"Challonge wouldn't take it — {reason}"
+
+    loser_id = match["Low"] if winner_id == match["High"] else match["High"]
+    score = (f"{scores.get(winner_id, 0)}-{scores.get(loser_id, 0)}"
+             if scores and winner_id else None)
+
+    raced = {"done": False}
+
+    def transform(stored):
+        current = stored["Matches"].get(match_id)
+        if current is None:
+            return None
+        if current.get("State") == "done":
+            raced["done"] = True
+            return None
+        current.update({"State": "done", "Winner": winner_id,
+                        "Score": score, "How": how,
+                        "FinishedAt": now_epoch()})
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if raced["done"]:
+        return True, f"{match_label(record, match)} is finished."
+    if status != "ok" or saved is None:
+        return False, f"Challonge has it, but the bot couldn't save it ({status})."
+
+    done = saved["Matches"][match_id]
+    await refresh_match_card(saved, match_id, done)
+    _match_threads.pop(int(done.get("ThreadId") or 0), None)
+    thread = await match_thread(saved, done)
+    if thread is not None:
+        try:
+            await thread.edit(locked=True, archived=True)
+        except discord.HTTPException:
+            pass
+    if winner_id is None:
+        return True, f"{match_label(saved, done)} is finished."
+    return True, (f"**{player_name(saved, winner_id)}** wins "
+                  f"{match_label(saved, done)}" + (f" {score}" if score else ""))
+
+async def begin_veto(record, match_id):
+    def transform(stored):
+        match = stored["Matches"].get(match_id)
+        if match is None or match.get("State") != "checkin":
+            return None
+        match.update({"State": "veto", "Bans": [],
+                      "Deadline": now_epoch() + BAN_SECONDS})
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if status == "ok" and saved is not None:
+        match = saved["Matches"][match_id]
+        await refresh_match_card(
+            saved, match_id, match,
+            ping=f"<@{ban_turn(match)}>, you ban first.",
+        )
+
+async def apply_ban(record, match_id, map_id, by, *, auto=False):
+    """Record one ban. Returns (ok, message) for whoever asked."""
+    state = {"why": None}
+
+    def transform(stored):
+        match = stored["Matches"].get(match_id)
+        if match is None or match.get("State") != "veto":
+            state["why"] = "The veto isn't running."
+            return None
+        if ban_turn(match) != by:
+            state["why"] = "It isn't your turn to ban."
+            return None
+        if auto and now_epoch() < match["Deadline"]:
+            return None
+        still_in = [entry["Id"] for entry in remaining_maps(stored, match)]
+        if map_id not in still_in:
+            state["why"] = "That map is already gone."
+            return None
+
+        match["Bans"].append({"Map": map_id, "By": by, "Auto": auto})
+        left = remaining_maps(stored, match)
+        if len(match["Bans"]) >= len(BAN_ORDER) or len(left) == 1:
+            match.update({"State": "playing", "Map": left[0]["Id"],
+                          "Deadline": None})
+        else:
+            match["Deadline"] = now_epoch() + BAN_SECONDS
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if state["why"]:
+        return False, state["why"]
+    if status != "ok" or saved is None:
+        return False, "Couldn't save that ban — try again."
+
+    match = saved["Matches"][match_id]
+    if match["State"] == "playing":
+        await hand_off(saved, match_id, match)
+    else:
+        await refresh_match_card(saved, match_id, match,
+                                 ping=f"<@{ban_turn(match)}>, your ban.")
+    return True, f"Banned **{pool_entry(saved, map_id)['Name']}**."
+
+async def hand_off(record, match_id, match):
+    """The veto is over: tell the game, and send the players in."""
+    high = player_by_discord(record, match["High"]) or {}
+    low = player_by_discord(record, match["Low"]) or {}
+    status, _written = await update_tournament_entry(
+        MATCH_KEY.format(id=match_id),
+        lambda _stored: {
+            "Tournament": record["Id"],
+            "Players": [high.get("RobloxId"), low.get("RobloxId")],
+            "Map": match["Map"],
+            "BestOf": record["BestOf"],
+        },
+    )
+    if status != "ok":
+        print(f"tournament {record['Id']}: couldn't write the match record "
+              f"for {match_id} ({status})")
+    await refresh_match_card(
+        record, match_id, match,
+        ping=f"<@{match['High']}> <@{match['Low']}> — the map's locked in.",
+    )
+
+async def resolve_checkin(record, match_id, match):
+    """Check-in ran out. One player in takes it; nobody in is for a host."""
+    present = [who for who in (match["High"], match["Low"])
+               if who in match.get("CheckedIn", [])]
+    if len(present) == 2:
+        await begin_veto(record, match_id)
+        return
+    if len(present) == 1:
+        winner = present[0]
+        loser = match["Low"] if winner == match["High"] else match["High"]
+        ok, text = await finish_match(record, match_id, winner,
+                                      {winner: 1, loser: 0}, "walkover")
+        if not ok:
+            await tell_host(record, f"Walkover for {match_label(record, match)}"
+                                    f" failed — {text}")
+        return
+
+    if match.get("HostWarned"):
+        return
+
+    def transform(stored):
+        current = stored["Matches"].get(match_id)
+        if current is None:
+            return None
+        current["HostWarned"] = True
+        return stored
+
+    await update_tournament(record["Id"], transform)
+    await tell_host(
+        record,
+        f"Nobody checked in for **{match_label(record, match)}**.\n"
+        f"-# Decide it with `!tournament ff {match.get('Code')} <player>` or "
+        f"`!tournament result {match.get('Code')} <score>`.",
+    )
+
+async def collect_game_result(record, match_id, match):
+    """Pick up a result the game wrote, if there is one yet."""
+    stored = await fetch_entry(RESULT_KEY.format(id=match_id),
+                               datastore=TOURNAMENTS_DATASTORE)
+    stored = decode_tournament_value(stored)
+    if not isinstance(stored, dict):
+        return
+
+    by_roblox = {str(player.get("RobloxId")): player["DiscordId"]
+                 for player in record["Players"]}
+    winner = by_roblox.get(str(stored.get("Winner")))
+    if winner not in (match["High"], match["Low"]):
+        print(f"tournament {record['Id']}: result for {match_id} names a "
+              f"winner outside the match: {stored!r}")
+        return
+
+    scores = {}
+    for roblox_id, value in (stored.get("Scores") or {}).items():
+        discord_id = by_roblox.get(str(roblox_id))
+        if discord_id and isinstance(value, (int, float)):
+            scores[discord_id] = int(value)
+    ok, text = await finish_match(record, match_id, winner, scores, "game")
+    if not ok:
+        print(f"tournament {record['Id']}: game result for {match_id} "
+              f"couldn't be reported: {text}")
+
+async def advance_matches(record):
+    """One pass over a live bracket. Safe to re-run."""
+    ok, found = await challonge_matches(record)
+    if not ok:
+        print(f"tournament {record['Id']}: couldn't read matches ({found})")
+        return
+
+    by_id = {match["Id"]: match for match in found}
+    for match in found:
+        if (match["State"] == "open" and match["Participants"]
+                and match["Id"] not in record["Matches"]):
+            await open_match(record, match)
+
+    record = await read_tournament(record["Id"]) or record
+    now = now_epoch()
+    for match_id, match in list(record["Matches"].items()):
+        if match.get("State") == "done":
+            continue
+        # Entered straight on Challonge: follow it rather than fight it.
+        upstream = by_id.get(match_id)
+        if upstream and upstream["State"] == "complete":
+            by_participant = {str(p.get("ChallongeId")): p["DiscordId"]
+                              for p in record["Players"]
+                              if p.get("ChallongeId")}
+            await finish_match(record, match_id,
+                               by_participant.get(upstream.get("Winner")),
+                               {}, "challonge")
+            continue
+
+        state = match.get("State")
+        if state == "checkin" and now >= (match.get("Deadline") or now):
+            await resolve_checkin(record, match_id, match)
+        elif state == "veto" and now >= (match.get("Deadline") or now):
+            left = remaining_maps(record, match)
+            if left:
+                await apply_ban(record, match_id,
+                                secrets.choice(left)["Id"], ban_turn(match),
+                                auto=True)
+        elif state == "playing":
+            await collect_game_result(record, match_id, match)
+
+    sync_match_threads(await read_tournament(record["Id"]) or record)
+
+@tasks.loop(seconds=MATCH_TICK_SECONDS)
+async def match_tick():
+    try:
+        index = await read_tournament_index()
+    except Exception:
+        traceback.print_exc()
+        return
+    for entry in index:
+        if not isinstance(entry, dict) or entry.get("Phase") != "live":
+            continue
+        try:
+            record = await read_tournament(entry["Id"])
+            if record is not None and record.get("Challonge"):
+                await advance_matches(record)
+        except Exception:
+            print(f"Match tick failed for {entry.get('Id')}:")
+            traceback.print_exc()
+
+@match_tick.before_loop
+async def before_match_tick():
+    await bot.wait_until_ready()
+
+# --- Buttons ---------------------------------------------------------------
+
+@bot.listen("on_interaction")
+async def tournament_match_buttons(interaction):
+    """Check-in and veto clicks, routed by custom_id."""
+    if interaction.type is not discord.InteractionType.component:
+        return
+    custom_id = (interaction.data or {}).get("custom_id") or ""
+    if not custom_id.startswith(MATCH_BUTTON_PREFIX):
+        return
+
+    parts = custom_id.split(":")
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    record = await active_tournament()
+    if record is None or record["Phase"] != "live" or len(parts) < 3:
+        await interaction.followup.send("That match is over.", ephemeral=True)
+        return
+
+    action, match_id = parts[1], parts[2]
+    match = record["Matches"].get(match_id)
+    who = str(interaction.user.id)
+    if match is None:
+        await interaction.followup.send("That match is over.", ephemeral=True)
+        return
+    if who not in (match["High"], match["Low"]):
+        await interaction.followup.send(
+            "Only the two players in this match can use these.",
+            ephemeral=True)
+        return
+
+    if action == "checkin":
+        state = {"why": None, "both": False}
+
+        def transform(stored):
+            current = stored["Matches"].get(match_id)
+            if current is None or current.get("State") != "checkin":
+                state["why"] = "Check-in is closed."
+                return None
+            if who in current["CheckedIn"]:
+                state["why"] = "You're already checked in."
+                return None
+            current["CheckedIn"].append(who)
+            state["both"] = len(current["CheckedIn"]) >= 2
+            return stored
+
+        status, saved = await update_tournament(record["Id"], transform)
+        if state["why"]:
+            await interaction.followup.send(state["why"], ephemeral=True)
+            return
+        if status != "ok" or saved is None:
+            await interaction.followup.send("Couldn't check you in — try "
+                                            "again.", ephemeral=True)
+            return
+        await interaction.followup.send("✋ Checked in.", ephemeral=True)
+        if state["both"]:
+            await begin_veto(saved, match_id)
+        else:
+            await refresh_match_card(saved, match_id,
+                                     saved["Matches"][match_id])
+        return
+
+    if action == "ban" and len(parts) >= 4:
+        try:
+            map_id = int(parts[3])
+        except ValueError:
+            return
+        ok, text = await apply_ban(record, match_id, map_id, who)
+        await interaction.followup.send(text, ephemeral=True)
+
+# --- Host overrides --------------------------------------------------------
+
+def resolve_match_player(record, match, text):
+    """One of the two players, by mention, Discord ID or Roblox name."""
+    cleaned = str(text).strip().strip("<@!>")
+    for discord_id in (match["High"], match["Low"]):
+        if cleaned == discord_id:
+            return discord_id
+        if player_name(record, discord_id).lower() == cleaned.lower():
+            return discord_id
+    return None
+
+async def tournament_result(ctx, tokens):
+    """!tournament result <match> <a>-<b>, scores in the order the match is
+    shown (higher seed first, as in the thread title)."""
+    record = await active_tournament()
+    if record is None or record["Phase"] != "live":
+        await ctx.send(view=simple_card("No bracket is live.",
+                                        colour=discord.Color.greyple()))
+        return
+    if len(tokens) != 2 or not re.fullmatch(r"\d+-\d+", tokens[1]):
+        await ctx.send(view=simple_card(
+            "**`!tournament result <match> <a>-<b>`**\n"
+            "-# Scores go in the order the match is shown — the thread title, "
+            "higher seed first. `!tournament result A 2-1`",
+            colour=discord.Color.red()))
+        return
+
+    match_id, match = find_match(record, tokens[0])
+    if match is None:
+        await ctx.send(view=simple_card(f"No match `{tokens[0]}`.",
+                                        colour=discord.Color.red()))
+        return
+    first, second = (int(part) for part in tokens[1].split("-"))
+    if first == second:
+        await ctx.send(view=simple_card(
+            "An elimination match can't end level.",
+            colour=discord.Color.red()))
+        return
+
+    winner = match["High"] if first > second else match["Low"]
+    scores = {match["High"]: first, match["Low"]: second}
+    async with ctx.typing():
+        ok, text = await finish_match(record, match_id, winner, scores, "host")
+    await ctx.send(view=simple_card(
+        text, colour=TOURNAMENT_COLOR if ok else discord.Color.red()))
+
+async def tournament_forfeit(ctx, tokens):
+    """!tournament ff <match> <player> -- that player forfeits."""
+    record = await active_tournament()
+    if record is None or record["Phase"] != "live":
+        await ctx.send(view=simple_card("No bracket is live.",
+                                        colour=discord.Color.greyple()))
+        return
+    if len(tokens) != 2:
+        await ctx.send(view=simple_card(
+            "**`!tournament ff <match> <player who forfeits>`**",
+            colour=discord.Color.red()))
+        return
+
+    match_id, match = find_match(record, tokens[0])
+    if match is None:
+        await ctx.send(view=simple_card(f"No match `{tokens[0]}`.",
+                                        colour=discord.Color.red()))
+        return
+    quitter = resolve_match_player(record, match, tokens[1])
+    if quitter is None:
+        await ctx.send(view=simple_card(
+            f"`{tokens[1]}` isn't in {match_label(record, match)}.",
+            colour=discord.Color.red()))
+        return
+
+    winner = match["Low"] if quitter == match["High"] else match["High"]
+    async with ctx.typing():
+        ok, text = await finish_match(record, match_id, winner,
+                                      {winner: 1, quitter: 0}, "forfeit")
+    await ctx.send(view=simple_card(
+        text, colour=TOURNAMENT_COLOR if ok else discord.Color.red()))
+
+# --- /match ----------------------------------------------------------------
+
+@bot.hybrid_command(name="match", description="What you need to do in the "
+                                               "tournament right now")
+async def match_command(ctx):
+    ephemeral = ctx.interaction is not None
+    await ctx.defer(ephemeral=ephemeral)
+    who = str(ctx.author.id)
+
+    async def reply(text, heading="⚔️ Your match"):
+        await ctx.send(view=simple_card(text, heading=heading,
+                                        colour=TOURNAMENT_COLOR),
+                       ephemeral=ephemeral)
+
+    record = await active_tournament()
+    if record is None:
+        await reply("No tournament is running right now.")
+        return
+
+    registered = player_by_discord(record, who) is not None
+    phase = record["Phase"]
+    if phase in ("draft", "registration"):
+        if registered:
+            await reply(f"You're registered for **{record['Name']}**. "
+                        f"Check-in opens {when(checkin_opens_at(record), 'R')}.")
+        else:
+            await reply(f"You aren't registered for **{record['Name']}**."
+                        + (" Registration is open." if phase == "registration"
+                           else ""))
+        return
+    if phase == "checkin":
+        if not registered:
+            await reply(f"You aren't in **{record['Name']}**.")
+        elif who in record["CheckedIn"]:
+            await reply(f"You're checked in. The bracket is built "
+                        f"{when(record['MatchesStart'], 'R')}.")
+        else:
+            await reply(f"**Check in now** — it closes "
+                        f"{when(record['MatchesStart'], 'R')}.")
+        return
+
+    if not registered or who not in record["CheckedIn"]:
+        await reply(f"You aren't in the **{record['Name']}** bracket.")
+        return
+
+    match_id, match = match_of_player(record, who)
+    if match is None:
+        lost = any(m.get("State") == "done" and m.get("Winner") != who
+                   and who in (m["High"], m["Low"])
+                   for m in record["Matches"].values())
+        if lost and record["Format"] == "single":
+            await reply("You're out of this one. 🫡")
+        else:
+            await reply("No match right now — you're waiting on your next "
+                        "opponent. I'll DM you when it's ready.")
+        return
+
+    opponent = match["Low"] if who == match["High"] else match["High"]
+    thread = f"<#{match['ThreadId']}>" if match.get("ThreadId") else ""
+    state = match.get("State")
+    if state == "checkin":
+        step = ("You're checked in — waiting on your opponent."
+                if who in match.get("CheckedIn", []) else
+                f"**Check in** by {when(match['Deadline'], 'R')}.")
+    elif state == "veto":
+        step = ("**Your ban** — " if ban_turn(match) == who else
+                "Waiting on your opponent's ban — ") + \
+               when(match["Deadline"], "R")
+    else:
+        step = (f"Play **{pool_entry(record, match['Map'])['Name']}** — "
+                f"best of {record['BestOf']}.")
+    await reply(f"**{match_label(record, match)}**\n"
+                f"vs **{player_name(record, opponent)}**\n\n{step}\n{thread}")
 
 def register_dev_variants():
     """Give every command a prefix-only !dev_ twin bound to DEV_UNIVERSE_ID.
