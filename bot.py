@@ -8205,7 +8205,8 @@ def merge_index(stored, record):
 # Lua has one table type, so an empty dict written here can come back from
 # the datastore as an empty list. Every collection on a record gets coerced
 # back to the shape the code expects rather than guarded at each use.
-TOURNAMENT_LIST_FIELDS = ("Pool", "Players", "CheckedIn", "Fired")
+TOURNAMENT_LIST_FIELDS = ("Pool", "Players", "CheckedIn", "Fired",
+                          "Seeded", "Standings")
 TOURNAMENT_DICT_FIELDS = ("Matches", "Discord")
 
 def normalize_tournament(record):
@@ -9488,22 +9489,119 @@ async def open_checkin(record):
     print(f"tournament {record['Id']}: check-in open, "
           f"{delivered}/{len(record['Players'])} DMs delivered")
 
+# Seeding blends two rankings, each taken as a percentile of the field so
+# neither dominates by scale: career wins run into the thousands while a
+# placement score is 0-1, and blending the raw numbers would make wins the
+# whole seed.
+SEED_TOURNAMENT_WEIGHT = 0.6
+SEED_WINS_WEIGHT = 0.4
+# Recent form counts most: the player's last tournaments, newest first. A
+# player with fewer than three is averaged over the ones they have.
+SEED_HISTORY_WEIGHTS = (1.0, 0.7, 0.5)
+# How many finished tournaments to read looking for that history. Each is a
+# datastore read, so this bounds the cost at bracket build; a player whose
+# last three all sit further back than this is treated as having none.
+SEED_HISTORY_SCAN = 30
+
+def placement_score(rank, field_size):
+    """A finish as 0-1: 1 for winning, 0 for last, scaled by bracket size.
+
+    Percentile rather than raw rank, so fourth of 32 is worth more than
+    fourth of 8.
+    """
+    if not isinstance(rank, int) or field_size <= 1:
+        return 0.0
+    return max(0.0, 1 - (rank - 1) / (field_size - 1))
+
+def field_percentiles(values):
+    """Each value's standing in the field, 0 worst to 1 best, ties shared."""
+    count = len(values)
+    if count <= 1:
+        return [1.0] * count
+    standings = []
+    for value in values:
+        below = sum(1 for other in values if other < value)
+        level = sum(1 for other in values if other == value) - 1
+        standings.append((below + level / 2) / (count - 1))
+    return standings
+
+async def recent_placements():
+    """Each player's last finishes, newest first: {discord_id: [score, ...]}.
+
+    Only tournaments that ran to a result count. A cancelled one says
+    nothing about anybody's form.
+    """
+    finished = [
+        entry for entry in await read_tournament_index()
+        if isinstance(entry, dict) and entry.get("Phase") == "done"
+    ]
+    finished.sort(key=lambda entry: entry.get("MatchesStart") or 0,
+                  reverse=True)
+
+    depth = len(SEED_HISTORY_WEIGHTS)
+    history = {}
+    for entry in finished[:SEED_HISTORY_SCAN]:
+        record = await read_tournament(entry["Id"])
+        if record is None:
+            continue
+        field_size = record.get("FieldSize") or len(record["Standings"])
+        for standing in record["Standings"]:
+            scores = history.setdefault(str(standing.get("DiscordId")), [])
+            if len(scores) < depth:
+                scores.append(placement_score(standing.get("Rank"),
+                                              field_size))
+    return history
+
+def form_score(scores):
+    """Recency-weighted average of a player's last finishes.
+
+    None of them at all scores 0 -- the bottom of the field, by choice, so a
+    player with a record always seeds above one without on this half.
+    """
+    if not scores:
+        return 0.0
+    weights = SEED_HISTORY_WEIGHTS[:len(scores)]
+    return sum(w * s for w, s in zip(weights, scores)) / sum(weights)
+
 async def seed_players(players):
-    """Order the field strongest first, by career wins.
+    """Order the field strongest first, by recent form and career wins.
 
     Seeding off something real is what keeps the top of the bracket from
-    meeting in round one; the Wins board is the only ranking the game has
-    until ranked mode exists.
+    meeting in round one. Returns the players in seed order, each carrying a
+    SeedScore breakdown so the host can see why the bracket came out as it
+    did.
     """
-    seeded = []
-    for player in players:
-        wins = await fetch_ordered_entry(
-            str(player["RobloxId"]), datastore="Data", scope="Wins"
-        )
-        seeded.append((wins if isinstance(wins, (int, float)) else -1, player))
-    # Stable, so equal records keep registration order.
-    seeded.sort(key=lambda pair: -pair[0])
-    return [player for _wins, player in seeded]
+    history = await recent_placements()
+    wins = await asyncio.gather(*(
+        fetch_ordered_entry(str(player["RobloxId"]), datastore="Data",
+                            scope="Wins")
+        for player in players
+    ))
+    wins = [value if isinstance(value, (int, float)) else 0 for value in wins]
+    form = [form_score(history.get(player["DiscordId"]))
+            for player in players]
+
+    form_rank = field_percentiles(form)
+    wins_rank = field_percentiles(wins)
+
+    scored = []
+    for player, raw_wins, raw_form, form_pct, wins_pct in zip(
+        players, wins, form, form_rank, wins_rank
+    ):
+        total = SEED_TOURNAMENT_WEIGHT * form_pct + SEED_WINS_WEIGHT * wins_pct
+        scored.append((total, raw_wins, {
+            **player,
+            "SeedScore": {
+                "Total": round(total, 4),
+                "Form": round(raw_form, 4),
+                "Played": len(history.get(player["DiscordId"]) or []),
+                "Wins": raw_wins,
+            },
+        }))
+
+    # Stable, so a dead heat on both keeps registration order.
+    scored.sort(key=lambda item: (-item[0], -item[1]))
+    return [player for _total, _wins, player in scored]
 
 async def challonge_push_field(record, players):
     """Fill the bracket with the checked-in field, then start it.
@@ -9610,6 +9708,11 @@ async def start_bracket(record):
               f"{stripped} no-show(s)")
 
     seeded = await seed_players(checked_in)
+    for position, player in enumerate(seeded, 1):
+        score = player["SeedScore"]
+        print(f"tournament {record['Id']}: seed {position} {player['Name']} "
+              f"total={score['Total']} form={score['Form']} "
+              f"({score['Played']} played) wins={score['Wins']}")
     ok, result = await challonge_push_field(record, seeded)
     if not ok:
         # Everything is still recoverable by hand from here: the field is
@@ -9625,7 +9728,11 @@ async def start_bracket(record):
 
     def transform(stored):
         stored["Phase"] = "live"
-        stored["Seeded"] = [player["DiscordId"] for player in seeded]
+        stored["Seeded"] = [
+            {"DiscordId": player["DiscordId"], "Name": player["Name"],
+             **player["SeedScore"]}
+            for player in seeded
+        ]
         for player in stored["Players"]:
             participant_id = result.get(player["DiscordId"])
             if participant_id:
@@ -10147,6 +10254,17 @@ async def check_bracket_complete(record):
             "Name": champion.get("name"),
             "DiscordId": winner_discord_id or None,
         }
+        # Every finish, not only the winner's -- the next tournament seeds
+        # off these. Players are keyed by Discord ID, carried on each
+        # participant in misc, since that is what registration keys them by.
+        stored["FieldSize"] = len(participants)
+        stored["Standings"] = [
+            {"DiscordId": str(participant["misc"]),
+             "Name": participant.get("name"),
+             "Rank": participant["final_rank"]}
+            for participant in standings
+            if participant.get("misc")
+        ]
         return stored
 
     status, saved = await update_tournament(record["Id"], transform)
