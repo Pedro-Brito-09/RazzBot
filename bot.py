@@ -8463,6 +8463,13 @@ async def challonge_request(path, *, method="GET", payload=None, params=None,
                     _retried=True,
                 )
 
+            if resp.status == 429:
+                print(f"challonge {method} {path} -> 429: monthly quota spent")
+                return False, (
+                    "Challonge's monthly API limit is used up (the free plan "
+                    "allows 500 requests a month). Usage is at "
+                    "https://connect.challonge.com"
+                )
             if resp.status >= 400:
                 print(f"challonge {method} {path} -> "
                       f"{resp.status}: {body[:300]}")
@@ -9025,7 +9032,7 @@ async def tournament_cancel(ctx, tokens=()):
     ))
 
 @bot.command(name="tournament", hidden=True,
-             usage="<create|pool|result|ff|cancel|cleanup>")
+             usage="<create|pool|result|ff|sync|cancel|cleanup>")
 @is_admin()
 async def admin_tournament(ctx, action: str = None, *arguments: str):
     """!tournament — run a bracket: create it, curate its pool, track it."""
@@ -9044,6 +9051,8 @@ async def admin_tournament(ctx, action: str = None, *arguments: str):
         await tournament_result(ctx, tokens)
     elif verb in ("ff", "forfeit"):
         await tournament_forfeit(ctx, tokens)
+    elif verb == "sync":
+        await tournament_sync(ctx)
     elif not verb:
         record = await active_tournament()
         if record is None:
@@ -9665,35 +9674,19 @@ async def challonge_push_field(record, players):
         return False, f"{data} (the field is in, but it wouldn't start)"
     return True, by_discord
 
-async def challonge_standings(record):
-    """The bracket's state and its participants. Returns (state, players).
-
-    Two calls rather than one: the include syntax for pulling participants
-    alongside a tournament is the kind of thing that differs per endpoint,
-    and this cannot afford to guess -- it is what decides when a tournament
-    is over.
-    """
-    challonge_id = record["Challonge"]["Id"]
+async def challonge_participants(record):
+    """Everyone in the bracket, with final_rank once it's finalized."""
     ok, data = await challonge_request(
-        f"application/tournaments/{challonge_id}"
+        f"application/tournaments/{record['Challonge']['Id']}/participants"
     )
     if not ok:
-        return None, data
-
-    state = challonge_attributes((data or {}).get("data") or {}).get("state")
-
-    ok, data = await challonge_request(
-        f"application/tournaments/{challonge_id}/participants"
-    )
-    if not ok:
-        return None, data
-
+        return False, data
     participants = []
     for resource in (data or {}).get("data") or []:
         attributes = challonge_attributes(resource)
         if attributes:
             participants.append(attributes)
-    return state, participants
+    return True, participants
 
 async def start_bracket(record):
     """Close check-in and build the bracket from whoever turned up."""
@@ -9774,6 +9767,8 @@ async def start_bracket(record):
         heading=f"🏆 {saved['Name']} — bracket is live",
         colour=TOURNAMENT_COLOR,
     ), ping="players")
+    _refreshed_since_boot.add(saved["Id"])
+    await refresh_bracket(saved)
 
 async def cancel_tournament(record, reason):
     """End a tournament that can't run, and say so where people registered."""
@@ -9845,7 +9840,8 @@ async def advance_tournament(record):
         return
 
     if phase == "live":
-        await check_bracket_complete(record)
+        # Matches run on their own loop, and the bracket is only read when
+        # it can have changed -- see refresh_bracket.
         return
 
     if phase == "registration":
@@ -10252,19 +10248,17 @@ def final_standings(participants):
     ranked.sort(key=lambda p: p["final_rank"])
     return ranked
 
-async def check_bracket_complete(record):
-    """Award the champion role once Challonge says the bracket is finished.
+async def crown_champion(record):
+    """Record the final ranks and award the champion role.
 
-    Polling for this is what lets a tournament run end to end today: results
-    can be entered on Challonge by hand and everything around them still
-    happens on its own.
+    Runs once, right after the bracket is finalized -- final ranks don't
+    exist before that, and asking earlier would only spend requests.
     """
-    state, participants = await challonge_standings(record)
-    if state is None:
-        print(f"tournament {record['Id']}: couldn't read the bracket "
-              f"({participants})")
-        return
-    if state != "complete":
+    ok, participants = await challonge_participants(record)
+    if not ok:
+        await tell_host(record, f"**{record['Name']}** is finalized, but its "
+                                f"final ranks couldn't be read — "
+                                f"{participants}")
         return
 
     standings = final_standings(participants)
@@ -10851,6 +10845,10 @@ async def finish_match(record, match_id, winner_id, scores, how):
             await thread.edit(locked=True, archived=True)
         except discord.HTTPException:
             pass
+    # Following a result from Challonge happens inside a refresh already;
+    # anything the bot reported itself is worth one read to open what's next.
+    if how != "challonge":
+        await refresh_bracket(saved)
     if winner_id is None:
         return True, f"{match_label(saved, done)} is finished."
     return True, (f"**{player_name(saved, winner_id)}** wins "
@@ -10997,35 +10995,85 @@ async def collect_game_result(record, match_id, match):
         print(f"tournament {record['Id']}: game result for {match_id} "
               f"couldn't be reported: {text}")
 
-async def advance_matches(record):
-    """One pass over a live bracket. Safe to re-run."""
+# Challonge's free plan allows 500 API requests a month, so the bracket is
+# never polled. A new match can only become ready when the bracket starts or
+# when a result lands, and the bot reports every result itself -- so it asks
+# Challonge at exactly those moments, plus once after each boot in case a
+# restart fell between a report and the refresh after it. The match loop
+# below keeps only the deadlines and the game's results, which cost nothing.
+_refreshed_since_boot = set()
+
+async def refresh_bracket(record):
+    """Read the bracket once and act on it. Returns (ok, reason).
+
+    Opens every match that just became ready, follows any result entered on
+    Challonge's own site, and finalizes the bracket once nothing is left to
+    play. One request, plus two more on the call that ends the tournament.
+    """
     ok, found = await challonge_matches(record)
     if not ok:
         print(f"tournament {record['Id']}: couldn't read matches ({found})")
-        return
+        return False, found
 
-    by_id = {match["Id"]: match for match in found}
     for match in found:
         if (match["State"] == "open" and match["Participants"]
                 and match["Id"] not in record["Matches"]):
             await open_match(record, match)
 
     record = await read_tournament(record["Id"]) or record
-    now = now_epoch()
+    by_id = {match["Id"]: match for match in found}
+    by_participant = {str(player.get("ChallongeId")): player["DiscordId"]
+                      for player in record["Players"]
+                      if player.get("ChallongeId")}
     for match_id, match in list(record["Matches"].items()):
-        if match.get("State") == "done":
-            continue
-        # Entered straight on Challonge: follow it rather than fight it.
         upstream = by_id.get(match_id)
-        if upstream and upstream["State"] == "complete":
-            by_participant = {str(p.get("ChallongeId")): p["DiscordId"]
-                              for p in record["Players"]
-                              if p.get("ChallongeId")}
+        if (match.get("State") != "done" and upstream
+                and upstream["State"] == "complete"):
             await finish_match(record, match_id,
                                by_participant.get(upstream.get("Winner")),
                                {}, "challonge")
-            continue
 
+    record = await read_tournament(record["Id"]) or record
+    sync_match_threads(record)
+
+    # Nothing open and something played means nothing is left to play: a
+    # match still pending would have both players, and so be open, if it
+    # could be. Challonge won't close the bracket on its own -- it has to be
+    # finalized before final ranks exist.
+    if (found and not any(m["State"] == "open" for m in found)
+            and any(m["State"] == "complete" for m in found)):
+        await finalize_bracket(record)
+    return True, None
+
+async def finalize_bracket(record):
+    """Close the bracket on Challonge, then crown the winner."""
+    if record["Phase"] != "live":
+        return
+    ok, reason = await challonge_request(
+        f"application/tournaments/{record['Challonge']['Id']}/change_state",
+        method="PUT",
+        payload={"data": {"type": "TournamentState",
+                          "attributes": {"state": "finalize"}}},
+    )
+    if not ok:
+        await tell_host(
+            record,
+            f"Every match in **{record['Name']}** is done, but Challonge "
+            f"wouldn't finalize the bracket — {reason}\n"
+            f"-# Finalize it on Challonge, then run `!tournament sync`.",
+        )
+        return
+    await crown_champion(record)
+
+async def advance_matches(record):
+    """Deadlines and the game's results. Never calls Challonge."""
+    if record["Id"] not in _refreshed_since_boot:
+        _refreshed_since_boot.add(record["Id"])
+        await refresh_bracket(record)
+        record = await read_tournament(record["Id"]) or record
+
+    now = now_epoch()
+    for match_id, match in list(record["Matches"].items()):
         state = match.get("State")
         if state == "checkin" and now >= (match.get("Deadline") or now):
             await resolve_checkin(record, match_id, match)
@@ -11039,6 +11087,21 @@ async def advance_matches(record):
             await collect_game_result(record, match_id, match)
 
     sync_match_threads(await read_tournament(record["Id"]) or record)
+
+async def tournament_sync(ctx):
+    """!tournament sync -- read the bracket now, for edits made on Challonge."""
+    record = await active_tournament()
+    if record is None or record["Phase"] != "live":
+        await ctx.send(view=simple_card("No bracket is live.",
+                                        colour=discord.Color.greyple()))
+        return
+    async with ctx.typing():
+        ok, reason = await refresh_bracket(record)
+    await ctx.send(view=simple_card(
+        "🔄 Read the bracket from Challonge and caught up."
+        if ok else f"Couldn't read the bracket — {reason}",
+        colour=TOURNAMENT_COLOR if ok else discord.Color.red(),
+    ))
 
 @tasks.loop(seconds=MATCH_TICK_SECONDS)
 async def match_tick():
