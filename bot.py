@@ -8307,6 +8307,57 @@ async def update_tournament(tournament_id, transform):
         )
     return status, outcome["record"]
 
+def tournament_universes():
+    """Every universe a tournament can live in, the active one first.
+
+    A !dev_ command has already set its universe, so searching that one
+    first keeps a dev tournament from being answered with the live one.
+    """
+    universes = [current_universe()]
+    for candidate in (UNIVERSE_ID, DEV_UNIVERSE_ID):
+        if candidate and str(candidate) not in {str(u) for u in universes}:
+            universes.append(candidate)
+    return universes
+
+async def bound_tournament(*, channel_id=None, match_id=None):
+    """The running tournament, with the universe switched to the one it is
+    stored in. None when there isn't one.
+
+    Buttons and the schedulers carry no universe of their own -- a component
+    callback runs in a fresh task long after the command returned -- so both
+    are searched. With a live and a dev tournament running at once, the one
+    whose match or whose channels the click came from wins, and otherwise
+    the first found.
+
+    The ContextVar is deliberately left set: each interaction and command
+    runs in its own task, whose context dies with it.
+    """
+    fallback = None
+    for universe in tournament_universes():
+        token = _active_universe.set(universe)
+        record = await active_tournament()
+        if record is None:
+            _active_universe.reset(token)
+            continue
+
+        if match_id is not None and match_id in record["Matches"]:
+            return record
+        space = tournament_space(record)
+        if channel_id is not None and str(channel_id) in {
+            space.get("InfoChannelId"), space.get("RegistrationChannelId"),
+            space.get("ChatChannelId"),
+        }:
+            return record
+
+        if fallback is None:
+            fallback = (record, universe)
+        _active_universe.reset(token)
+
+    if fallback is None:
+        return None
+    _active_universe.set(fallback[1])
+    return fallback[0]
+
 async def active_tournament():
     """The one tournament still running, or None.
 
@@ -8807,6 +8858,7 @@ async def tournament_create(ctx, tokens):
         "Matches": {},
         "Challonge": None,
         "Discord": {},
+        "Universe": str(current_universe()),
         "Private": False,
         "HostChannelId": ctx.channel.id,
         "CreatedAt": now_epoch(),
@@ -9316,7 +9368,7 @@ async def reply_quietly(interaction, text, *, colour=None):
     )
 
 async def handle_registration(interaction):
-    record = await active_tournament()
+    record = await bound_tournament(channel_id=interaction.channel_id)
     if record is None or record["Phase"] != "registration":
         await reply_quietly(interaction, "Registration isn't open.")
         return
@@ -9401,7 +9453,7 @@ async def handle_registration(interaction):
     )
 
 async def handle_checkin(interaction):
-    record = await active_tournament()
+    record = await bound_tournament(channel_id=interaction.channel_id)
     if record is None or record["Phase"] != "checkin":
         await reply_quietly(interaction, "Check-in isn't open.")
         return
@@ -9912,8 +9964,7 @@ async def advance_tournament(record):
             return stored
         await update_tournament(record["Id"], transform)
 
-@tasks.loop(seconds=TOURNAMENT_TICK_SECONDS)
-async def tournament_tick():
+async def advance_due_tournaments():
     try:
         index = await read_tournament_index()
     except Exception:
@@ -9933,6 +9984,21 @@ async def tournament_tick():
             # One broken tournament must not stop the loop for the rest.
             print(f"Tournament tick failed for {entry.get('Id')}:")
             traceback.print_exc()
+
+@tasks.loop(seconds=TOURNAMENT_TICK_SECONDS)
+async def tournament_tick():
+    # A !dev_ tournament lives in the dev universe's datastore, so every
+    # universe gets its own pass -- otherwise one would sit untouched,
+    # never opening registration or building its bracket.
+    for universe in tournament_universes():
+        token = _active_universe.set(universe)
+        try:
+            await advance_due_tournaments()
+        except Exception:
+            print(f"Tournament tick failed on universe {universe}:")
+            traceback.print_exc()
+        finally:
+            _active_universe.reset(token)
 
 @tournament_tick.before_loop
 async def before_tournament_tick():
@@ -11145,8 +11211,7 @@ async def tournament_sync(ctx):
         colour=TOURNAMENT_COLOR if ok else discord.Color.red(),
     ))
 
-@tasks.loop(seconds=MATCH_TICK_SECONDS)
-async def match_tick():
+async def run_match_deadlines():
     try:
         index = await read_tournament_index()
     except Exception:
@@ -11162,6 +11227,18 @@ async def match_tick():
         except Exception:
             print(f"Match tick failed for {entry.get('Id')}:")
             traceback.print_exc()
+
+@tasks.loop(seconds=MATCH_TICK_SECONDS)
+async def match_tick():
+    for universe in tournament_universes():
+        token = _active_universe.set(universe)
+        try:
+            await run_match_deadlines()
+        except Exception:
+            print(f"Match tick failed on universe {universe}:")
+            traceback.print_exc()
+        finally:
+            _active_universe.reset(token)
 
 @match_tick.before_loop
 async def before_match_tick():
@@ -11180,13 +11257,16 @@ async def tournament_match_buttons(interaction):
 
     parts = custom_id.split(":")
     await interaction.response.defer(ephemeral=True, thinking=True)
-
-    record = await active_tournament()
-    if record is None or record["Phase"] != "live" or len(parts) < 3:
-        await interaction.followup.send("That match is over.", ephemeral=True)
+    if len(parts) < 3:
         return
 
     action, match_id = parts[1], parts[2]
+    record = await bound_tournament(match_id=match_id,
+                                    channel_id=interaction.channel_id)
+    if record is None or record["Phase"] != "live":
+        await interaction.followup.send("That match is over.", ephemeral=True)
+        return
+
     match = record["Matches"].get(match_id)
     who = str(interaction.user.id)
     if match is None:
@@ -11330,7 +11410,7 @@ async def match_command(ctx):
                                         colour=TOURNAMENT_COLOR),
                        ephemeral=ephemeral)
 
-    record = await active_tournament()
+    record = await bound_tournament(channel_id=ctx.channel.id)
     if record is None:
         await reply("No tournament is running right now.")
         return
