@@ -3974,6 +3974,8 @@ async def on_ready():
     global _synced, _link_expiration_restore_task
     print(f"Logged in as {bot.user}")
 
+    await announce_restart_done()
+
     if (
         not _link_expirations_restored
         and (
@@ -4881,6 +4883,86 @@ async def admin_only_predicate(ctx):
 def is_admin():
     """Prefix-command gate. Stays silent for everyone else."""
     return commands.check(admin_only_predicate)
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Written just before !restart exits, read by on_ready to say we're back.
+RESTART_NOTICE_PATH = os.path.join(BOT_DIR, ".restart_notice.json")
+
+async def run_git(*args):
+    """Run git in the bot's checkout -> (exit code, combined output)."""
+    process = await asyncio.create_subprocess_exec(
+        "git", "-C", BOT_DIR, *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        process.kill()
+        return 1, "git timed out after 60s"
+    return process.returncode, output.decode(errors="replace").strip()
+
+@bot.command(name="restart", hidden=True)
+@is_admin()
+async def admin_restart(ctx):
+    """Pull the latest main and restart the bot."""
+    async with ctx.typing():
+        _, before = await run_git("rev-parse", "--short", "HEAD")
+        code, output = await run_git("pull", "--ff-only", "origin", "main")
+        if code != 0:
+            await ctx.send(
+                f"❌ `git pull` failed, not restarting.\n```\n{output[-1800:]}\n```"
+            )
+            return
+        _, after = await run_git("rev-parse", "--short", "HEAD")
+
+        if before == after:
+            lines = [f"Already up to date on `{after}`."]
+        else:
+            _, log = await run_git(
+                "log", "--format=- %h %s", f"{before}..{after}"
+            )
+            lines = [f"Pulled `{before}` → `{after}`:", log[-1500:]]
+            _, changed = await run_git(
+                "diff", "--name-only", f"{before}..{after}"
+            )
+            if "requirements.txt" in changed.splitlines():
+                lines.append(
+                    "⚠️ `requirements.txt` changed — run `pip install` on "
+                    "the VPS, or the restart may crash."
+                )
+
+    try:
+        with open(RESTART_NOTICE_PATH, "w") as f:
+            json.dump({"channel_id": ctx.channel.id}, f)
+    except OSError:
+        traceback.print_exc()
+
+    lines.append("🔄 Restarting...")
+    await ctx.send("\n".join(lines))
+    # systemd's Restart=always brings the process back up.
+    await bot.close()
+
+async def announce_restart_done():
+    """Tell the channel that ran !restart that the new process is up."""
+    try:
+        with open(RESTART_NOTICE_PATH) as f:
+            channel_id = json.load(f)["channel_id"]
+    except (OSError, ValueError, KeyError):
+        return
+    finally:
+        try:
+            os.remove(RESTART_NOTICE_PATH)
+        except OSError:
+            pass
+
+    _, commit = await run_git("rev-parse", "--short", "HEAD")
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        await channel.send(f"✅ Back online on `{commit}`.")
+    except discord.HTTPException:
+        traceback.print_exc()
 
 async def resolve_admin_target(ctx, player):
     """Username or ID -> (user_id, name). Reports and returns None on miss."""
