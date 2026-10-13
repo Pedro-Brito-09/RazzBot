@@ -4983,6 +4983,38 @@ async def admin_restart(ctx):
     # systemd's Restart=always brings the process back up.
     await bot.close()
 
+def _clear_owned_badges_cache(universe):
+    for key in [k for k in _owned_badges_cache if k[0] == universe]:
+        del _owned_badges_cache[key]
+
+# Every in-memory cache !clearcache can drop, all scoped to one universe.
+CACHE_CLEARERS = {
+    "maps": lambda universe: _maps_cache.pop(universe, None),
+    "badges": _clear_owned_badges_cache,
+    "catalog": lambda universe: _reward_catalog_cache.pop(universe, None),
+}
+
+@bot.command(name="clearcache", hidden=True, usage="[maps|badges|catalog]")
+@is_admin()
+async def admin_clearcache(ctx, which: str = None):
+    """Drop cached data so the next command fetches it fresh."""
+    if which is None:
+        names = list(CACHE_CLEARERS)
+    elif which.lower() in CACHE_CLEARERS:
+        names = [which.lower()]
+    else:
+        await ctx.send(
+            f"Unknown cache `{which}`. Pick one of: "
+            + ", ".join(f"`{name}`" for name in CACHE_CLEARERS)
+            + ", or leave it empty for all."
+        )
+        return
+
+    universe = current_universe()
+    for name in names:
+        CACHE_CLEARERS[name](universe)
+    await ctx.send(f"🧹 Cleared: {', '.join(names)}")
+
 async def announce_restart_done():
     """Tell the channel that ran !restart that the new process is up."""
     try:
