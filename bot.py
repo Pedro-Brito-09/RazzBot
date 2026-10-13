@@ -16,7 +16,7 @@ import re
 import secrets
 import string
 import time
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import quote, unquote
 from datetime import datetime, time as datetime_time, timedelta, timezone
 
@@ -4590,7 +4590,7 @@ async def leaderboard_command(ctx, target: str):
         return
     await ctx.send(embed=embed)
 
-async def build_map_view(entry, parent=None):
+async def build_map_view(entry, parent=None, view_class=None):
     """Resolve a map's creator and wrap it in a card."""
     creator_id = entry.get("Creator")
     creator = await fetch_username(creator_id) if creator_id else None
@@ -4605,7 +4605,7 @@ async def build_map_view(entry, parent=None):
     if creator_id:
         headshot = (await fetch_headshots([creator_id])).get(creator_id)
 
-    return MapView(
+    return (view_class or MapView)(
         entry, headshot=headshot, creator_text=creator_text,
         creator_id=creator_id, creator_name=creator, parent=parent,
     )
@@ -4662,6 +4662,227 @@ async def profile_command(ctx, username: str = None):
         return
 
     view.message = await ctx.send(view=view)
+
+# How many rows /topmaps and /topcreators list.
+TOP_LIST_LIMIT = 50
+# The prefix form takes either spelling; the slash form offers these two.
+RANKING_STATS = {"plays": "Plays", "favourites": "Favorites"}
+RankingStat = Literal["plays", "favourites"]
+
+def public_maps(maps_by_id):
+    return [m for m in maps_by_id.values() if m.get("Privacy") == "Public"]
+
+class RandomMapView(MapView):
+    """A map card with a Reroll button that swaps in another random map."""
+
+    def __init__(self, entry, **kwargs):
+        super().__init__(entry, **kwargs)
+        button = discord.ui.Button(
+            label="Reroll", style=discord.ButtonStyle.primary, emoji="🎲",
+        )
+        button.callback = self.reroll
+
+        container = self.children[0]
+        rows = [c for c in container.children
+                if isinstance(c, discord.ui.ActionRow)]
+        if rows and len(rows[-1].children) < 5:
+            rows[-1].add_item(button)
+        else:
+            row = discord.ui.ActionRow()
+            row.add_item(button)
+            container.add_item(row)
+
+    @keeps_context
+    async def reroll(self, interaction):
+        await interaction.response.defer()
+        view = await build_random_map_view(exclude=self.entry.get("Id"))
+        if view is None:
+            await interaction.followup.send(
+                "There are no other public maps to roll.", ephemeral=True
+            )
+            return
+        view.message = interaction.message
+        await interaction.edit_original_response(view=view)
+
+async def build_random_map_view(exclude=None):
+    """A card for one public map, every map equally likely."""
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        return None
+    pool = [m for m in public_maps(maps_by_id) if m.get("Id") != exclude]
+    if not pool:
+        return None
+    entry = secrets.choice(pool)
+    return await build_map_view(entry, view_class=RandomMapView)
+
+@bot.hybrid_command(name="randommap", description="Show a random public community map")
+async def randommap_command(ctx):
+    await ctx.defer()
+    view = await build_random_map_view()
+    if view is None:
+        await ctx.send("Failed to fetch the community map list.")
+        return
+    view.message = await ctx.send(view=view)
+
+@bot.hybrid_command(name="topmaps", description="The most played or most favourited public maps")
+@app_commands.describe(by="Rank by plays or favourites (default plays)")
+async def topmaps_command(ctx, by: RankingStat = "plays"):
+    await ctx.defer()
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        await ctx.send("Failed to fetch the community map list.")
+        return
+
+    key = RANKING_STATS[by]
+    ranked = sorted(public_maps(maps_by_id),
+                    key=lambda m: m.get(key) or 0, reverse=True)
+    ranked = ranked[:TOP_LIST_LIMIT]
+    if not ranked:
+        await ctx.send("There are no public maps yet.")
+        return
+
+    creators = await fetch_usernames([m.get("Creator") for m in ranked])
+    view = MapListView(
+        ranked,
+        title="🔥 Top Maps",
+        subtitle=f"Top {len(ranked)} public maps by {by}",
+        creators=creators,
+    )
+    view.message = await ctx.send(view=view)
+
+class CreatorListView(MapListView):
+    """MapListView's paging, with one creator per row instead of a map."""
+
+    def describe(self, entry):
+        creator_id = entry["Creator"]
+        name = self.creators.get(creator_id) or f"User {creator_id}"
+        maps = entry["Maps"]
+        return (
+            f"`#{entry['Rank']}` **{name}**\n"
+            f"-# ▶️ {format_number(entry['Plays'])} plays"
+            f"  ·  ⭐ {format_number(entry['Favorites'])}"
+            f"  ·  🗺️ {maps} map{'s' if maps != 1 else ''}"
+        )
+
+@bot.hybrid_command(name="topcreators", description="Creators ranked by the plays or favourites of their public maps")
+@app_commands.describe(by="Rank by plays or favourites (default plays)")
+async def topcreators_command(ctx, by: RankingStat = "plays"):
+    await ctx.defer()
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        await ctx.send("Failed to fetch the community map list.")
+        return
+
+    totals = {}
+    for entry in public_maps(maps_by_id):
+        creator_id = entry.get("Creator")
+        if creator_id is None:
+            continue
+        row = totals.setdefault(creator_id, {
+            "Creator": creator_id, "Plays": 0, "Favorites": 0, "Maps": 0,
+        })
+        row["Plays"] += entry.get("Plays") or 0
+        row["Favorites"] += entry.get("Favorites") or 0
+        row["Maps"] += 1
+
+    key = RANKING_STATS[by]
+    ranked = sorted(totals.values(), key=lambda r: r[key], reverse=True)
+    ranked = ranked[:TOP_LIST_LIMIT]
+    if not ranked:
+        await ctx.send("Nobody has published a map yet.")
+        return
+    for rank, row in enumerate(ranked, start=1):
+        row["Rank"] = rank
+
+    creators = await fetch_usernames([r["Creator"] for r in ranked])
+    view = CreatorListView(
+        ranked,
+        title="🛠️ Top Creators",
+        subtitle=f"Top {len(ranked)} creators by {by} across their public maps",
+        creators=creators,
+    )
+    view.message = await ctx.send(view=view)
+
+async def fetch_compare_stats(user_id):
+    """The numbers /compare lines up, or None when there's no saved data."""
+    entry, wins = await asyncio.gather(
+        fetch_entry(str(user_id), datastore="Main_Data"),
+        fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins"),
+    )
+    if not entry:
+        return None
+    data = entry.get("Data") if isinstance(entry, dict) else None
+    data = data if isinstance(data, dict) else {}
+
+    stats = {
+        "👑 Wins": wins,
+        "⚡ Win streak": dig(data, "Stats", "WinStreak", default=0),
+        "⭐ Stars": data.get("Stars") or 0,
+        "🌟 All-time stars": dig(data, "Stats", "AllTimeStars", default=0),
+    }
+    for i, tier in enumerate(MEDAL_TIERS):
+        medals = dig(data, "Medals", tier, default=[]) or []
+        stats[f"{get_medal_emoji(i)} {tier} medals"] = len(medals)
+    return stats
+
+@bot.hybrid_command(name="compare", description="Compare two players' stats side by side")
+@app_commands.describe(
+    player1="Roblox username",
+    player2="Roblox username. Uses your linked account if omitted.",
+)
+async def compare_command(ctx, player1: str, player2: str = None):
+    await ctx.defer()
+
+    first_id, first = await resolve_command_user(ctx, player1)
+    if first_id is None:
+        return
+    second_id, second = await resolve_command_user(ctx, player2)
+    if second_id is None:
+        return
+    if first_id == second_id:
+        await ctx.send("Pick two different players to compare.")
+        return
+
+    first_stats, second_stats = await asyncio.gather(
+        fetch_compare_stats(first_id), fetch_compare_stats(second_id),
+    )
+    missing = [name for name, stats in ((first, first_stats),
+                                        (second, second_stats))
+               if stats is None]
+    if missing:
+        await ctx.send(f"No game data saved for **{'** or **'.join(missing)}**.")
+        return
+
+    first_leads = second_leads = 0
+    lines = []
+    for label, a in first_stats.items():
+        b = second_stats[label]
+        # Wins can be unreadable on its own; don't call that a loss.
+        if a is None or b is None:
+            a_text = format_number(a) if a is not None else "?"
+            b_text = format_number(b) if b is not None else "?"
+            lines.append(f"{label}\n-# {first}: {a_text}  ·  {second}: {b_text}")
+            continue
+        a_text, b_text = format_number(a), format_number(b)
+        if a > b:
+            first_leads += 1
+            a_text = f"**{a_text}** 🏆"
+        elif b > a:
+            second_leads += 1
+            b_text = f"**{b_text}** 🏆"
+        lines.append(f"{label}\n-# {first}: {a_text}  ·  {second}: {b_text}")
+
+    if first_leads > second_leads:
+        verdict = f"**{first}** leads {first_leads}–{second_leads}"
+    elif second_leads > first_leads:
+        verdict = f"**{second}** leads {second_leads}–{first_leads}"
+    else:
+        verdict = f"Dead even, {first_leads}–{second_leads}"
+
+    await ctx.send(view=simple_card(
+        "\n".join(lines) + f"\n\n{verdict}",
+        heading=f"⚔️ {first} vs {second}",
+    ))
 
 def describe_command(command, prefix):
     usage = f"{prefix}{command.qualified_name}"
