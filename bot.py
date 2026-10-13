@@ -2888,10 +2888,14 @@ class ProfileView(CardView):
         # edit_original_response would then edit that, not the card.
         await interaction.response.defer()
 
-        view = await build_created_maps_view(self.user_id, self.username, parent=self)
+        include_hidden = shows_hidden_maps(interaction.channel)
+        view = await build_created_maps_view(
+            self.user_id, self.username, parent=self,
+            include_hidden=include_hidden,
+        )
         if view is None:
             await interaction.followup.send(
-                f"**{self.username}** has no public maps...", ephemeral=True
+                no_maps_message(self.username, include_hidden), ephemeral=True
             )
             return
 
@@ -2943,6 +2947,8 @@ def search_public_maps(maps_by_id, query, limit=50):
     scored.sort(key=lambda item: (item[0], item[1]))
     return [entry for _, _, entry in scored[:limit]]
 
+PRIVACY_BADGES = {"Public": "🌐", "Private": "🔒", "Unlisted": "🔗"}
+
 class MapListView(CardView):
     """A paginated list of maps, shared by search results and a player's maps."""
 
@@ -2966,6 +2972,10 @@ class MapListView(CardView):
         creator = self.creators.get(creator_id)
         by = f"  ·  👤 {creator}" if creator else (
             f"  ·  👤 User {creator_id}" if creator_id else "")
+        # Only the staff map lists ever contain non-public maps.
+        privacy = entry.get("Privacy")
+        if privacy and privacy != "Public":
+            star += f" {PRIVACY_BADGES.get(privacy, '')} *{privacy}*"
         return (
             f"`#{entry.get('Id')}` **{name}**{star}\n"
             f"-# ▶️ {format_number(entry.get('Plays') or 0)} plays"
@@ -3292,25 +3302,51 @@ async def build_map_search_view(query, matches, parent=None):
         parent=parent,
     )
 
-async def build_created_maps_view(user_id, username, parent=None):
-    """List the community maps a player has created, most played first."""
+# Staff channels where a player's map list also shows their Private and
+# Unlisted maps. Who can read the channel is the access control.
+ALL_MAPS_CHANNEL_IDS = {1257828475231010817, 1465654101248311419}
+
+def shows_hidden_maps(channel):
+    """True in a staff channel, or a thread inside one."""
+    if channel is None:
+        return False
+    return (channel.id in ALL_MAPS_CHANNEL_IDS
+            or getattr(channel, "parent_id", None) in ALL_MAPS_CHANNEL_IDS)
+
+def no_maps_message(username, include_hidden):
+    return f"**{username}** has no {'' if include_hidden else 'public '}maps..."
+
+async def build_created_maps_view(user_id, username, parent=None,
+                                  include_hidden=False):
+    """List the community maps a player has created, most played first.
+
+    include_hidden adds their Private and Unlisted maps to the public ones.
+    """
     maps_by_id = await get_community_maps()
     if not maps_by_id:
         return None
 
     owned = [
         m for m in maps_by_id.values()
-        if m.get("Creator") == user_id and m.get("Privacy") == "Public"
+        if m.get("Creator") == user_id
+        and (include_hidden or m.get("Privacy") == "Public")
     ]
     if not owned:
         return None
     owned.sort(key=lambda m: m.get("Plays") or 0, reverse=True)
 
+    if include_hidden:
+        public = sum(1 for m in owned if m.get("Privacy") == "Public")
+        subtitle = (f"{len(owned)} map{'s' if len(owned) != 1 else ''}"
+                    f" · {public} public, {len(owned) - public} hidden")
+    else:
+        subtitle = f"{len(owned)} public map{'s' if len(owned) != 1 else ''}"
+
     creators = await fetch_usernames([user_id])
     return MapListView(
         owned,
         title=f"🗺️ Maps by {username}",
-        subtitle=f"{len(owned)} public map{'s' if len(owned) != 1 else ''}",
+        subtitle=subtitle,
         creators=creators,
         parent=parent,
     )
@@ -3381,7 +3417,7 @@ def build_map_container(entry, *, headshot=None, creator_text="Unknown",
 
     footer = f"ID {map_id}"
     if privacy:
-        badge = {"Public": "🌐", "Private": "🔒"}.get(privacy, "")
+        badge = PRIVACY_BADGES.get(privacy, "")
         footer += f"  ·  {badge} {privacy}".rstrip()
     container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
 
@@ -4375,9 +4411,12 @@ async def maps_command(ctx, username: str = None):
     if user_id is None:
         return
 
-    view = await build_created_maps_view(user_id, canonical)
+    include_hidden = shows_hidden_maps(ctx.channel)
+    view = await build_created_maps_view(
+        user_id, canonical, include_hidden=include_hidden
+    )
     if view is None:
-        await ctx.send(f"**{canonical}** has no public maps...")
+        await ctx.send(no_maps_message(canonical, include_hidden))
         return
 
     await ctx.send(view=view)
