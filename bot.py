@@ -253,7 +253,8 @@ TOURNAMENT_CHANNEL_ID = os.getenv("TOURNAMENT_CHANNEL_ID")
 TOURNAMENT_ROLE_ID = os.getenv("TOURNAMENT_ROLE_ID")
 # A permanent record of every tournament that finishes: its top 3. Lives
 # outside the tournament's category, so !tournament cleanup never takes it.
-TOURNAMENT_LOG_CHANNEL_ID = os.getenv("TOURNAMENT_LOG_CHANNEL_ID")
+TOURNAMENT_LOG_CHANNEL_ID = (os.getenv("TOURNAMENT_LOG_CHANNEL_ID")
+                             or "1561880467257561159")
 # Challonge owns the bracket -- seeding, byes and advancement. The bot creates
 # the tournament there, fills it once check-in closes, and pushes results back.
 # Bracket logic is fiddly and already solved; more to the point, a host can fix
