@@ -144,6 +144,17 @@ PLAY_URL_TEMPLATE = (
     "https://www.roblox.com/games/start"
     "?placeId=86832525327994&launchData=Map%2F{id}"
 )
+# A Tournament Match's Play and Spectate link. The Public Game reads Match_<id>
+# and sends both players, and anyone else as a spectator, into the one Party
+# Mode server for that match.
+TOURNAMENT_MATCH_URL_TEMPLATE = (
+    "https://www.roblox.com/games/start"
+    "?placeId={place_id}&launchData=Match%2F{match_id}"
+)
+PUBLIC_GAME_PLACE_ID = 86832525327994
+# The Public Game in DEV_UNIVERSE_ID, for tournaments made with !dev_.
+DEV_PUBLIC_GAME_PLACE_ID = int(os.getenv("DEV_PUBLIC_GAME_PLACE_ID")
+                               or 84214369402843)
 # Daily Cup announcements use the cup experience rather than Challenge Mode.
 DAILY_CUP_PLAY_URL_TEMPLATE = (
     "https://www.roblox.com/games/start"
@@ -11040,6 +11051,13 @@ def match_button(action, match_id, *extra, label, style, emoji=None,
     return discord.ui.Button(label=label[:80], style=style, emoji=emoji,
                              custom_id=custom_id, disabled=disabled)
 
+def tournament_match_url(record, match_id):
+    """The Play/Spectate link, in the universe the tournament was made in."""
+    live = str(record.get("Universe") or UNIVERSE_ID) == str(UNIVERSE_ID)
+    place_id = PUBLIC_GAME_PLACE_ID if live else DEV_PUBLIC_GAME_PLACE_ID
+    return TOURNAMENT_MATCH_URL_TEMPLATE.format(
+        place_id=place_id, match_id=quote(str(match_id), safe=""))
+
 def match_card(record, match_id, match):
     """The one message in a match thread, rendered for its current state."""
     container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
@@ -11106,12 +11124,20 @@ def match_card(record, match_id, match):
             f"<@{high}> <@{low}> — you're up. Best of {record['BestOf']} "
             f"on this map.\n"
             f"-# The result is picked up automatically once the game reports "
-            f"it. A host can also enter it."
+            f"it. A host can also enter it. Anyone else who opens the match "
+            f"joins as a spectator."
         ))
+        # One link for both: the game seats the two players and makes
+        # everyone else a spectator.
+        url = tournament_match_url(record, match_id)
         row = discord.ui.ActionRow()
         row.add_item(discord.ui.Button(
             label="Play", style=discord.ButtonStyle.link, emoji="▶️",
-            url=PLAY_URL_TEMPLATE.format(id=chosen["Id"]),
+            url=url,
+        ))
+        row.add_item(discord.ui.Button(
+            label="Spectate", style=discord.ButtonStyle.link, emoji="👀",
+            url=url,
         ))
         container.add_item(row)
 
@@ -11123,6 +11149,10 @@ def match_card(record, match_id, match):
             "host": "entered by a host",
             "challonge": "entered on Challonge",
             "game": "reported by the game",
+            "game-no-show": "reported by the game — the other player "
+                            "didn't show up",
+            "game-disconnect": "reported by the game — the other player "
+                               "disconnected and didn't come back",
         }.get(match.get("How"), match.get("How") or "")
         headline = (f"## 🏁 <@{winner}> wins"
                     + (f" {match['Score']}" if match.get("Score") else "")
@@ -11451,6 +11481,13 @@ async def resolve_checkin(record, match_id, match):
         f"`!tournament result {match.get('Code')} <score>`.",
     )
 
+# Result_<id>'s Reason -> the match's How
+GAME_RESULT_HOW = {
+    "completed": "game",
+    "no-show": "game-no-show",
+    "disconnect": "game-disconnect",
+}
+
 async def collect_game_result(record, match_id, match):
     """Pick up a result the game wrote, if there is one yet."""
     stored = await fetch_entry(RESULT_KEY.format(id=match_id),
@@ -11472,7 +11509,10 @@ async def collect_game_result(record, match_id, match):
         discord_id = by_roblox.get(str(roblox_id))
         if discord_id and isinstance(value, (int, float)):
             scores[discord_id] = int(value)
-    ok, text = await finish_match(record, match_id, winner, scores, "game")
+    # The game says why it ended, so a no-show or a disconnect isn't
+    # mistaken for a match that was played out.
+    how = GAME_RESULT_HOW.get(stored.get("Reason"), "game")
+    ok, text = await finish_match(record, match_id, winner, scores, how)
     if not ok:
         print(f"tournament {record['Id']}: game result for {match_id} "
               f"couldn't be reported: {text}")
