@@ -9452,8 +9452,9 @@ async def tournament_cancel(ctx, tokens=()):
         if keep:
             teardown = "-# The channels and roles were left up."
         else:
+            # Nobody won a cancelled tournament, so its champion role goes too
             removed, failed = await delete_tournament_space(record)
-            record["Discord"] = space_after_teardown(record)
+            record["Discord"] = {}
             teardown = (
                 ("🗑️ Removed " + ", ".join(removed) if removed
                  else "-# There were no channels to remove.")
@@ -10715,21 +10716,24 @@ async def dress_tournament_space(record):
     if waiting_id:
         space["RegistrationMessageId"] = waiting_id
 
-async def delete_tournament_space(record):
-    """Delete the category, its channels and the player role.
+async def delete_tournament_space(record, *, keep_champion=False):
+    """Delete the category, its channels and its roles. (removed, failed).
 
-    Returns (removed, failed). The champion role is never deleted: winners
-    keep it for good. Store space_after_teardown(record) afterwards so the
-    record still knows which role that is.
+    keep_champion leaves the champion role, for a tournament that finished:
+    its winner keeps the role for good. Store space_after_teardown(record)
+    afterwards so the record still knows which role that is.
     """
     guild = tournament_guild(record)
     if guild is None:
         return [], []
 
     removed, failed = [], []
-    # Channels before the category that holds them, the role last.
-    for field in ("InfoChannelId", "RegistrationChannelId", "ChatChannelId",
-                  "CategoryId", "PlayerRoleId"):
+    # Channels before the category that holds them, roles last.
+    fields = ("InfoChannelId", "RegistrationChannelId", "ChatChannelId",
+              "CategoryId", "PlayerRoleId")
+    if not keep_champion:
+        fields += ("WinnerRoleId",)
+    for field in fields:
         target = space_object(record, guild, field)
         if target is None:
             continue
@@ -10877,9 +10881,9 @@ async def log_tournament_result(record, standings, field_size):
 # --- !tournament cleanup ---------------------------------------------------
 
 async def tournament_cleanup(ctx, tokens):
-    """Delete a finished tournament's category, channels and player role.
+    """Delete a tournament's category, channels and roles.
 
-    The champion role stays: winners keep it for good.
+    A finished tournament keeps its champion role: winners keep it for good.
     """
     positional, _ = split_flags(tokens)
     wanted = positional[0] if positional else None
@@ -10919,8 +10923,12 @@ async def tournament_cleanup(ctx, tokens):
         return
 
     async with ctx.typing():
-        removed, failed = await delete_tournament_space(record)
-        record["Discord"] = space_after_teardown(record)
+        # Only a finished tournament has a champion to keep. A cancelled one
+        # (left up with --keep) or a draft loses the role with everything else.
+        finished = record["Phase"] == "done"
+        removed, failed = await delete_tournament_space(
+            record, keep_champion=finished)
+        record["Discord"] = space_after_teardown(record) if finished else {}
         await save_tournament(record)
 
     lines = []
