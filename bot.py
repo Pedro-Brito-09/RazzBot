@@ -9632,21 +9632,6 @@ async def tell_host(record, text):
     except discord.HTTPException as error:
         print(f"Couldn't reach the host channel: {error}")
 
-async def dm_registrants(record, view):
-    """Best-effort DM to everyone registered. Returns how many landed."""
-    delivered = 0
-    for player in record["Players"]:
-        try:
-            user = bot.get_user(int(player["DiscordId"]))
-            if user is None:
-                user = await bot.fetch_user(int(player["DiscordId"]))
-            await user.send(view=view)
-            delivered += 1
-        except (discord.HTTPException, ValueError, TypeError):
-            # Closed DMs are ordinary; the announcement still reached them.
-            continue
-    return delivered
-
 # --- Player-facing cards ---------------------------------------------------
 
 class TournamentRegisterView(discord.ui.LayoutView):
@@ -9838,7 +9823,7 @@ async def handle_registration(interaction):
         f"✅ Registered for **{saved['Name']}** as **{name}**.\n\n"
         f"**Check-in opens** {when(checkin_at)} ({when(checkin_at, 'R')}) — "
         f"you have to check in then, or you're out.\n"
-        f"-# I'll DM you when it does.",
+        f"-# You'll be pinged when it does.",
         colour=TOURNAMENT_COLOR,
     )
 
@@ -9892,7 +9877,8 @@ async def handle_checkin(interaction):
         interaction,
         f"✋ Checked in for **{saved['Name']}**.\n\n"
         f"The bracket is built {when(saved['MatchesStart'], 'R')}. Stay in "
-        f"Discord — I'll DM you when your first match is up.",
+        f"Discord — you'll be pinged in your match thread when your first "
+        f"match is up.",
         colour=TOURNAMENT_COLOR,
     )
 
@@ -9962,13 +9948,9 @@ async def open_checkin(record):
         return
     record = saved
 
-    # A fresh view per destination: announcing mutates the card to carry the
-    # role ping, which renders as a dead `<@&…>` once it reaches a DM.
+    # Players are pinged here through their role, never DMed.
     await announce_tournament(record, TournamentCheckinView(record),
                               ping="players")
-    delivered = await dm_registrants(record, TournamentCheckinView(record))
-    print(f"tournament {record['Id']}: check-in open, "
-          f"{delivered}/{len(record['Players'])} DMs delivered")
 
 # Seeding blends two rankings, each taken as a percentile of the field so
 # neither dominates by scale: career wins run into the thousands while a
@@ -10246,7 +10228,8 @@ async def start_bracket(record):
     await announce_tournament(saved, simple_card(
         f"**{len(seeded)}** players are in. First round is up.\n\n"
         f"🔗 {saved['Challonge']['Url']}\n\n"
-        f"-# I'll DM you when your match is ready — check in, veto the maps, "
+        f"-# You'll be pinged in your match thread when it's ready — check "
+        f"in, veto the maps, "
         f"then play.",
         heading=f"🏆 {saved['Name']} — bracket is live",
         colour=TOURNAMENT_COLOR,
@@ -10648,7 +10631,7 @@ def tournament_info_card(record):
         f"· Register in <#{tournament_space(record).get('RegistrationChannelId')}> "
         f"— you need a linked Roblox account (`/link`).\n"
         f"· **Check in** once registration closes, or you're not in the "
-        f"bracket. I'll DM you when it opens.\n"
+        f"bracket. You'll be pinged when it opens.\n"
         f"· The **{TOURNAMENT_POOL_SIZE}-map pool** is revealed at check-in. "
         f"Each match vetoes it down to one map.\n"
         f"· Seeding is by career wins."
@@ -11368,20 +11351,8 @@ async def open_match(record, found):
             pass
         return
 
+    # The match card in the thread mentions both players; nobody is DMed.
     _match_threads[thread.id] = {high, low, str(ADMIN_USER_ID)}
-    for discord_id in (high, low):
-        opponent = low if discord_id == high else high
-        try:
-            user = bot.get_user(int(discord_id)) or await bot.fetch_user(
-                int(discord_id))
-            await user.send(view=simple_card(
-                f"Your match against **{player_name(saved, opponent)}** is "
-                f"ready.\n\n**Check in** by {when(match['Deadline'])} "
-                f"({when(match['Deadline'], 'R')}): {thread.jump_url}",
-                heading=f"⚔️ {saved['Name']}", colour=TOURNAMENT_COLOR,
-            ))
-        except (discord.HTTPException, ValueError):
-            continue
 
 async def finish_match(record, match_id, winner_id, scores, how):
     """Report a result and close the match. Returns (ok, message)."""
@@ -11937,7 +11908,8 @@ async def match_command(ctx):
             await reply("You're out of this one. 🫡")
         else:
             await reply("No match right now — you're waiting on your next "
-                        "opponent. I'll DM you when it's ready.")
+                        "opponent. You'll be pinged in its thread when "
+                        "it's ready.")
         return
 
     opponent = match["Low"] if who == match["High"] else match["High"]
