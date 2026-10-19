@@ -98,6 +98,13 @@ two per day.
 `DAILY_CUP_ROLE_ID` is the ID of the role pinged with the new map card. If it
 is omitted, the bot falls back to a role named exactly `Daily Cup Notification`.
 
+`TOURNAMENT_LOG_CHANNEL_ID` (optional) is the channel that keeps a permanent
+record of every tournament that finishes: its top 3, format, size, date and
+Challonge link, posted once the bracket is finalized. It should sit outside the
+tournament categories, since `!tournament cleanup` deletes those. Cancelled and
+`!dev_` tournaments are never logged. The bot needs View Channel and Send
+Messages there; nobody is pinged.
+
 The Open Cloud API key needs read, create, and update access to the
 `AccountLinking` data store in addition to the bot's existing data-store access.
 
