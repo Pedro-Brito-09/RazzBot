@@ -251,6 +251,10 @@ DAILY_CUP_ROLE_ID = os.getenv("DAILY_CUP_ROLE_ID")
 TOURNAMENT_CHANNEL_ID = os.getenv("TOURNAMENT_CHANNEL_ID")
 # Pinged when registration opens and again when check-in starts.
 TOURNAMENT_ROLE_ID = os.getenv("TOURNAMENT_ROLE_ID")
+# A permanent record of every tournament that finishes: its top 3. Lives
+# outside the tournament's category, so !tournament cleanup never takes it.
+TOURNAMENT_LOG_CHANNEL_ID = (os.getenv("TOURNAMENT_LOG_CHANNEL_ID")
+                             or "1561880467257561159")
 # Challonge owns the bracket -- seeding, byes and advancement. The bot creates
 # the tournament there, fills it once check-in closes, and pushes results back.
 # Bracket logic is fiddly and already solved; more to the point, a host can fix
@@ -9449,6 +9453,7 @@ async def tournament_cancel(ctx, tokens=()):
         if keep:
             teardown = "-# The channels and roles were left up."
         else:
+            # Nobody won a cancelled tournament, so its champion role goes too
             removed, failed = await delete_tournament_space(record)
             record["Discord"] = {}
             teardown = (
@@ -10712,16 +10717,24 @@ async def dress_tournament_space(record):
     if waiting_id:
         space["RegistrationMessageId"] = waiting_id
 
-async def delete_tournament_space(record):
-    """Delete the category, its channels and its roles. (removed, failed)."""
+async def delete_tournament_space(record, *, keep_champion=False):
+    """Delete the category, its channels and its roles. (removed, failed).
+
+    keep_champion leaves the champion role, for a tournament that finished:
+    its winner keeps the role for good. Store space_after_teardown(record)
+    afterwards so the record still knows which role that is.
+    """
     guild = tournament_guild(record)
     if guild is None:
         return [], []
 
     removed, failed = [], []
     # Channels before the category that holds them, roles last.
-    for field in ("InfoChannelId", "RegistrationChannelId", "ChatChannelId",
-                  "CategoryId", "PlayerRoleId", "WinnerRoleId"):
+    fields = ("InfoChannelId", "RegistrationChannelId", "ChatChannelId",
+              "CategoryId", "PlayerRoleId")
+    if not keep_champion:
+        fields += ("WinnerRoleId",)
+    for field in fields:
         target = space_object(record, guild, field)
         if target is None:
             continue
@@ -10731,6 +10744,12 @@ async def delete_tournament_space(record):
         except discord.HTTPException:
             failed.append(f"`{target.name}`")
     return removed, failed
+
+def space_after_teardown(record):
+    """What stays on record once the channels are gone: the champion role."""
+    space = tournament_space(record)
+    return {field: space[field] for field in ("GuildId", "WinnerRoleId")
+            if space.get(field)}
 
 # --- Watching the bracket finish -------------------------------------------
 
@@ -10814,11 +10833,59 @@ async def crown_champion(record):
         heading=f"🏆 {saved['Name']} — we have a winner",
         colour=WINNER_ROLE_COLOR,
     ), ping=True)
+    await log_tournament_result(saved, standings, len(participants))
+
+async def log_tournament_result(record, standings, field_size):
+    """Post the top 3 to the results log, for good.
+
+    Only finished tournaments get here: crown_champion runs once Challonge
+    has finalized the bracket, never for a cancelled one. A !dev_ tournament
+    isn't logged, so testing never shows up in the real record.
+    """
+    if str(record.get("Universe") or UNIVERSE_ID) != str(UNIVERSE_ID):
+        return
+    try:
+        channel = bot.get_channel(int(TOURNAMENT_LOG_CHANNEL_ID))
+    except (TypeError, ValueError):
+        channel = None
+    if channel is None:
+        print(f"tournament {record['Id']}: not logged -- "
+              f"TOURNAMENT_LOG_CHANNEL_ID is unset or unreachable")
+        return
+
+    # Ranks rather than positions in the list: a bracket without a
+    # third-place match has two players tied for 3rd, and both belong here.
+    lines = []
+    for participant in standings:
+        rank = participant["final_rank"]
+        if rank > 3:
+            break
+        who = participant.get("misc")
+        name = participant.get("name") or "Unknown"
+        lines.append(f"{('🥇', '🥈', '🥉')[rank - 1]} **{name}**"
+                     + (f" · <@{who}>" if who else ""))
+
+    details = (f"-# {CHALLONGE_FORMATS.get(record.get('Format'), '')} · "
+               f"Bo{record['BestOf']} · {field_size} players · "
+               f"<t:{now_epoch()}:D>")
+    try:
+        # Nobody is pinged: it's a record, and the announcement already went out.
+        await channel.send(view=simple_card(
+            "\n".join(lines) + f"\n{details}\n🔗 {record['Challonge']['Url']}",
+            heading=f"🏆 {record['Name']}",
+            colour=WINNER_ROLE_COLOR,
+        ), allowed_mentions=SILENT)
+    except discord.HTTPException as error:
+        print(f"tournament {record['Id']}: couldn't post to the results "
+              f"log: {error}")
 
 # --- !tournament cleanup ---------------------------------------------------
 
 async def tournament_cleanup(ctx, tokens):
-    """Delete a finished tournament's category, channels and roles."""
+    """Delete a tournament's category, channels and roles.
+
+    A finished tournament keeps its champion role: winners keep it for good.
+    """
     positional, _ = split_flags(tokens)
     wanted = positional[0] if positional else None
 
@@ -10857,8 +10924,12 @@ async def tournament_cleanup(ctx, tokens):
         return
 
     async with ctx.typing():
-        removed, failed = await delete_tournament_space(record)
-        record["Discord"] = {}
+        # Only a finished tournament has a champion to keep. A cancelled one
+        # (left up with --keep) or a draft loses the role with everything else.
+        finished = record["Phase"] == "done"
+        removed, failed = await delete_tournament_space(
+            record, keep_champion=finished)
+        record["Discord"] = space_after_teardown(record) if finished else {}
         await save_tournament(record)
 
     lines = []
@@ -10866,6 +10937,8 @@ async def tournament_cleanup(ctx, tokens):
         lines.append("🗑️ Removed " + ", ".join(removed))
     if failed:
         lines.append("⚠️ Couldn't remove " + ", ".join(failed))
+    if record["Discord"].get("WinnerRoleId"):
+        lines.append("-# The champion role stays.")
     await ctx.send(view=simple_card(
         "\n".join(lines) or "There was nothing left to remove.",
         heading=f"🧹 {record['Name']}",
