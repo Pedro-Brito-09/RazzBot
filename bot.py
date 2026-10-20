@@ -10954,45 +10954,68 @@ async def crown_champion(record):
         heading=f"🏆 {saved['Name']} — we have a winner",
         colour=WINNER_ROLE_COLOR,
     ), ping=True)
-    await log_tournament_result(saved, standings, len(participants))
+    try:
+        await log_tournament_result(saved, standings, len(participants))
+    except Exception:
+        # The log is a record; it must never take the crowning down with it.
+        print(f"tournament {record['Id']}: results log failed:")
+        traceback.print_exc()
+
+# How far down the final standings the results log goes
+TOURNAMENT_LOG_PLACES = 10
+
+async def log_channel():
+    """The results log channel, or None. Fetched when it isn't cached, since
+    get_channel only knows channels the bot has seen since it started."""
+    try:
+        channel_id = int(TOURNAMENT_LOG_CHANNEL_ID)
+    except (TypeError, ValueError):
+        return None
+    channel = bot.get_channel(channel_id)
+    if channel is not None:
+        return channel
+    try:
+        return await bot.fetch_channel(channel_id)
+    except discord.HTTPException as error:
+        print(f"Results log channel {channel_id} unreachable: {error}")
+        return None
 
 async def log_tournament_result(record, standings, field_size):
-    """Post the top 3 to the results log, for good.
+    """Post the top 10 to the results log, for good.
 
     Only finished tournaments get here: crown_champion runs once Challonge
     has finalized the bracket, never for a cancelled one. A !dev_ tournament
-    isn't logged, so testing never shows up in the real record.
+    is logged too, marked as a test.
     """
-    if str(record.get("Universe") or UNIVERSE_ID) != str(UNIVERSE_ID):
-        return
-    try:
-        channel = bot.get_channel(int(TOURNAMENT_LOG_CHANNEL_ID))
-    except (TypeError, ValueError):
-        channel = None
+    channel = await log_channel()
     if channel is None:
         print(f"tournament {record['Id']}: not logged -- "
               f"TOURNAMENT_LOG_CHANNEL_ID is unset or unreachable")
         return
 
-    # Ranks rather than positions in the list: a bracket without a
-    # third-place match has two players tied for 3rd, and both belong here.
+    # By rank rather than position in the list: players knocked out in the
+    # same round share a rank (two 3rds without a third-place match, four
+    # 5ths in single elimination), and a shared place is listed whole.
     lines = []
     for participant in standings:
         rank = participant["final_rank"]
-        if rank > 3:
+        if rank > TOURNAMENT_LOG_PLACES:
             break
+        place = ("🥇", "🥈", "🥉")[rank - 1] if rank <= 3 else f"`#{rank}`"
         who = participant.get("misc")
         name = participant.get("name") or "Unknown"
-        lines.append(f"{('🥇', '🥈', '🥉')[rank - 1]} **{name}**"
-                     + (f" · <@{who}>" if who else ""))
+        lines.append(f"{place} **{name}**" + (f" · <@{who}>" if who else ""))
 
-    details = (f"-# {CHALLONGE_FORMATS.get(record.get('Format'), '')} · "
+    test = str(record.get("Universe") or UNIVERSE_ID) != str(UNIVERSE_ID)
+    details = (("-# 🧪 Test tournament (dev universe)\n" if test else "")
+               + f"-# {CHALLONGE_FORMATS.get(record.get('Format'), '')} · "
                f"Bo{record['BestOf']} · {field_size} players · "
                f"<t:{now_epoch()}:D>")
+    url = (record.get("Challonge") or {}).get("Url")
     try:
         # Nobody is pinged: it's a record, and the announcement already went out.
         await channel.send(view=simple_card(
-            "\n".join(lines) + f"\n{details}\n🔗 {record['Challonge']['Url']}",
+            "\n".join(lines) + f"\n{details}" + (f"\n🔗 {url}" if url else ""),
             heading=f"🏆 {record['Name']}",
             colour=WINNER_ROLE_COLOR,
         ), allowed_mentions=SILENT)
