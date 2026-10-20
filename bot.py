@@ -11,6 +11,7 @@ import asyncio
 import io
 import socket
 import contextvars
+import copy
 import functools
 import re
 import secrets
@@ -1056,9 +1057,13 @@ async def fetch_entry_resource(entry_key, datastore, *, universe_id=None,
 
 async def update_entry_resource(
     entry_key, datastore, value, *, etag=None, allow_missing=False,
-    universe_id=None, api_key=None
+    universe_id=None, api_key=None, out=None
 ):
-    """Update an existing entry without silently replacing a newer version."""
+    """Update an existing entry without silently replacing a newer version.
+
+    Pass a dict as `out` to get the written entry back in out["resource"]
+    (it carries the new ETag); left as None when the reply had no body.
+    """
     url = data_store_entry_url(entry_key, datastore, universe_id)
     if allow_missing:
         url += "?allowMissing=true"
@@ -1075,6 +1080,11 @@ async def update_entry_resource(
     try:
         async with session.patch(url, headers=headers, json=payload) as resp:
             if resp.status in (200, 201):
+                if out is not None:
+                    try:
+                        out["resource"] = await resp.json(content_type=None)
+                    except (ValueError, aiohttp.ClientError):
+                        out["resource"] = None
                 return "ok"
             if resp.status in (409, 412):
                 return "conflict"
@@ -8529,17 +8539,81 @@ def decode_tournament_value(stored):
             return None
     return stored
 
+# Tournament entries in memory. The bot is the only writer of tournament
+# records and the index -- the game only writes Result_ keys, which are always
+# read fresh -- so each entry is kept with its ETag:
+#   * a read within TOURNAMENT_CACHE_SECONDS is answered from memory;
+#   * a write skips the read and PATCHes with the remembered ETag. If anything
+#     else wrote the entry meanwhile, the ETag no longer matches, the write is
+#     refused, and the entry is re-read and the change reapplied.
+# Writes to one entry are serialized by a lock, so matches acting at the same
+# moment queue for a few hundred milliseconds instead of colliding on the ETag
+# and backing off for seconds.
+TOURNAMENT_CACHE_SECONDS = 30
+_tournament_cache = {}
+_tournament_locks = {}
+
+def tournament_slot(key):
+    """Entries are per universe: a !dev_ tournament never shares a slot."""
+    return (str(current_universe()), key)
+
+def tournament_lock(key):
+    slot = tournament_slot(key)
+    lock = _tournament_locks.get(slot)
+    if lock is None:
+        lock = _tournament_locks[slot] = asyncio.Lock()
+    return lock
+
+def remember_tournament_entry(key, value, etag):
+    _tournament_cache[tournament_slot(key)] = {
+        "value": copy.deepcopy(value), "etag": etag, "at": time.monotonic(),
+    }
+
+def forget_tournament_entry(key):
+    _tournament_cache.pop(tournament_slot(key), None)
+
+async def fetch_tournament_entry(key):
+    """(status, value, etag) straight from the store, remembered on success."""
+    status, resource = await fetch_entry_resource(key, TOURNAMENTS_DATASTORE)
+    if status == "missing":
+        forget_tournament_entry(key)
+        return "missing", None, None
+    if status != "ok":
+        return status, None, None
+    raw = resource.get("value")
+    value = decode_tournament_value(decode_entry_value(raw)) if raw else None
+    remember_tournament_entry(key, value, resource.get("etag"))
+    return "ok", value, resource.get("etag")
+
+async def read_tournament_entry(key):
+    """The entry's value (a copy the caller may change), or None."""
+    cached = _tournament_cache.get(tournament_slot(key))
+    if (cached is not None
+            and time.monotonic() - cached["at"] < TOURNAMENT_CACHE_SECONDS):
+        return copy.deepcopy(cached["value"])
+    _status, value, _etag = await fetch_tournament_entry(key)
+    return copy.deepcopy(value)
+
 async def update_tournament_entry(key, transform, *, attempts=4):
     """Read-modify-write one entry in the tournament store.
 
     Same contract as update_entry_with_retry -- ok / skipped / conflict /
     error, with the ETag guarding the write -- but it creates the entry, and
-    the store, when they aren't there yet.
+    the store, when they aren't there yet. The read comes from memory when
+    the entry is remembered (see above).
     """
+    async with tournament_lock(key):
+        return await _update_tournament_entry(key, transform, attempts)
+
+async def _update_tournament_entry(key, transform, attempts):
     bootstrapped = False
     for attempt in range(1, attempts + 1):
-        status, resource = await fetch_entry_resource(key,
-                                                      TOURNAMENTS_DATASTORE)
+        cached = _tournament_cache.get(tournament_slot(key))
+        if cached is not None and cached["etag"]:
+            status, current, etag = ("ok", copy.deepcopy(cached["value"]),
+                                     cached["etag"])
+        else:
+            status, current, etag = await fetch_tournament_entry(key)
         if status not in ("ok", "missing"):
             return status, None
 
@@ -8566,19 +8640,25 @@ async def update_tournament_entry(key, transform, *, attempts=4):
                     encode_tournament_value(new_value),
                 )
         else:
-            new_value = transform(decode_tournament_value(
-                decode_entry_value(resource.get("value"))
-            ))
+            new_value = transform(current)
             if new_value is None:
                 return "skipped", None
+            written = {}
             result = await update_entry_resource(
                 key, TOURNAMENTS_DATASTORE,
                 encode_tournament_value(new_value),
-                etag=resource.get("etag"),
+                etag=etag, out=written,
             )
 
         if result == "ok":
+            # A create, or a reply without a body, leaves no ETag: reads still
+            # come from memory, and the next write fetches one first.
+            new_etag = (written.get("resource") or {}).get("etag") \
+                if status == "ok" else None
+            remember_tournament_entry(key, new_value, new_etag)
             return "ok", new_value
+        # Whatever is in memory can't be trusted after a refused write.
+        forget_tournament_entry(key)
         if result != "conflict":
             return result, None
 
@@ -8588,10 +8668,21 @@ async def update_tournament_entry(key, transform, *, attempts=4):
     return "conflict", None
 
 async def read_tournament_index():
-    stored = decode_tournament_value(await fetch_entry(
-        TOURNAMENT_INDEX_KEY, datastore=TOURNAMENTS_DATASTORE
-    ))
+    stored = await read_tournament_entry(TOURNAMENT_INDEX_KEY)
     return stored if isinstance(stored, list) else []
+
+async def update_tournament_index(record):
+    """Bring the record's index summary into step -- unless it already is.
+
+    The summary only changes with the name, phase or start time, so most
+    record writes leave the index alone and skip two requests.
+    """
+    if index_summary(record) in await read_tournament_index():
+        return "ok"
+    status, _index = await update_tournament_entry(
+        TOURNAMENT_INDEX_KEY, lambda stored: merge_index(stored, record),
+    )
+    return status
 
 def index_summary(record):
     """The slice of a tournament the scheduler needs before loading it."""
@@ -8630,9 +8721,7 @@ def normalize_tournament(record):
     return record
 
 async def read_tournament(tournament_id):
-    record = decode_tournament_value(await fetch_entry(
-        tournament_key(tournament_id), datastore=TOURNAMENTS_DATASTORE
-    ))
+    record = await read_tournament_entry(tournament_key(tournament_id))
     if not isinstance(record, dict):
         return None
     return normalize_tournament(record)
@@ -8650,10 +8739,7 @@ async def save_tournament(record):
     if status != "ok":
         return status
 
-    status, _index = await update_tournament_entry(
-        TOURNAMENT_INDEX_KEY, lambda stored: merge_index(stored, record),
-    )
-    return status
+    return await update_tournament_index(record)
 
 def save_failure_text(status):
     """Why a save failed, in terms the host can act on."""
@@ -8693,10 +8779,7 @@ async def update_tournament(tournament_id, transform):
         tournament_key(tournament_id), apply
     )
     if status == "ok" and outcome["record"] is not None:
-        await update_tournament_entry(
-            TOURNAMENT_INDEX_KEY,
-            lambda stored: merge_index(stored, outcome["record"]),
-        )
+        await update_tournament_index(outcome["record"])
     return status, outcome["record"]
 
 def tournament_universes():
@@ -11587,12 +11670,17 @@ GAME_RESULT_HOW = {
     "disconnect": "game-disconnect",
 }
 
-async def collect_game_result(record, match_id, match):
-    """Pick up a result the game wrote, if there is one yet."""
+async def fetch_game_result(match_id):
+    """The result the game wrote for a match, or None. Always read fresh:
+    the game writes it, so it's never in the tournament cache."""
     stored = await fetch_entry(RESULT_KEY.format(id=match_id),
                                datastore=TOURNAMENTS_DATASTORE)
     stored = decode_tournament_value(stored)
-    if not isinstance(stored, dict):
+    return stored if isinstance(stored, dict) else None
+
+async def collect_game_result(record, match_id, match, stored):
+    """Report a result the game wrote (from fetch_game_result), if any."""
+    if stored is None:
         return
 
     by_roblox = {str(player.get("RobloxId")): player["DiscordId"]
@@ -11693,6 +11781,13 @@ async def advance_matches(record):
         await refresh_bracket(record)
         record = await read_tournament(record["Id"]) or record
 
+    # Every playing match's result is read at once: one round trip for the
+    # whole tick, however many matches are being played.
+    playing = [match_id for match_id, match in record["Matches"].items()
+               if match.get("State") == "playing"]
+    results = dict(zip(playing, await asyncio.gather(
+        *(fetch_game_result(match_id) for match_id in playing))))
+
     now = now_epoch()
     for match_id, match in list(record["Matches"].items()):
         state = match.get("State")
@@ -11705,7 +11800,8 @@ async def advance_matches(record):
                                 secrets.choice(left)["Id"], ban_turn(match),
                                 auto=True)
         elif state == "playing":
-            await collect_game_result(record, match_id, match)
+            await collect_game_result(record, match_id, match,
+                                      results.get(match_id))
 
     sync_match_threads(await read_tournament(record["Id"]) or record)
 
