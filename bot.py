@@ -98,7 +98,14 @@ DEV_UNIVERSE_ID = int(os.getenv("DEV_UNIVERSE_ID") or 7117693401)
 # Ownership is checked one badge per request against inventory.roblox.com,
 # the only endpoint that answers without authentication.
 OWNED_BADGES_CACHE_TTL = 300
+# The game's own badge list changes only when a badge is added to it.
+UNIVERSE_BADGES_CACHE_TTL = 600
+# How long a found account link is trusted before the table is read again.
+LINKED_CACHE_TTL = 60
 BADGE_CONCURRENCY = 8
+# Members !sync all works on at once. Each fans out BADGE_CONCURRENCY badge
+# requests, and the shared session caps the total in flight anyway.
+SYNC_ALL_CONCURRENCY = 3
 BADGE_ICON_SIZE = "150x150"
 # Discord decides gallery layout from the item count. Nine images make a
 # balanced grid; a final group of six or fewer uses six slots instead so it
@@ -1867,7 +1874,25 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
         await member.remove_roles(*remove, reason="RazzBot role sync")
     return add, remove, blocked
 
+# The Linked table as last read, per universe: {discord id: roblox id}.
+_linked_cache = {}
+
 async def fetch_linked_user_id(account_id):
+    """The linked Roblox user ID, or None.
+
+    A recent copy of the table answers when it has the account. A miss
+    always reads fresh: the game writes links, not the bot, so nothing here
+    knows when one lands, and someone who just linked must not be told
+    they haven't.
+    """
+    cached = _linked_cache.get(current_universe())
+    if cached and time.monotonic() - cached[0] < LINKED_CACHE_TTL:
+        stored = cached[1].get(normalize_discord_id(account_id))
+        try:
+            if stored is not None:
+                return int(stored)
+        except (TypeError, ValueError):
+            pass
     _, user_id = await fetch_linked_account(account_id)
     return user_id
 
@@ -1930,11 +1955,16 @@ async def fetch_linked_account(account_id, *, attempts=1):
                     last_status = "error"
                 else:
                     last_status = "missing"
-                    for stored_account_id, stored_user_id in linked.items():
-                        if normalize_discord_id(stored_account_id) != expected_id:
-                            continue
+                    by_account = {
+                        normalize_discord_id(key): value
+                        for key, value in linked.items()
+                    }
+                    _linked_cache[current_universe()] = (
+                        time.monotonic(), by_account
+                    )
+                    if expected_id in by_account:
                         try:
-                            return "linked", int(stored_user_id)
+                            return "linked", int(by_account[expected_id])
                         except (TypeError, ValueError):
                             print(
                                 "AccountLinking/Linked contains an invalid Roblox "
@@ -1942,12 +1972,9 @@ async def fetch_linked_account(account_id, *, attempts=1):
                             )
                             return "error", None
 
-                    visible_keys = [
-                        normalize_discord_id(key) for key in linked.keys()
-                    ]
                     print(
-                        f"AccountLinking/Linked has no key for {expected_id}; "
-                        f"stored Discord IDs: {visible_keys}"
+                        f"AccountLinking/Linked has no key for {expected_id} "
+                        f"({len(by_account)} accounts linked)"
                     )
         elif fetch_status == "missing":
             last_status = "missing"
@@ -1961,23 +1988,36 @@ async def fetch_linked_account(account_id, *, attempts=1):
 
 _owned_badges_cache = {}
 
+_universe_badges_cache = {}
+
 async def fetch_universe_badges():
-    """Every badge the game defines. Public, no auth needed."""
+    """Every badge the game defines. Public, no auth needed.
+
+    Cached per universe, but only once every page came back: a list cut
+    short by a failed page would hide badges until the entry expired.
+    """
+    universe = current_universe()
+    cached = _universe_badges_cache.get(universe)
+    if cached and time.monotonic() - cached[0] < UNIVERSE_BADGES_CACHE_TTL:
+        return list(cached[1])
+
     badges, cursor = [], None
     while True:
-        url = (f"https://badges.roblox.com/v1/universes/{current_universe()}/badges"
+        url = (f"https://badges.roblox.com/v1/universes/{universe}/badges"
                f"?limit=100&sortOrder=Asc")
         if cursor:
             url += f"&cursor={quote(cursor)}"
         data = await request_json(url, label="fetch_universe_badges")
         if not data:
-            break
+            return badges
         badges.extend(data.get("data") or [])
         cursor = data.get("nextPageCursor")
         if not cursor:
             break
 
-    return badges
+    if badges:
+        _universe_badges_cache[universe] = (time.monotonic(), badges)
+    return list(badges)
 
 async def _badge_is_owned(user_id, badge_id, semaphore):
     async with semaphore:
@@ -1991,7 +2031,9 @@ async def fetch_owned_badge_ids(user_id, badge_ids):
     """Which of badge_ids the player owns. One request per badge, so the
     result is cached briefly per player."""
     now = time.monotonic()
-    cache_key = (current_universe(), user_id)
+    # Keyed by the badges asked about too: /sync asks only for the rule
+    # badges, and that answer must not stand in for the full badge card.
+    cache_key = (current_universe(), user_id, frozenset(badge_ids))
     cached = _owned_badges_cache.get(cache_key)
     if cached and now - cached[0] < OWNED_BADGES_CACHE_TTL:
         return cached[1]
@@ -5132,22 +5174,31 @@ async def sync_command(ctx, *, target: str = None):
         linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
         linked = linked if isinstance(linked, dict) else {}
 
-        synced = changed = skipped = 0
-        for account_id, roblox_id in linked.items():
+        # A few members at a time: each one is a burst of badge requests
+        # and role edits, so going wider would trip Roblox and Discord
+        # rate limits.
+        semaphore = asyncio.Semaphore(SYNC_ALL_CONCURRENCY)
+
+        async def sync_one(account_id, roblox_id):
             member = ctx.guild.get_member(int(account_id))
             if member is None:
-                skipped += 1
-                continue
-            try:
-                added, removed, _ = await sync_member_roles(
-                    member, int(roblox_id), rules, map_cache=map_cache
-                )
-            except discord.HTTPException:
-                skipped += 1
-                continue
-            synced += 1
-            if added or removed:
-                changed += 1
+                return "skipped"
+            async with semaphore:
+                try:
+                    added, removed, _ = await sync_member_roles(
+                        member, int(roblox_id), rules, map_cache=map_cache
+                    )
+                except discord.HTTPException:
+                    return "skipped"
+            return "changed" if added or removed else "synced"
+
+        outcomes = await asyncio.gather(*(
+            sync_one(account_id, roblox_id)
+            for account_id, roblox_id in linked.items()
+        ))
+        skipped = outcomes.count("skipped")
+        changed = outcomes.count("changed")
+        synced = len(outcomes) - skipped
 
         await ctx.send(view=simple_card(
             f"**{synced}** member(s) synced  ·  **{changed}** changed"
@@ -5267,15 +5318,17 @@ async def admin_restart(ctx):
 def _clear_owned_badges_cache(universe):
     for key in [k for k in _owned_badges_cache if k[0] == universe]:
         del _owned_badges_cache[key]
+    _universe_badges_cache.pop(universe, None)
 
 # Every in-memory cache !clearcache can drop, all scoped to one universe.
 CACHE_CLEARERS = {
     "maps": lambda universe: _maps_cache.pop(universe, None),
     "badges": _clear_owned_badges_cache,
     "catalog": lambda universe: _reward_catalog_cache.pop(universe, None),
+    "linked": lambda universe: _linked_cache.pop(universe, None),
 }
 
-@bot.command(name="clearcache", hidden=True, usage="[maps|badges|catalog]")
+@bot.command(name="clearcache", hidden=True, usage="[maps|badges|catalog|linked]")
 @is_admin()
 async def admin_clearcache(ctx, which: str = None):
     """Drop cached data so the next command fetches it fresh."""
@@ -5833,9 +5886,7 @@ async def resolve_reward_badge(value):
 async def player_owns_badge(user_id, badge_id):
     """Whether the player has one badge, asked directly.
 
-    Deliberately not fetch_owned_badge_ids: that cache is keyed by the player
-    alone, so seeding it from a single badge would leave the badge card
-    reporting every other badge unowned until the entry expires.
+    Deliberately uncached, so a badge earned moments ago counts.
     """
     _, owned = await _badge_is_owned(user_id, badge_id, asyncio.Semaphore(1))
     return owned
@@ -10121,8 +10172,11 @@ async def recent_placements():
 
     depth = len(SEED_HISTORY_WEIGHTS)
     history = {}
-    for entry in finished[:SEED_HISTORY_SCAN]:
-        record = await read_tournament(entry["Id"])
+    # Read together, but gather keeps them newest first.
+    records = await asyncio.gather(*(
+        read_tournament(entry["Id"]) for entry in finished[:SEED_HISTORY_SCAN]
+    ))
+    for record in records:
         if record is None:
             continue
         field_size = record.get("FieldSize") or len(record["Standings"])
