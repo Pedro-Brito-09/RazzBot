@@ -251,6 +251,9 @@ DAILY_CUP_ROLE_ID = os.getenv("DAILY_CUP_ROLE_ID")
 TOURNAMENT_CHANNEL_ID = os.getenv("TOURNAMENT_CHANNEL_ID")
 # Pinged when registration opens and again when check-in starts.
 TOURNAMENT_ROLE_ID = os.getenv("TOURNAMENT_ROLE_ID")
+# Each tournament's champion role sits directly above this role in the list.
+CHAMPION_ROLE_ANCHOR_ID = (os.getenv("CHAMPION_ROLE_ANCHOR_ID")
+                           or "1537170680146165840")
 # A permanent record of every tournament that finishes: its top 3. Lives
 # outside the tournament's category, so !tournament cleanup never takes it.
 TOURNAMENT_LOG_CHANNEL_ID = (os.getenv("TOURNAMENT_LOG_CHANNEL_ID")
@@ -10413,6 +10416,55 @@ def tournament_guild(record):
     except (TypeError, ValueError):
         return None
 
+async def place_tournament_roles(guild, player_role, winner_role):
+    """The player role last in the list, the champion directly above the anchor.
+
+    Returns a list of problems. Positions are read fresh from Discord rather
+    than the cache: two roles were just created, which shifts the ones below
+    them, and the cache may not have caught up yet.
+    """
+    try:
+        fetched = await guild.fetch_roles()
+    except discord.HTTPException as error:
+        return [f"Couldn't order the roles — {error}."]
+
+    # Bottom to top, @everyone left out: it is always position 0.
+    order = sorted((role for role in fetched if not role.is_default()),
+                   key=lambda role: (role.position, role.id))
+    order = [role for role in order
+             if role.id not in (player_role.id, winner_role.id)]
+    order.insert(0, player_role)
+
+    problems = []
+    anchor_index = next((index for index, role in enumerate(order)
+                         if str(role.id) == str(CHAMPION_ROLE_ANCHOR_ID)), None)
+    me = guild.me
+    if anchor_index is None:
+        problems.append("Couldn't find the role the champion role goes above, "
+                        "so it was left at the bottom.")
+        order.insert(1, winner_role)
+    elif me is None or order[anchor_index] >= me.top_role:
+        problems.append("The champion role goes above a role that's higher "
+                        "than mine, so I left it at the bottom — move my role "
+                        "up, or move it by hand.")
+        order.insert(1, winner_role)
+    else:
+        order.insert(anchor_index + 1, winner_role)
+
+    # Only the roles that actually move. Everything above the champion's new
+    # spot keeps its position, so roles above mine are never touched.
+    current = {role.id: role.position for role in fetched}
+    positions = {role: index for index, role in enumerate(order, start=1)
+                 if current.get(role.id) != index}
+    if not positions:
+        return problems
+    try:
+        await guild.edit_role_positions(positions=positions,
+                                        reason="Tournament role order")
+    except discord.HTTPException as error:
+        problems.append(f"Couldn't order the roles — {error}.")
+    return problems
+
 async def create_tournament_space(guild, record, *, private=False):
     """Build the category, its three channels and the two roles.
 
@@ -10432,21 +10484,24 @@ async def create_tournament_space(guild, record, *, private=False):
 
     if me.guild_permissions.manage_roles:
         try:
+            # Neither role has a colour: they mark who is in or who won, and
+            # shouldn't repaint anyone's name.
             player_role = await guild.create_role(
-                name=f"{short} Player", colour=TOURNAMENT_COLOR,
-                mentionable=True,
+                name=f"{short} Player", mentionable=True,
                 reason=f"Tournament {record['Id']}: registered players",
             )
             space["PlayerRoleId"] = str(player_role.id)
 
             winner_role = await guild.create_role(
-                name=f"{short} Champion", colour=WINNER_ROLE_COLOR,
-                hoist=True, mentionable=True,
+                name=f"{short} Champion", hoist=True, mentionable=True,
                 reason=f"Tournament {record['Id']}: winner",
             )
             space["WinnerRoleId"] = str(winner_role.id)
         except discord.HTTPException as error:
             problems.append(f"Couldn't create the roles — {error}.")
+        else:
+            problems += await place_tournament_roles(guild, player_role,
+                                                     winner_role)
     else:
         problems.append("I need **Manage Roles** to create the player and "
                         "champion roles.")
