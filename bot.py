@@ -492,7 +492,9 @@ def buffer_encoding_field(value):
 def is_buffer_value(value):
     return buffer_encoding_field(value) is not None
 
-async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
+async def fetch_entry(entry_key, datastore="Daily Cup Submissions", *, raw=False):
+    """The entry's decoded value, or None. raw=True skips the decode, for a
+    caller that would rather run it off the event loop."""
     # Datastore names contain spaces ("Daily Cup Submissions"), so encode
     # both segments rather than relying on the client to fix up the URL.
     url = (
@@ -508,7 +510,7 @@ async def fetch_entry(entry_key, datastore="Daily Cup Submissions"):
     value = data.get("value")
     if not value:
         return None
-    return decode_entry_value(value)
+    return value if raw else decode_entry_value(value)
 
 def user_restriction_url(user_id):
     return (
@@ -2295,6 +2297,13 @@ async def fetch_user_id(username):
     # Roblox matches case-insensitively; take the name it considers canonical.
     return users[0].get("id"), users[0].get("name")
 
+def normalize_user_id(value):
+    """A Roblox user ID as an int, or None. Boards store it either way."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 async def fetch_usernames(user_ids):
     """Resolve many user IDs to names in one request per 100."""
     unique = [uid for uid in dict.fromkeys(user_ids) if uid is not None]
@@ -2392,15 +2401,20 @@ async def collect_leaderboard_rows(
     """Resolve a leaderboard into plain row dicts, ready for either renderer."""
     rows = []
     total = len(leaderboard)
-    for pos in range(min(len(leaderboard), limit)):
-        entry = leaderboard[pos]
+    shown = leaderboard[:limit]
+    # Every missing name in one batched request rather than one per row.
+    names = await fetch_usernames([
+        normalize_user_id(entry.get("UserId")) for entry in shown
+        if isinstance(entry, dict) and not entry.get("Name")
+    ])
+    for pos, entry in enumerate(shown):
         if not isinstance(entry, dict):
             continue
 
         user_id = entry.get("UserId")
         name = entry.get("Name")
         if not name and user_id is not None:
-            name = await fetch_username(user_id)
+            name = names.get(normalize_user_id(user_id))
         if not name:
             # A failed username lookup shouldn't drop the whole row.
             name = f"User {user_id}" if user_id is not None else "Unknown"
@@ -2511,6 +2525,21 @@ def render_leaderboard_list(
 
 # Keyed by universe: a !dev_ command must never poison the live cache.
 _maps_cache = {}
+# One refresh at a time per universe, so commands arriving together on an
+# expired cache share a single download instead of each starting their own.
+_maps_locks = {}
+
+def index_community_maps(raw):
+    """Decode the Ids entry and index it by Id. Runs in a worker thread:
+    decompressing and parsing ~85k records would otherwise stall the bot."""
+    entries = decode_entry_value(raw)
+    if not isinstance(entries, list):
+        return None
+    by_id = {}
+    for e in entries:
+        if isinstance(e, dict) and e.get("Id") is not None:
+            by_id[e["Id"]] = {k: e.get(k) for k in MAP_FIELDS}
+    return by_id
 
 async def get_community_maps():
     """Community maps indexed by Id, cached for MAPS_CACHE_TTL seconds.
@@ -2519,24 +2548,27 @@ async def get_community_maps():
     upstream doesn't take the command down.
     """
     universe = current_universe()
-    now = time.monotonic()
     entry = _maps_cache.get(universe)
     cached = entry["by_id"] if entry else None
-    if cached and now - entry["at"] < MAPS_CACHE_TTL:
+    if cached and time.monotonic() - entry["at"] < MAPS_CACHE_TTL:
         return cached
 
-    entries = await fetch_entry("Ids", datastore="Community Maps")
-    if not entries:
-        return cached
+    async with _maps_locks.setdefault(universe, asyncio.Lock()):
+        # Whoever held the lock may have just refreshed it.
+        now = time.monotonic()
+        entry = _maps_cache.get(universe)
+        cached = entry["by_id"] if entry else None
+        if cached and now - entry["at"] < MAPS_CACHE_TTL:
+            return cached
 
-    by_id = {}
-    for e in entries:
-        if isinstance(e, dict) and e.get("Id") is not None:
-            by_id[e["Id"]] = {k: e.get(k) for k in MAP_FIELDS}
+        raw = await fetch_entry("Ids", datastore="Community Maps", raw=True)
+        by_id = await asyncio.to_thread(index_community_maps, raw) if raw else None
+        if not by_id:
+            return cached
 
-    _maps_cache[universe] = {"by_id": by_id, "at": now}
-    print(f"community maps indexed: {len(by_id)} entries (universe {universe})")
-    return by_id
+        _maps_cache[universe] = {"by_id": by_id, "at": now}
+        print(f"community maps indexed: {len(by_id)} entries (universe {universe})")
+        return by_id
 
 def badge_display_name(badge):
     return badge.get("displayName") or badge.get("name") or "Unnamed"
