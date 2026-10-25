@@ -10273,11 +10273,36 @@ async def challonge_push_field(record, players):
     v2.1 registers participants one at a time, so a partial failure is
     possible; the caller is told which name broke rather than being left to
     guess from a half-filled bracket.
+
+    A failed push is retried on the next tick, so this resumes: anyone the
+    last attempt already registered is skipped (re-adding them is rejected
+    as "has already been taken"), and a bracket the host started by hand
+    isn't started again.
     """
     challonge_id = record["Challonge"]["Id"]
-    by_discord = {}
+
+    ok, existing = await challonge_participants(record)
+    if not ok:
+        return False, f"{existing} (while reading who's already in)"
+    by_discord = {
+        str(participant["misc"]): str(participant["id"])
+        for participant in existing
+        if participant.get("misc") and participant.get("id")
+    }
+
+    if existing:
+        ok, data = await challonge_request(
+            f"application/tournaments/{challonge_id}"
+        )
+        if not ok:
+            return False, f"{data} (while checking the bracket's state)"
+        state = challonge_attributes((data or {}).get("data")).get("state")
+        if state and state != "pending":
+            return True, by_discord
 
     for position, player in enumerate(players, 1):
+        if player["DiscordId"] in by_discord:
+            continue
         payload = {"data": {
             "type": "participant",
             "attributes": {
@@ -10323,7 +10348,8 @@ async def challonge_participants(record):
     for resource in (data or {}).get("data") or []:
         attributes = challonge_attributes(resource)
         if attributes:
-            participants.append(attributes)
+            # The id lives on the resource, not in its attributes.
+            participants.append({**attributes, "id": resource.get("id")})
     return True, participants
 
 async def start_bracket(record):
