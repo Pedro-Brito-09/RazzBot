@@ -9126,10 +9126,12 @@ async def challonge_create_tournament(record):
             "description": (f"Best of {record['BestOf']}. Matches start "
                             f"{starts:%d/%m/%Y %H:%M} UTC."),
             "private": False,
-            # Single elimination's two semifinal losers play for third.
-            "match_options": {"third_place_match": True},
         },
     }}
+    if record["Format"] == "single":
+        # Single elimination's two semifinal losers play for third.
+        payload["data"]["attributes"]["match_options"] = {
+            "third_place_match": True}
     ok, data = await challonge_request(
         "application/tournaments", method="POST", payload=payload
     )
@@ -9706,6 +9708,8 @@ async def admin_tournament(ctx, action: str = None, *arguments: str):
 # ping rather than from the bot.
 
 TOURNAMENT_TICK_SECONDS = 60
+# How long a failed bracket push waits before it's tried again
+START_RETRY_SECONDS = 600
 # Reminders, as (Fired key, seconds before the deadline they belong to).
 REGISTRATION_REMINDERS = ((24 * 3600, "reg:24h"), (3600, "reg:1h"))
 CHECKIN_REMINDERS = ((900, "checkin:15m"),)
@@ -10307,7 +10311,8 @@ async def challonge_push_field(record, players):
 
     # Brackets made before the third-place match was turned on get it here,
     # while the bracket can still change shape. A refusal only costs that.
-    if record["Format"] == "single":
+    # Only on the first try: a resumed push already sent it.
+    if record["Format"] == "single" and not existing:
         ok, data = await challonge_update_tournament(
             record, {"match_options": {"third_place_match": True}}
         )
@@ -10404,19 +10409,30 @@ async def start_bracket(record):
               f"({score['Played']} played) wins={score['Wins']}")
     ok, result = await challonge_push_field(record, seeded)
     if not ok:
-        # Everything is still recoverable by hand from here: the field is
-        # saved, the bracket exists, and the host can start it on Challonge.
-        await tell_host(
-            record,
-            f"❌ Couldn't start **{record['Name']}** on Challonge — {result}\n"
-            f"-# {len(seeded)} players checked in. The bracket is at "
-            f"{record['Challonge']['Url']} — start it there and the bot will "
-            f"pick the matches up.",
-        )
+        # Retried every START_RETRY_SECONDS, picking up where this stopped;
+        # the host hears each new reason once, not every retry.
+        previous = (record.get("StartError") or {}).get("Text")
+
+        def note_failure(stored):
+            stored["StartError"] = {"At": now_epoch(), "Text": result}
+            return stored
+
+        await update_tournament(record["Id"], note_failure)
+        if result != previous:
+            await tell_host(
+                record,
+                f"❌ Couldn't start **{record['Name']}** on Challonge — "
+                f"{result}\n"
+                f"-# {len(seeded)} players checked in. The bot tries again "
+                f"every {START_RETRY_SECONDS // 60} minutes, carrying on from "
+                f"where it stopped. The bracket is at "
+                f"{record['Challonge']['Url']}.",
+            )
         return
 
     def transform(stored):
         stored["Phase"] = "live"
+        stored.pop("StartError", None)
         stored["Seeded"] = [
             {"DiscordId": player["DiscordId"], "Name": player["Name"],
              **player["SeedScore"]}
@@ -10537,7 +10553,11 @@ async def advance_tournament(record):
     elif phase == "checkin":
         deadline = record["MatchesStart"]
         if now >= deadline:
-            await start_bracket(record)
+            # A push that failed is retried, but not every tick: each try
+            # spends Challonge requests from a 500-a-month allowance.
+            failed = record.get("StartError") or {}
+            if now - (failed.get("At") or 0) >= START_RETRY_SECONDS:
+                await start_bracket(record)
             return
         fired = await fire_reminders(
             record, deadline, CHECKIN_REMINDERS, checkin_reminder,
@@ -11305,8 +11325,18 @@ def ban_turn(match):
 def match_label(record, match):
     return (f"{match.get('Code') or '?'} · "
             + ("🥉 3rd place · " if match.get("ThirdPlace") else "")
+            # Challonge numbers the losers bracket's rounds below zero.
+            + ("🔻 Losers · " if isinstance(match.get("Round"), int)
+               and match["Round"] < 0 else "")
             + f"{player_name(record, match['High'])}"
             f" vs {player_name(record, match['Low'])}")
+
+def losses(record, discord_id):
+    """Finished matches this player lost -- two is out in double elimination."""
+    return sum(1 for match in record["Matches"].values()
+               if match.get("State") == "done" and match.get("Winner")
+               and match["Winner"] != discord_id
+               and discord_id in (match["High"], match["Low"]))
 
 def has_lost(record, discord_id):
     return any(match.get("State") == "done" and match.get("Winner")
@@ -11636,6 +11666,16 @@ async def open_match(record, found):
     if not all(players):
         print(f"tournament {record['Id']}: match {found['Id']} has a "
               f"participant the bot doesn't know ({found['Participants']})")
+        # Someone added on Challonge's site carries no Discord ID, so their
+        # match can't open here. Only asked about when the bracket is read,
+        # which is rare, so this doesn't repeat every tick.
+        await tell_host(
+            record,
+            f"Match {found.get('Code') or found['Id']} is ready on Challonge, "
+            f"but has a player the bot doesn't know — probably added on "
+            f"Challonge's site. It won't open here.\n"
+            f"-# Decide it on Challonge, then run `!tournament sync`.",
+        )
         return
 
     first, second = (player["DiscordId"] for player in players)
@@ -11948,6 +11988,9 @@ async def collect_game_result(record, match_id, match, stored):
         if status == "ok" and saved is not None:
             mine = scores.get(winner, 0)
             theirs = max([v for k, v in scores.items() if k != winner] or [0])
+            # A no-show or disconnect can come with no score; the result
+            # command needs a winner on top.
+            mine = max(mine, theirs + 1)
             high_first = (f"{mine}-{theirs}" if winner == match["High"]
                           else f"{theirs}-{mine}")
             await tell_host(
@@ -12379,13 +12422,17 @@ async def reopen_match(record, match_id, match):
         return False, (f"{match_label(record, match)} was played in game, so "
                        f"it can't be reopened.")
     # Challonge resets the next round along with it; a result there can't
-    # be pulled back without the host redoing it by hand.
+    # be pulled back without the host redoing it by hand. Both players move
+    # on from a match: the winner up, and in double elimination the loser
+    # into the losers bracket.
+    pair = {match["High"], match["Low"]}
     later = [other for other in record["Matches"].values()
              if other is not match and other.get("State") == "done"
              and (other.get("FinishedAt") or 0) >= (match.get("FinishedAt") or 0)
-             and match.get("Winner") in (other["High"], other["Low"])]
+             and pair & {other["High"], other["Low"]}]
     if later:
-        return False, (f"**{player_name(record, match['Winner'])}** has "
+        who = (pair & {later[0]["High"], later[0]["Low"]}).pop()
+        return False, (f"**{player_name(record, who)}** has "
                        f"already finished {match_label(record, later[0])}. "
                        f"Undo that one first.")
 
@@ -12394,18 +12441,19 @@ async def reopen_match(record, match_id, match):
         return False, f"Couldn't read the bracket — {found}"
     upstream = {entry["Id"]: entry for entry in found}
 
-    # The API's reopen leaves the winner in the match they advanced to, so
-    # they'd play on while this one is replayed. Challonge's own Reopen
-    # button resets that match; with it reset this check passes.
-    winner = player_by_discord(record, match.get("Winner") or "")
-    winner_pid = str((winner or {}).get("ChallongeId") or "")
+    # The API's reopen leaves the players in the matches they moved on to,
+    # so they'd play on while this one is replayed. Challonge's own Reopen
+    # button resets those; with them reset this check passes.
+    moved = {str(player.get("ChallongeId")): player
+             for player in record["Players"]
+             if player["DiscordId"] in pair and player.get("ChallongeId")}
     placed = [entry for entry in found
-              if entry["Id"] != match_id and winner_pid
-              and winner_pid in entry["Entrants"]
-              and entry["State"] != "complete"]
+              if entry["Id"] != match_id and entry["State"] != "complete"
+              and moved.keys() & set(entry["Entrants"])]
     if placed:
+        mover = moved[(moved.keys() & set(placed[0]["Entrants"])).pop()]
         return False, (
-            f"**{winner['Name']}** is already in match "
+            f"**{mover['Name']}** is already in match "
             f"{placed[0].get('Code') or placed[0]['Id']}, and Challonge's API "
             f"won't take them back out.\n"
             f"-# Reopen {match.get('Code') or match_id} on "
@@ -12429,10 +12477,11 @@ async def reopen_match(record, match_id, match):
             return False, f"Reopened on Challonge, but couldn't re-read it — {found}"
         upstream = {entry["Id"]: entry for entry in found}
 
-    # Any match the winner had moved on to is no longer ready on Challonge.
+    # Any match either player had moved on to is no longer ready on
+    # Challonge.
     stale = [other_id for other_id, other in record["Matches"].items()
              if other_id != match_id and other.get("State") != "done"
-             and match.get("Winner") in (other["High"], other["Low"])
+             and pair & {other["High"], other["Low"]}
              and (upstream.get(other_id) or {}).get("State") != "open"]
 
     def transform(stored):
@@ -12551,7 +12600,8 @@ async def match_command(ctx):
             await reply("You're playing for **third place** — you'll be "
                         "pinged in its thread once the other semifinal is "
                         "done.")
-        elif lost and record["Format"] == "single":
+        elif lost and (record["Format"] == "single"
+                       or losses(record, who) >= 2):
             await reply("You're out of this one. 🫡")
         else:
             await reply("No match right now — you're waiting on your next "
