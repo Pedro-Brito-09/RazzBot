@@ -11325,6 +11325,22 @@ def match_participants(resource):
             ids.append(str(data["id"]))
     return ids if len(ids) == 2 else None
 
+def match_entrants(resource):
+    """Whoever is already placed in a match, even one still waiting on its
+    second player -- match_participants only answers once both are in."""
+    attributes = challonge_attributes(resource)
+    ids = {str(attributes[key]) for key in ("player1_id", "player2_id")
+           if attributes.get(key)}
+    for entry in attributes.get("points_by_participant") or []:
+        if isinstance(entry, dict) and entry.get("participant_id"):
+            ids.add(str(entry["participant_id"]))
+    relationships = resource.get("relationships") or {}
+    for key in ("player1", "player2"):
+        data = (relationships.get(key) or {}).get("data") or {}
+        if data.get("id"):
+            ids.add(str(data["id"]))
+    return sorted(ids)
+
 async def challonge_matches(record):
     """Every match in the bracket. Returns (ok, [match dict]) or (False, why)."""
     global _logged_match_shape
@@ -11348,6 +11364,7 @@ async def challonge_matches(record):
             "Round": attributes.get("round"),
             "State": attributes.get("state"),
             "Participants": match_participants(resource),
+            "Entrants": match_entrants(resource),
             "Winner": (str(attributes["winner_id"])
                        if attributes.get("winner_id") else None),
         })
@@ -12144,9 +12161,18 @@ async def tournament_forfeit(ctx, tokens):
         text, colour=TOURNAMENT_COLOR if ok else discord.Color.red()))
 
 async def tournament_reopen(ctx, tokens):
-    """!tournament reopen <match> -- undo a finished match and replay it."""
+    """!tournament reopen <match> -- undo a finished match and replay it.
+
+    With nothing running, it reaches back into the last finished tournament,
+    so a final that was decided wrongly can be replayed.
+    """
     record = await active_tournament()
-    if record is None or record["Phase"] != "live":
+    if record is None:
+        for entry in reversed(await read_tournament_index()):
+            if isinstance(entry, dict) and entry.get("Phase") == "done":
+                record = await read_tournament(entry["Id"])
+                break
+    if record is None or record["Phase"] not in ("live", "done"):
         await ctx.send(view=simple_card("No bracket is live.",
                                         colour=discord.Color.greyple()))
         return
@@ -12188,6 +12214,26 @@ async def reopen_match(record, match_id, match):
     if not ok:
         return False, f"Couldn't read the bracket — {found}"
     upstream = {entry["Id"]: entry for entry in found}
+
+    # The API's reopen leaves the winner in the match they advanced to, so
+    # they'd play on while this one is replayed. Challonge's own Reopen
+    # button resets that match; with it reset this check passes.
+    winner = player_by_discord(record, match.get("Winner") or "")
+    winner_pid = str((winner or {}).get("ChallongeId") or "")
+    placed = [entry for entry in found
+              if entry["Id"] != match_id and winner_pid
+              and winner_pid in entry["Entrants"]
+              and entry["State"] != "complete"]
+    if placed:
+        return False, (
+            f"**{winner['Name']}** is already in match "
+            f"{placed[0].get('Code') or placed[0]['Id']}, and Challonge's API "
+            f"won't take them back out.\n"
+            f"-# Reopen {match.get('Code') or match_id} on "
+            f"{record['Challonge']['Url']} (it resets the next match), then "
+            f"run this again."
+        )
+
     if (upstream.get(match_id) or {}).get("State") == "complete":
         ok, reason = await challonge_request(
             f"application/tournaments/{record['Challonge']['Id']}"
@@ -12222,6 +12268,11 @@ async def reopen_match(record, match_id, match):
         })
         for other_id in stale:
             stored["Matches"].pop(other_id, None)
+        # A finished tournament goes back to live; the bracket finalizes and
+        # crowns again once the replay is in.
+        stored["Phase"] = "live"
+        for key in ("Winner", "Standings", "FieldSize"):
+            stored.pop(key, None)
         return stored
 
     status, saved = await update_tournament(record["Id"], transform)
@@ -12238,6 +12289,16 @@ async def reopen_match(record, match_id, match):
                 await thread.send(f"{match_label(record, match)} is being "
                                   f"replayed, so this match is off for now.")
                 await thread.edit(locked=True, archived=True)
+            except discord.HTTPException:
+                pass
+
+    champion = (record.get("Winner") or {}).get("DiscordId")
+    if record["Phase"] == "done" and champion:
+        guild, role = await members_with_role(record, "WinnerRoleId")
+        member = guild.get_member(int(champion)) if role is not None else None
+        if member is not None:
+            try:
+                await member.remove_roles(role, reason="Final reopened")
             except discord.HTTPException:
                 pass
 
