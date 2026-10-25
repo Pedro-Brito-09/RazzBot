@@ -11008,11 +11008,15 @@ def final_standings(participants):
     ranked.sort(key=lambda p: p["final_rank"])
     return ranked
 
-async def crown_champion(record):
+async def crown_champion(record, decided=None):
     """Record the final ranks and award the champion role.
 
     Runs once, right after the bracket is finalized -- final ranks don't
     exist before that, and asking earlier would only spend requests.
+
+    decided is (winner, loser) of a final the bot recorded after Challonge
+    had already been finalized: Challonge's top two are from the first
+    final, so those two places come from the bot instead.
     """
     ok, participants = await challonge_participants(record)
     if not ok:
@@ -11020,6 +11024,16 @@ async def crown_champion(record):
                                 f"final ranks couldn't be read — "
                                 f"{participants}")
         return
+
+    if decided:
+        places = {str(decided[0]): 1, str(decided[1]): 2}
+        for participant in participants:
+            place = places.get(str(participant.get("misc") or ""))
+            if place:
+                participant["final_rank"] = place
+            elif participant.get("final_rank") in (1, 2):
+                # Out of the final that counted: level with the semifinals.
+                participant["final_rank"] = 3
 
     standings = final_standings(participants)
     if not standings:
@@ -11696,11 +11710,16 @@ async def finish_match(record, match_id, winner_id, scores, how):
     if match.get("State") == "done":
         return False, "That match is already finished."
 
-    # Challonge learns first: if it refuses, nothing here claims otherwise.
+    # Challonge learns first: if it refuses, nothing here claims otherwise --
+    # unless its bracket is already finalized and can't take results at all,
+    # as after a reopened final. Then the bot's record is the only one left.
+    frozen = False
     if how != "challonge":
         ok, reason = await challonge_report(record, match, winner_id, scores)
         if not ok:
-            return False, f"Challonge wouldn't take it — {reason}"
+            if not await challonge_finalized(record):
+                return False, f"Challonge wouldn't take it — {reason}"
+            frozen = True
 
     loser_id = match["Low"] if winner_id == match["High"] else match["High"]
     score = (f"{scores.get(winner_id, 0)}-{scores.get(loser_id, 0)}"
@@ -11737,7 +11756,23 @@ async def finish_match(record, match_id, winner_id, scores, how):
             pass
     # Following a result from Challonge happens inside a refresh already;
     # anything the bot reported itself is worth one read to open what's next.
-    if how != "challonge":
+    if frozen:
+        # Nothing opens on a finalized bracket, so this was the last match
+        # once nothing else is waiting.
+        waiting = [m for m in saved["Matches"].values()
+                   if m.get("State") != "done"]
+        if not waiting and saved["Phase"] == "live":
+            await crown_champion(saved, decided=(winner_id, loser_id))
+        elif waiting:
+            await tell_host(
+                saved,
+                f"Challonge's bracket is finalized, so "
+                f"{match_label(saved, done)} is only on the bot's record. "
+                f"The winner is crowned once these are decided too:\n"
+                + "\n".join(f"· {match_label(saved, m)}" for m in waiting)
+                + "\n-# `!tournament result` or `!tournament ff` each one.",
+            )
+    elif how != "challonge":
         await refresh_bracket(saved)
     if winner_id is None:
         return True, f"{match_label(saved, done)} is finished."
@@ -11899,6 +11934,30 @@ async def collect_game_result(record, match_id, match, stored):
     if not ok:
         print(f"tournament {record['Id']}: game result for {match_id} "
               f"couldn't be reported: {text}")
+        # Retrying every tick would spend the monthly Challonge quota on a
+        # refusal that won't change by itself, so the host hears it once
+        # and the match waits for them.
+        def transform(stored_record):
+            current = stored_record["Matches"].get(match_id)
+            if current is None or current.get("ReportFailed"):
+                return None
+            current["ReportFailed"] = text
+            return stored_record
+
+        status, saved = await update_tournament(record["Id"], transform)
+        if status == "ok" and saved is not None:
+            mine = scores.get(winner, 0)
+            theirs = max([v for k, v in scores.items() if k != winner] or [0])
+            high_first = (f"{mine}-{theirs}" if winner == match["High"]
+                          else f"{theirs}-{mine}")
+            await tell_host(
+                record,
+                f"The game says **{player_name(record, winner)}** won "
+                f"{match_label(record, match)}, but it couldn't be reported "
+                f"— {text}\n"
+                f"-# Fix that, then enter it with `!tournament result "
+                f"{match.get('Code')} {high_first}`.",
+            )
 
 # Challonge's free plan allows 500 API requests a month, so the bracket is
 # never polled. A new match can only become ready when the bracket starts or
@@ -12016,6 +12075,14 @@ async def follow_bracket_edits(record, found):
                 pass
     return saved
 
+async def challonge_finalized(record):
+    """True when Challonge has the bracket finalized ("complete")."""
+    ok, data = await challonge_request(
+        f"application/tournaments/{record['Challonge']['Id']}"
+    )
+    return bool(ok and challonge_attributes((data or {}).get("data"))
+                .get("state") == "complete")
+
 async def finalize_bracket(record):
     """Close the bracket on Challonge, then crown the winner."""
     if record["Phase"] != "live":
@@ -12029,12 +12096,7 @@ async def finalize_bracket(record):
     if not ok:
         # A bracket whose final was reopened can still be finalized on
         # Challonge, which refuses to do it twice; that's done, not stuck.
-        found, data = await challonge_request(
-            f"application/tournaments/{record['Challonge']['Id']}"
-        )
-        if (found and challonge_attributes((data or {}).get("data"))
-                .get("state") == "complete"):
-            ok = True
+        ok = await challonge_finalized(record)
     if not ok:
         await tell_host(
             record,
@@ -12055,7 +12117,8 @@ async def advance_matches(record):
     # Every playing match's result is read at once: one round trip for the
     # whole tick, however many matches are being played.
     playing = [match_id for match_id, match in record["Matches"].items()
-               if match.get("State") == "playing"]
+               if match.get("State") == "playing"
+               and not match.get("ReportFailed")]
     results = dict(zip(playing, await asyncio.gather(
         *(fetch_game_result(match_id) for match_id in playing))))
 
