@@ -9126,6 +9126,8 @@ async def challonge_create_tournament(record):
             "description": (f"Best of {record['BestOf']}. Matches start "
                             f"{starts:%d/%m/%Y %H:%M} UTC."),
             "private": False,
+            # Single elimination's two semifinal losers play for third.
+            "match_options": {"third_place_match": True},
         },
     }}
     ok, data = await challonge_request(
@@ -10303,6 +10305,16 @@ async def challonge_push_field(record, players):
         if state and state != "pending":
             return True, by_discord
 
+    # Brackets made before the third-place match was turned on get it here,
+    # while the bracket can still change shape. A refusal only costs that.
+    if record["Format"] == "single":
+        ok, data = await challonge_update_tournament(
+            record, {"match_options": {"third_place_match": True}}
+        )
+        if not ok:
+            print(f"tournament {record['Id']}: couldn't turn on the "
+                  f"third-place match ({data})")
+
     for position, player in enumerate(players, 1):
         if player["DiscordId"] in by_discord:
             continue
@@ -11277,8 +11289,32 @@ def ban_turn(match):
     return match["High"] if BAN_ORDER[count] == "high" else match["Low"]
 
 def match_label(record, match):
-    return (f"{match.get('Code') or '?'} · {player_name(record, match['High'])}"
+    return (f"{match.get('Code') or '?'} · "
+            + ("🥉 3rd place · " if match.get("ThirdPlace") else "")
+            + f"{player_name(record, match['High'])}"
             f" vs {player_name(record, match['Low'])}")
+
+def has_lost(record, discord_id):
+    return any(match.get("State") == "done" and match.get("Winner")
+               and match["Winner"] != discord_id
+               and discord_id in (match["High"], match["Low"])
+               for match in record["Matches"].values())
+
+def awaits_third_place(record, discord_id):
+    """A single-elimination semifinal loser whose third-place match hasn't
+    opened yet -- out of the title, not out of the tournament."""
+    if record["Format"] != "single":
+        return False
+    if any(match.get("ThirdPlace") for match in record["Matches"].values()):
+        return False
+    # ceil(log2(field)): the number of rounds, so the semifinal is the last
+    # but one.
+    rounds = (max(len(record.get("Seeded") or []), 2) - 1).bit_length()
+    return rounds >= 2 and any(
+        match.get("State") == "done" and match.get("Winner") != discord_id
+        and discord_id in (match["High"], match["Low"])
+        and match.get("Round") == rounds - 1
+        for match in record["Matches"].values())
 
 def find_match(record, reference):
     """A match by Challonge's letter, its id, or None."""
@@ -11597,6 +11633,11 @@ async def open_match(record, found):
         "CheckedIn": [], "Bans": [], "Map": None,
         "Deadline": now_epoch() + record["MatchCheckinMinutes"] * 60,
     }
+    # In single elimination only the third-place match pairs two players
+    # who have both lost already.
+    if record["Format"] == "single" and all(
+            has_lost(record, who) for who in (high, low)):
+        match["ThirdPlace"] = True
 
     guild = tournament_guild(record)
     chat = (space_object(record, guild, "ChatChannelId")
@@ -12443,7 +12484,11 @@ async def match_command(ctx):
         lost = any(m.get("State") == "done" and m.get("Winner") != who
                    and who in (m["High"], m["Low"])
                    for m in record["Matches"].values())
-        if lost and record["Format"] == "single":
+        if awaits_third_place(record, who):
+            await reply("You're playing for **third place** — you'll be "
+                        "pinged in its thread once the other semifinal is "
+                        "done.")
+        elif lost and record["Format"] == "single":
             await reply("You're out of this one. 🫡")
         else:
             await reply("No match right now — you're waiting on your next "
