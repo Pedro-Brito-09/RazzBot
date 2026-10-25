@@ -11986,6 +11986,15 @@ async def finalize_bracket(record):
                           "attributes": {"state": "finalize"}}},
     )
     if not ok:
+        # A bracket whose final was reopened can still be finalized on
+        # Challonge, which refuses to do it twice; that's done, not stuck.
+        found, data = await challonge_request(
+            f"application/tournaments/{record['Challonge']['Id']}"
+        )
+        if (found and challonge_attributes((data or {}).get("data"))
+                .get("state") == "complete"):
+            ok = True
+    if not ok:
         await tell_host(
             record,
             f"Every match in **{record['Name']}** is done, but Challonge "
