@@ -11879,6 +11879,7 @@ async def refresh_bracket(record):
         print(f"tournament {record['Id']}: couldn't read matches ({found})")
         return False, found
 
+    record = await follow_bracket_edits(record, found)
     for match in found:
         if (match["State"] == "open" and match["Participants"]
                 and match["Id"] not in record["Matches"]):
@@ -11908,6 +11909,71 @@ async def refresh_bracket(record):
             and any(m["State"] == "complete" for m in found)):
         await finalize_bracket(record)
     return True, None
+
+async def follow_bracket_edits(record, found):
+    """Bring the bot's matches in line with a bracket the host changed on
+    Challonge's site. Returns the record as saved.
+
+    A match reset there (reopened, or emptied because one before it was) is
+    forgotten, and its thread closed: once Challonge has both players again
+    it opens fresh, with whoever is in it now. A finished match whose winner
+    was changed there takes the new winner.
+    """
+    by_id = {match["Id"]: match for match in found}
+    by_participant = {str(player.get("ChallongeId")): player["DiscordId"]
+                      for player in record["Players"]
+                      if player.get("ChallongeId")}
+
+    forget, rewin = [], {}
+    for match_id, match in record["Matches"].items():
+        upstream = by_id.get(match_id)
+        if upstream is None:
+            continue
+        players = {by_participant.get(pid)
+                   for pid in upstream["Participants"] or []}
+        if upstream["State"] == "complete":
+            winner = by_participant.get(upstream.get("Winner"))
+            if (match.get("State") == "done" and winner
+                    and winner != match.get("Winner")):
+                rewin[match_id] = winner
+        elif (match.get("State") == "done"
+              or players != {match["High"], match["Low"]}):
+            forget.append(match_id)
+
+    if not forget and not rewin:
+        return record
+
+    def transform(stored):
+        for match_id in forget:
+            stored["Matches"].pop(match_id, None)
+        for match_id, winner in rewin.items():
+            current = stored["Matches"].get(match_id)
+            if current is not None:
+                current.update({"Winner": winner, "Score": None,
+                                "How": "challonge"})
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if status != "ok" or saved is None:
+        print(f"tournament {record['Id']}: couldn't follow bracket edits "
+              f"({status})")
+        return record
+
+    for match_id in forget:
+        match = record["Matches"][match_id]
+        print(f"tournament {record['Id']}: {match_id} was reset on "
+              f"Challonge, dropping it")
+        _match_threads.pop(int(match.get("ThreadId") or 0), None)
+        thread = await match_thread(record, match)
+        if thread is not None:
+            try:
+                await thread.send("The bracket was changed on Challonge, so "
+                                  "this match is off. If it's still on, it "
+                                  "opens again in a new thread.")
+                await thread.edit(locked=True, archived=True)
+            except discord.HTTPException:
+                pass
+    return saved
 
 async def finalize_bracket(record):
     """Close the bracket on Challonge, then crown the winner."""
