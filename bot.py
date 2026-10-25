@@ -8446,6 +8446,7 @@ TOURNAMENT_USAGE = (
     "**`!tournament result <match> <a>-<b>`** — enter a score, higher seed "
     "first as the thread shows it\n"
     "**`!tournament ff <match> <player>`** — that player forfeits\n"
+    "**`!tournament reopen <match>`** — undo a finished match and replay it\n"
     "**`!tournament cancel`** — call it off, deleting its channels "
     "(`--keep` to spare them)\n"
     "**`!tournament cleanup [id]`** — delete a finished one's channels "
@@ -9647,7 +9648,7 @@ async def tournament_cancel(ctx, tokens=()):
     ))
 
 @bot.command(name="tournament", hidden=True,
-             usage="<create|pool|edit|seed|add|drop|result|ff|sync|"
+             usage="<create|pool|edit|seed|add|drop|result|ff|reopen|sync|"
                    "cancel|cleanup>")
 @is_admin()
 async def admin_tournament(ctx, action: str = None, *arguments: str):
@@ -9667,6 +9668,8 @@ async def admin_tournament(ctx, action: str = None, *arguments: str):
         await tournament_result(ctx, tokens)
     elif verb in ("ff", "forfeit"):
         await tournament_forfeit(ctx, tokens)
+    elif verb == "reopen":
+        await tournament_reopen(ctx, tokens)
     elif verb == "sync":
         await tournament_sync(ctx)
     elif verb == "edit":
@@ -12139,6 +12142,120 @@ async def tournament_forfeit(ctx, tokens):
                                       {winner: 1, quitter: 0}, "forfeit")
     await ctx.send(view=simple_card(
         text, colour=TOURNAMENT_COLOR if ok else discord.Color.red()))
+
+async def tournament_reopen(ctx, tokens):
+    """!tournament reopen <match> -- undo a finished match and replay it."""
+    record = await active_tournament()
+    if record is None or record["Phase"] != "live":
+        await ctx.send(view=simple_card("No bracket is live.",
+                                        colour=discord.Color.greyple()))
+        return
+    if len(tokens) != 1:
+        await ctx.send(view=simple_card("**`!tournament reopen <match>`**",
+                                        colour=discord.Color.red()))
+        return
+
+    match_id, match = find_match(record, tokens[0])
+    if match is None:
+        await ctx.send(view=simple_card(f"No match `{tokens[0]}`.",
+                                        colour=discord.Color.red()))
+        return
+    async with ctx.typing():
+        ok, text = await reopen_match(record, match_id, match)
+    await ctx.send(view=simple_card(
+        text, colour=TOURNAMENT_COLOR if ok else discord.Color.red()))
+
+async def reopen_match(record, match_id, match):
+    """Put a finished match back to check-in. Returns (ok, message)."""
+    if match.get("State") != "done":
+        return False, f"{match_label(record, match)} isn't finished."
+    if match.get("How") in GAME_RESULT_HOW.values():
+        # The game's Result_<id> would close it again on the first tick.
+        return False, (f"{match_label(record, match)} was played in game, so "
+                       f"it can't be reopened.")
+    # Challonge resets the next round along with it; a result there can't
+    # be pulled back without the host redoing it by hand.
+    later = [other for other in record["Matches"].values()
+             if other is not match and other.get("State") == "done"
+             and (other.get("FinishedAt") or 0) >= (match.get("FinishedAt") or 0)
+             and match.get("Winner") in (other["High"], other["Low"])]
+    if later:
+        return False, (f"**{player_name(record, match['Winner'])}** has "
+                       f"already finished {match_label(record, later[0])}. "
+                       f"Undo that one first.")
+
+    ok, found = await challonge_matches(record)
+    if not ok:
+        return False, f"Couldn't read the bracket — {found}"
+    upstream = {entry["Id"]: entry for entry in found}
+    if (upstream.get(match_id) or {}).get("State") == "complete":
+        ok, reason = await challonge_request(
+            f"application/tournaments/{record['Challonge']['Id']}"
+            f"/matches/{match_id}/change_state",
+            method="PUT",
+            payload={"data": {"type": "MatchState",
+                              "attributes": {"state": "reopen"}}},
+        )
+        if not ok:
+            return False, (f"Challonge wouldn't reopen it — {reason}\n"
+                           f"-# Reopen it on Challonge, then run this again.")
+        ok, found = await challonge_matches(record)
+        if not ok:
+            return False, f"Reopened on Challonge, but couldn't re-read it — {found}"
+        upstream = {entry["Id"]: entry for entry in found}
+
+    # Any match the winner had moved on to is no longer ready on Challonge.
+    stale = [other_id for other_id, other in record["Matches"].items()
+             if other_id != match_id and other.get("State") != "done"
+             and match.get("Winner") in (other["High"], other["Low"])
+             and (upstream.get(other_id) or {}).get("State") != "open"]
+
+    def transform(stored):
+        current = stored["Matches"].get(match_id)
+        if current is None or current.get("State") != "done":
+            return None
+        for key in ("Winner", "Score", "How", "FinishedAt", "HostWarned"):
+            current.pop(key, None)
+        current.update({
+            "State": "checkin", "CheckedIn": [], "Bans": [], "Map": None,
+            "Deadline": now_epoch() + stored["MatchCheckinMinutes"] * 60,
+        })
+        for other_id in stale:
+            stored["Matches"].pop(other_id, None)
+        return stored
+
+    status, saved = await update_tournament(record["Id"], transform)
+    if status != "ok" or saved is None:
+        return False, (f"Reopened on Challonge, but the bot couldn't save it "
+                       f"({status}). Run this again.")
+
+    for other_id in stale:
+        other = record["Matches"][other_id]
+        _match_threads.pop(int(other.get("ThreadId") or 0), None)
+        thread = await match_thread(record, other)
+        if thread is not None:
+            try:
+                await thread.send(f"{match_label(record, match)} is being "
+                                  f"replayed, so this match is off for now.")
+                await thread.edit(locked=True, archived=True)
+            except discord.HTTPException:
+                pass
+
+    reopened = saved["Matches"][match_id]
+    thread = await match_thread(saved, reopened)
+    if thread is not None:
+        try:
+            await thread.edit(archived=False, locked=False)
+        except discord.HTTPException:
+            pass
+    sync_match_threads(saved)
+    await refresh_match_card(
+        saved, match_id, reopened,
+        ping=(f"<@{reopened['High']}> <@{reopened['Low']}>, this match is "
+              f"back on — check in by {when(reopened['Deadline'], 'R')}."),
+    )
+    return True, (f"{match_label(saved, reopened)} is reopened. Check-in "
+                  f"closes {when(reopened['Deadline'], 'R')}.")
 
 # --- /match ----------------------------------------------------------------
 
