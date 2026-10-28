@@ -79,7 +79,7 @@ MEDALS_PER_PAGE = 10
 MAPS_CACHE_TTL = 600
 # Only the fields the embed needs are retained, to keep the index small.
 MAP_FIELDS = ("Id", "Name", "Creator", "Plays", "Favorites",
-              "Playstyle", "Privacy", "Featured")
+              "Playstyle", "Privacy", "Featured", "ThumbnailId")
 
 # Luau Execution runs a script on a real server for the place. It is the only
 # way to write a value the game reads back as a buffer: the datastore API can
@@ -107,6 +107,8 @@ BADGE_CONCURRENCY = 8
 # requests, and the shared session caps the total in flight anyway.
 SYNC_ALL_CONCURRENCY = 3
 BADGE_ICON_SIZE = "150x150"
+# 16:9, so a map thumbnail keeps its shape in the card.
+MAP_THUMBNAIL_SIZE = "768x432"
 # Discord decides gallery layout from the item count. Nine images make a
 # balanced grid; a final group of six or fewer uses six slots instead so it
 # keeps the same proportions without spending three unnecessary components.
@@ -2422,6 +2424,26 @@ async def fetch_headshots(user_ids):
             headshots[item.get("targetId")] = item["imageUrl"]
     return headshots
 
+async def fetch_map_thumbnail(entry):
+    """The map's ThumbnailId image URL, or None when it has none."""
+    asset_id = entry.get("ThumbnailId")
+    if not asset_id:
+        return None
+
+    url = (
+        "https://thumbnails.roblox.com/v1/assets"
+        f"?assetIds={asset_id}&size={MAP_THUMBNAIL_SIZE}"
+        "&format=Png&isCircular=false"
+    )
+    data = await request_json(url, label="fetch_map_thumbnail")
+    if not data:
+        return None
+
+    for item in data.get("data", []):
+        if item.get("state") == "Completed" and item.get("imageUrl"):
+            return item["imageUrl"]
+    return None
+
 MENTION_PATTERN = re.compile(r"<@!?\d+>")
 
 def truncate_name(name, limit=MAX_LEADERBOARD_NAME):
@@ -3472,7 +3494,7 @@ async def build_profile_view(user_id, username, parent=None, guild=None):
     )
 
 def build_map_container(entry, *, headshot=None, creator_text="Unknown",
-                        accent_colour=MAP_COLOR, banner=None):
+                        accent_colour=MAP_COLOR, banner=None, thumbnail=None):
     """The body of a map card, without any action buttons.
 
     Shared by the normal map card and the delete confirmation, so the two
@@ -3504,6 +3526,11 @@ def build_map_container(entry, *, headshot=None, creator_text="Unknown",
     else:
         container.add_item(discord.ui.TextDisplay(heading))
 
+    if thumbnail:
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(media=thumbnail, description=entry.get("Name") or None)
+        container.add_item(gallery)
+
     container.add_item(discord.ui.Separator())
 
     container.add_item(discord.ui.TextDisplay(
@@ -3533,7 +3560,7 @@ class MapView(CardView):
 
     def __init__(self, entry, *, headshot=None, creator_text="Unknown",
                  creator_id=None, creator_name=None, parent=None,
-                 timeout=MAP_VIEW_TIMEOUT,
+                 thumbnail=None, timeout=MAP_VIEW_TIMEOUT,
                  play_label="Play in Challenge Mode",
                  play_url_template=PLAY_URL_TEMPLATE,
                  show_leaderboard=True, show_creator=True):
@@ -3545,7 +3572,8 @@ class MapView(CardView):
         map_id = entry.get("Id")
         privacy = entry.get("Privacy")
         container = build_map_container(
-            entry, headshot=headshot, creator_text=creator_text
+            entry, headshot=headshot, creator_text=creator_text,
+            thumbnail=thumbnail,
         )
 
         row = discord.ui.ActionRow()
@@ -3747,6 +3775,7 @@ async def build_map_card(entry, **view_options):
     return MapView(
         entry,
         headshot=headshot,
+        thumbnail=await fetch_map_thumbnail(entry),
         creator_text=creator_text,
         creator_id=creator_id,
         creator_name=creator,
@@ -3794,6 +3823,9 @@ async def build_daily_cup_map_card(entry, cup_index, cup_date):
     )
     if headshot:
         embed.set_thumbnail(url=headshot)
+    thumbnail = await fetch_map_thumbnail(entry)
+    if thumbnail:
+        embed.set_image(url=thumbnail)
 
     return embed, DailyCupMapView()
 
@@ -4710,6 +4742,7 @@ async def build_map_view(entry, parent=None, view_class=None):
     return (view_class or MapView)(
         entry, headshot=headshot, creator_text=creator_text,
         creator_id=creator_id, creator_name=creator, parent=parent,
+        thumbnail=await fetch_map_thumbnail(entry),
     )
 
 @bot.hybrid_command(
@@ -6859,7 +6892,7 @@ class DeleteMapView(CardView):
     """The map about to be deleted, with the confirmation on it."""
 
     def __init__(self, entry, *, headshot=None, creator_text="Unknown",
-                 timeout=MAP_VIEW_TIMEOUT):
+                 thumbnail=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(timeout=timeout)
         self.entry = entry
         self.pending = []
@@ -6869,6 +6902,7 @@ class DeleteMapView(CardView):
             entry,
             headshot=headshot,
             creator_text=creator_text,
+            thumbnail=thumbnail,
             accent_colour=discord.Color.red(),
             banner=("### ⚠️ Delete this map?\n"
                     "-# Removes it from the index of ~85k maps and deletes its "
@@ -7026,8 +7060,10 @@ async def admin_delete_map(ctx, map_id: int):
         headshot = None
         if creator_id:
             headshot = (await fetch_headshots([creator_id])).get(creator_id)
+        thumbnail = await fetch_map_thumbnail(entry)
 
-    view = DeleteMapView(entry, headshot=headshot, creator_text=creator_text)
+    view = DeleteMapView(entry, headshot=headshot, creator_text=creator_text,
+                         thumbnail=thumbnail)
     view.message = await ctx.send(view=view)
 
 async def find_discord_user(ctx, query):
