@@ -2442,6 +2442,7 @@ async def fetch_map_thumbnail(entry):
     for item in data.get("data", []):
         if item.get("state") == "Completed" and item.get("imageUrl"):
             return item["imageUrl"]
+    print(f"fetch_map_thumbnail: asset {asset_id} not ready: {data}")
     return None
 
 MENTION_PATTERN = re.compile(r"<@!?\d+>")
@@ -3526,11 +3527,6 @@ def build_map_container(entry, *, headshot=None, creator_text="Unknown",
     else:
         container.add_item(discord.ui.TextDisplay(heading))
 
-    if thumbnail:
-        gallery = discord.ui.MediaGallery()
-        gallery.add_item(media=thumbnail, description=entry.get("Name") or None)
-        container.add_item(gallery)
-
     container.add_item(discord.ui.Separator())
 
     container.add_item(discord.ui.TextDisplay(
@@ -3549,6 +3545,12 @@ def build_map_container(entry, *, headshot=None, creator_text="Unknown",
         badge = PRIVACY_BADGES.get(privacy, "")
         footer += f"  ·  {badge} {privacy}".rstrip()
     container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+
+    # Last, so it sits between the info and whatever buttons follow.
+    if thumbnail:
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(media=thumbnail, description=entry.get("Name") or None)
+        container.add_item(gallery)
 
     container.add_item(discord.ui.Separator(
         visible=False, spacing=discord.SeparatorSpacing.small
