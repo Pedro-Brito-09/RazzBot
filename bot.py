@@ -3529,23 +3529,26 @@ def build_map_container(entry, *, headshot=None, creator_text="Unknown",
 
     container.add_item(discord.ui.Separator())
 
-    stats = (f"🎮  **{playstyle}**",
+    stats = [f"🎮  **{playstyle}**",
              f"▶️  **{plays:,}** plays",
-             f"⭐  **{favorites:,}** favourites")
-    # The thumbnail already takes the room, so the stats fold onto one line.
-    joiner = "  ·  " if thumbnail else "\n"
-    container.add_item(discord.ui.TextDisplay(joiner.join(stats)))
-
-    # Invisible separator: breathing room without a second rule.
-    container.add_item(discord.ui.Separator(
-        visible=False, spacing=discord.SeparatorSpacing.small
-    ))
-
-    footer = f"ID {map_id}"
+             f"⭐  **{favorites:,}** favourites"]
+    footer = [f"ID {map_id}"]
     if privacy:
         badge = PRIVACY_BADGES.get(privacy, "")
-        footer += f"  ·  {badge} {privacy}".rstrip()
-    container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+        footer.append(f"{badge} {privacy}".strip())
+
+    if thumbnail:
+        # The thumbnail already takes the room, so everything folds onto
+        # one line.
+        container.add_item(discord.ui.TextDisplay("  ·  ".join(stats + footer)))
+    else:
+        container.add_item(discord.ui.TextDisplay("\n".join(stats)))
+
+        # Invisible separator: breathing room without a second rule.
+        container.add_item(discord.ui.Separator(
+            visible=False, spacing=discord.SeparatorSpacing.small
+        ))
+        container.add_item(discord.ui.TextDisplay(f"-# {'  ·  '.join(footer)}"))
 
     # Last, so it sits between the info and whatever buttons follow.
     if thumbnail:
