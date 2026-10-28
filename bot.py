@@ -2424,26 +2424,39 @@ async def fetch_headshots(user_ids):
             headshots[item.get("targetId")] = item["imageUrl"]
     return headshots
 
-async def fetch_map_thumbnail(entry):
-    """The map's ThumbnailId image URL, or None when it has none."""
-    asset_id = entry.get("ThumbnailId")
-    if not asset_id:
-        return None
+async def fetch_map_thumbnails(entries):
+    """ThumbnailId image URLs keyed by map ID. One batched request.
+
+    Maps without a ThumbnailId, or whose image isn't ready, are left out.
+    """
+    asset_to_map = {}
+    for entry in entries:
+        if entry.get("ThumbnailId"):
+            asset_to_map.setdefault(entry["ThumbnailId"], []).append(entry.get("Id"))
+    if not asset_to_map:
+        return {}
 
     url = (
         "https://thumbnails.roblox.com/v1/assets"
-        f"?assetIds={asset_id}&size={MAP_THUMBNAIL_SIZE}"
-        "&format=Png&isCircular=false"
+        f"?assetIds={','.join(str(a) for a in asset_to_map)}"
+        f"&size={MAP_THUMBNAIL_SIZE}&format=Png&isCircular=false"
     )
-    data = await request_json(url, label="fetch_map_thumbnail")
+    data = await request_json(url, label="fetch_map_thumbnails")
     if not data:
-        return None
+        return {}
 
+    thumbnails = {}
     for item in data.get("data", []):
         if item.get("state") == "Completed" and item.get("imageUrl"):
-            return item["imageUrl"]
-    print(f"fetch_map_thumbnail: asset {asset_id} not ready: {data}")
-    return None
+            for map_id in asset_to_map.get(item.get("targetId"), []):
+                thumbnails[map_id] = item["imageUrl"]
+        else:
+            print(f"fetch_map_thumbnails: asset not ready: {item}")
+    return thumbnails
+
+async def fetch_map_thumbnail(entry):
+    """The map's ThumbnailId image URL, or None when it has none."""
+    return (await fetch_map_thumbnails([entry])).get(entry.get("Id"))
 
 MENTION_PATTERN = re.compile(r"<@!?\d+>")
 
@@ -9902,9 +9915,10 @@ class TournamentRegisterView(discord.ui.LayoutView):
 class TournamentCheckinView(discord.ui.LayoutView):
     """Check-in card, carrying the pool reveal. Persistent."""
 
-    def __init__(self, record=None):
+    def __init__(self, record=None, thumbnails=None):
         super().__init__(timeout=None)
         container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
+        thumbnails = thumbnails or {}
 
         if record is None:
             container.add_item(discord.ui.TextDisplay("## ✋ Check-in"))
@@ -9923,9 +9937,24 @@ class TournamentCheckinView(discord.ui.LayoutView):
             if record["Pool"]:
                 container.add_item(discord.ui.Separator())
                 container.add_item(discord.ui.TextDisplay(
-                    f"## 🗺️ The pool\n{pool_lines(record['Pool'])}\n\n"
-                    f"-# Every match vetoes these down to one. You have until "
-                    f"matches start to practise."
+                    f"## 🗺️ The pool\n{pool_lines(record['Pool'])}"
+                ))
+
+                # Pool order, so the grid reads the same way as the list.
+                # A map without a thumbnail just leaves the grid.
+                gallery = discord.ui.MediaGallery()
+                for position, entry in enumerate(record["Pool"], 1):
+                    if entry["Id"] in thumbnails:
+                        gallery.add_item(
+                            media=thumbnails[entry["Id"]],
+                            description=f"{position}. {entry['Name']}",
+                        )
+                if gallery.items:
+                    container.add_item(gallery)
+
+                container.add_item(discord.ui.TextDisplay(
+                    "-# Every match vetoes these down to one. You have until "
+                    "matches start to practise."
                 ))
 
         row = discord.ui.ActionRow()
@@ -10154,8 +10183,16 @@ async def open_checkin(record):
         return
     record = saved
 
+    # The pool only stores IDs and names, so thumbnails come from the index,
+    # read now in case a map's ThumbnailId changed since the pool was set.
+    maps_by_id = await get_community_maps() or {}
+    thumbnails = await fetch_map_thumbnails(
+        maps_by_id[entry["Id"]] for entry in record["Pool"]
+        if entry["Id"] in maps_by_id
+    )
+
     # Players are pinged here through their role, never DMed.
-    await announce_tournament(record, TournamentCheckinView(record),
+    await announce_tournament(record, TournamentCheckinView(record, thumbnails),
                               ping="players")
 
 # Seeding blends two rankings, each taken as a percentile of the field so
