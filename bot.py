@@ -3529,26 +3529,14 @@ def build_map_container(entry, *, headshot=None, creator_text="Unknown",
 
     container.add_item(discord.ui.Separator())
 
-    stats = [f"🎮  **{playstyle}**",
-             f"▶️  **{plays:,}** plays",
-             f"⭐  **{favorites:,}** favourites"]
-    footer = [f"ID {map_id}"]
+    info = [f"🎮  **{playstyle}**",
+            f"▶️  **{plays:,}** plays",
+            f"⭐  **{favorites:,}** favourites",
+            f"ID {map_id}"]
     if privacy:
         badge = PRIVACY_BADGES.get(privacy, "")
-        footer.append(f"{badge} {privacy}".strip())
-
-    if thumbnail:
-        # The thumbnail already takes the room, so everything folds onto
-        # one line.
-        container.add_item(discord.ui.TextDisplay("  ·  ".join(stats + footer)))
-    else:
-        container.add_item(discord.ui.TextDisplay("\n".join(stats)))
-
-        # Invisible separator: breathing room without a second rule.
-        container.add_item(discord.ui.Separator(
-            visible=False, spacing=discord.SeparatorSpacing.small
-        ))
-        container.add_item(discord.ui.TextDisplay(f"-# {'  ·  '.join(footer)}"))
+        info.append(f"{badge} {privacy}".strip())
+    container.add_item(discord.ui.TextDisplay("  ·  ".join(info)))
 
     # Last, so it sits between the info and whatever buttons follow.
     if thumbnail:
