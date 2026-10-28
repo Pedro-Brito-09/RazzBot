@@ -3539,16 +3539,12 @@ def build_map_container(entry, *, headshot=None, creator_text="Unknown",
     container.add_item(discord.ui.TextDisplay("  ·  ".join(info)))
 
     # Last, so it sits between the info and whatever buttons follow.
+    container.add_item(discord.ui.Separator())
     if thumbnail:
-        container.add_item(discord.ui.Separator())
         gallery = discord.ui.MediaGallery()
         gallery.add_item(media=thumbnail, description=entry.get("Name") or None)
         container.add_item(gallery)
         container.add_item(discord.ui.Separator())
-    else:
-        container.add_item(discord.ui.Separator(
-            visible=False, spacing=discord.SeparatorSpacing.small
-        ))
     return container
 
 class MapView(CardView):
