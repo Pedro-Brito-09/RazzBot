@@ -3529,11 +3529,12 @@ def build_map_container(entry, *, headshot=None, creator_text="Unknown",
 
     container.add_item(discord.ui.Separator())
 
-    container.add_item(discord.ui.TextDisplay(
-        f"🎮  **{playstyle}**\n"
-        f"▶️  **{plays:,}** plays\n"
-        f"⭐  **{favorites:,}** favourites"
-    ))
+    stats = (f"🎮  **{playstyle}**",
+             f"▶️  **{plays:,}** plays",
+             f"⭐  **{favorites:,}** favourites")
+    # The thumbnail already takes the room, so the stats fold onto one line.
+    joiner = "  ·  " if thumbnail else "\n"
+    container.add_item(discord.ui.TextDisplay(joiner.join(stats)))
 
     # Invisible separator: breathing room without a second rule.
     container.add_item(discord.ui.Separator(
