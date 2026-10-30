@@ -2029,6 +2029,14 @@ async def _badge_is_owned(user_id, badge_id, semaphore):
         owned = await request_json(url, label=f"badge_is_owned({badge_id})")
         return badge_id, owned is True
 
+def evict_expired_owned_badges(now):
+    """Drop finished entries. Each new player and badge set gets its own key,
+    so without this the cache grows until the bot restarts."""
+    expired = [key for key, entry in _owned_badges_cache.items()
+               if now - entry[0] >= OWNED_BADGES_CACHE_TTL]
+    for key in expired:
+        del _owned_badges_cache[key]
+
 async def fetch_owned_badge_ids(user_id, badge_ids):
     """Which of badge_ids the player owns. One request per badge, so the
     result is cached briefly per player."""
@@ -2045,6 +2053,7 @@ async def fetch_owned_badge_ids(user_id, badge_ids):
         _badge_is_owned(user_id, badge_id, semaphore) for badge_id in badge_ids
     ))
     owned = {badge_id for badge_id, has in results if has}
+    evict_expired_owned_badges(now)
     _owned_badges_cache[cache_key] = (now, owned)
     return owned
 
@@ -5391,8 +5400,8 @@ def cache_status(label, ttl, stamps, unit=None):
     """One /cache entry from the monotonic times its data was stored.
 
     unit marks a cache of many entries, which is summed up rather than listed:
-    /cache is public, and those are keyed by player and tournament. Nothing
-    evicts them, so entries past ttl are left out of the count.
+    /cache is public, and those are keyed by player and tournament. Entries
+    past ttl can still be sitting there, so they are left out of the count.
     """
     now = time.monotonic()
     def timestamp(stamp):
