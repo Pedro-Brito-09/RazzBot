@@ -259,8 +259,10 @@ DAILY_CUP_CHANNEL_ID = os.getenv("DAILY_CUP_CHANNEL_ID")
 DAILY_CUP_ROLE_ID = os.getenv("DAILY_CUP_ROLE_ID")
 # Channel for tournament announcements: registration, check-in and results.
 TOURNAMENT_CHANNEL_ID = os.getenv("TOURNAMENT_CHANNEL_ID")
-# Pinged when registration opens and again when check-in starts.
-TOURNAMENT_ROLE_ID = os.getenv("TOURNAMENT_ROLE_ID")
+# Pinged when registration opens. Player pings fall back to it when a
+# tournament's own role never got created.
+TOURNAMENT_ROLE_ID = (os.getenv("TOURNAMENT_ROLE_ID")
+                      or "1563624540070740109")
 # Each tournament's champion role sits directly above this role in the list.
 CHAMPION_ROLE_ANCHOR_ID = (os.getenv("CHAMPION_ROLE_ANCHOR_ID")
                            or "1537170680146165840")
@@ -11249,7 +11251,7 @@ async def crown_champion(record, decided=None):
         + f"\n\n🔗 {saved['Challonge']['Url']}{note}",
         heading=f"🏆 {saved['Name']} — we have a winner",
         colour=WINNER_ROLE_COLOR,
-    ), ping=True)
+    ))
     try:
         await log_tournament_result(saved, standings, len(participants))
     except Exception:
