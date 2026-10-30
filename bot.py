@@ -263,9 +263,9 @@ TOURNAMENT_CHANNEL_ID = os.getenv("TOURNAMENT_CHANNEL_ID")
 # tournament's own role never got created.
 TOURNAMENT_ROLE_ID = (os.getenv("TOURNAMENT_ROLE_ID")
                       or "1563624540070740109")
-# Each tournament's champion role sits directly above this role in the list.
-CHAMPION_ROLE_ANCHOR_ID = (os.getenv("CHAMPION_ROLE_ANCHOR_ID")
-                           or "1537170680146165840")
+# Every tournament winner holds this role, and each tournament's own champion
+# role sits directly below it in the list.
+CHAMPION_ROLE_ID = os.getenv("CHAMPION_ROLE_ID") or "1565808397109043260"
 # A permanent record of every tournament that finishes: its top 3. Lives
 # outside the tournament's category, so !tournament cleanup never takes it.
 TOURNAMENT_LOG_CHANNEL_ID = (os.getenv("TOURNAMENT_LOG_CHANNEL_ID")
@@ -303,6 +303,8 @@ bot = commands.Bot(
 _synced = False
 # Persistent tournament views are bound once per process, in on_ready.
 _tournament_views_bound = False
+# Older champion roles are unhoisted once per process, in on_ready.
+_champion_roles_flattened = False
 _session = None
 
 # Which universe the command currently running should talk to. A ContextVar
@@ -4188,6 +4190,14 @@ async def on_ready():
             # Without this the buttons on an already-posted announcement go
             # dead after a redeploy, so it is worth shouting about.
             print("Binding the persistent tournament views failed:")
+            traceback.print_exc()
+
+    if not _champion_roles_flattened:
+        try:
+            await flatten_champion_roles()
+            globals()["_champion_roles_flattened"] = True
+        except Exception:
+            print("Flattening the champion roles failed:")
             traceback.print_exc()
 
     if not match_tick.is_running():
@@ -10784,7 +10794,8 @@ def tournament_guild(record):
         return None
 
 async def place_tournament_roles(guild, player_role, winner_role):
-    """The player role last in the list, the champion directly above the anchor.
+    """The player role last in the list, the champion directly below the
+    shared champion role.
 
     Returns a list of problems. Positions are read fresh from Discord rather
     than the cache: two roles were just created, which shifts the ones below
@@ -10804,19 +10815,19 @@ async def place_tournament_roles(guild, player_role, winner_role):
 
     problems = []
     anchor_index = next((index for index, role in enumerate(order)
-                         if str(role.id) == str(CHAMPION_ROLE_ANCHOR_ID)), None)
+                         if str(role.id) == str(CHAMPION_ROLE_ID)), None)
     me = guild.me
     if anchor_index is None:
-        problems.append("Couldn't find the role the champion role goes above, "
+        problems.append("Couldn't find the role the champion role goes below, "
                         "so it was left at the bottom.")
         order.insert(1, winner_role)
     elif me is None or order[anchor_index] >= me.top_role:
-        problems.append("The champion role goes above a role that's higher "
+        problems.append("The champion role goes below a role that's higher "
                         "than mine, so I left it at the bottom — move my role "
                         "up, or move it by hand.")
         order.insert(1, winner_role)
     else:
-        order.insert(anchor_index + 1, winner_role)
+        order.insert(anchor_index, winner_role)
 
     # Only the roles that actually move. Everything above the champion's new
     # spot keeps its position, so roles above mine are never touched.
@@ -10860,7 +10871,7 @@ async def create_tournament_space(guild, record, *, private=False):
             space["PlayerRoleId"] = str(player_role.id)
 
             winner_role = await guild.create_role(
-                name=f"{short} Champion", hoist=True, mentionable=True,
+                name=f"{short} Champion", mentionable=True,
                 reason=f"Tournament {record['Id']}: winner",
             )
             space["WinnerRoleId"] = str(winner_role.id)
@@ -11013,18 +11024,54 @@ async def strip_no_shows(record, checked_in_ids):
             continue
     return removed
 
+async def flatten_champion_roles():
+    """Stop the champion roles made before they were created unhoisted from
+    being listed separately. Does nothing to a role that's already flat."""
+    for entry in await read_tournament_index():
+        if not isinstance(entry, dict):
+            continue
+        record = await read_tournament(entry["Id"])
+        if record is None:
+            continue
+        _guild, role = await members_with_role(record, "WinnerRoleId")
+        if role is None or not role.hoist:
+            continue
+        try:
+            await role.edit(hoist=False, reason="Champion roles aren't hoisted")
+        except discord.HTTPException as error:
+            print(f"tournament {record['Id']}: couldn't flatten the champion "
+                  f"role -- {error}")
+
 async def crown_winner(record, discord_id):
+    """Give the winner this tournament's role and the shared champion role.
+
+    Each is given even if the other can't be. True only if both landed.
+    """
     guild, role = await members_with_role(record, "WinnerRoleId")
-    if role is None:
+    if guild is None:
         return False
     member = guild.get_member(int(discord_id))
     if member is None:
         return False
+    wanted = (role, manageable_role(guild, int(CHAMPION_ROLE_ID)))
+    roles = [item for item in wanted if item is not None]
+    if not roles:
+        return False
     try:
-        await member.add_roles(role, reason="Won the tournament")
-        return True
+        await member.add_roles(*roles, reason="Won the tournament")
     except discord.HTTPException:
         return False
+    return len(roles) == len(wanted)
+
+async def won_another_tournament(record, discord_id):
+    for entry in await read_tournament_index():
+        if (not isinstance(entry, dict) or entry.get("Phase") != "done"
+                or entry["Id"] == record["Id"]):
+            continue
+        other = await read_tournament(entry["Id"])
+        if other and (other.get("Winner") or {}).get("DiscordId") == discord_id:
+            return True
+    return False
 
 def tournament_info_card(record):
     """The player-facing summary pinned in #info at creation.
@@ -11243,8 +11290,8 @@ async def crown_champion(record, decided=None):
 
     note = ""
     if winner_discord_id and not crowned:
-        note = ("\n-# Couldn't hand out the champion role — check that mine "
-                "sits above it and that they're still in the server.")
+        note = ("\n-# Couldn't hand out the champion roles — check that mine "
+                "sits above them and that they're still in the server.")
 
     await announce_tournament(saved, simple_card(
         "\n".join(podium)
@@ -12660,10 +12707,14 @@ async def reopen_match(record, match_id, match):
     champion = (record.get("Winner") or {}).get("DiscordId")
     if record["Phase"] == "done" and champion:
         guild, role = await members_with_role(record, "WinnerRoleId")
-        member = guild.get_member(int(champion)) if role is not None else None
+        member = guild.get_member(int(champion)) if guild is not None else None
         if member is not None:
+            # The shared role stays if another tournament earned it too.
+            shared = (None if await won_another_tournament(record, champion)
+                      else manageable_role(guild, int(CHAMPION_ROLE_ID)))
+            roles = [item for item in (role, shared) if item is not None]
             try:
-                await member.remove_roles(role, reason="Final reopened")
+                await member.remove_roles(*roles, reason="Final reopened")
             except discord.HTTPException:
                 pass
 
