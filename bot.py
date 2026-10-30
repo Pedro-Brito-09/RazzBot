@@ -5450,9 +5450,10 @@ async def cache_command(ctx):
     ]
     await ctx.send(view=simple_card(
         "\n\n".join(entries)
-        + "\n\n-# Nothing refetches on a timer: the first command that needs "
-          "expired data fetches it. Someone missing from the linked accounts "
-          "is always read fresh.",
+        + "\n\n-# Nothing refetches on a timer: the first read of expired "
+          "data fetches it. Tournament writes skip that and keep using the "
+          "remembered record until the store refuses one. Someone missing "
+          "from the linked accounts is always read fresh.",
         heading="🗄️ Cache",
     ))
 
