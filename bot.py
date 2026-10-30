@@ -5387,6 +5387,66 @@ async def admin_clearcache(ctx, which: str = None):
         CACHE_CLEARERS[name](universe)
     await ctx.send(f"🧹 Cleared: {', '.join(names)}")
 
+def cache_status(label, ttl, stamps, unit=None):
+    """One /cache entry from the monotonic times its data was stored.
+
+    unit marks a cache of many entries, which is summed up rather than listed:
+    /cache is public, and those are keyed by player and tournament. Nothing
+    evicts them, so entries past ttl are left out of the count.
+    """
+    now = time.monotonic()
+    def timestamp(stamp):
+        return f"<t:{int(time.time() + stamp - now)}:R>"
+
+    refresh = f"{ttl // 60} min" if ttl >= 60 else f"{ttl}s"
+    title = f"**{label}**\n-# Refreshes after {refresh}"
+    if not stamps:
+        return f"{title}\nNot cached yet"
+
+    live = [stamp for stamp in stamps if now - stamp < ttl]
+    if not live:
+        return (f"{title}\nLast cached {timestamp(max(stamps))} · "
+                "expired, next use fetches")
+
+    status = (f"Last cached {timestamp(max(live))} · "
+              f"next fetch {timestamp(min(live) + ttl)}")
+    if unit:
+        status = f"{len(live)} {unit}{'' if len(live) == 1 else 's'} · {status}"
+    return f"{title}\n{status}"
+
+@bot.hybrid_command(name="cache", description="See when the bot's data was last cached and when it fetches again")
+async def cache_command(ctx):
+    universe = current_universe()
+    def stamp_of(entry):
+        return [entry[0]] if entry else []
+
+    maps = _maps_cache.get(universe)
+    entries = [
+        cache_status("Community maps", MAPS_CACHE_TTL,
+                     [maps["at"]] if maps else []),
+        cache_status("Game badge list", UNIVERSE_BADGES_CACHE_TTL,
+                     stamp_of(_universe_badges_cache.get(universe))),
+        cache_status("Reward catalog", REWARD_CATALOG_TTL,
+                     stamp_of(_reward_catalog_cache.get(universe))),
+        cache_status("Linked accounts", LINKED_CACHE_TTL,
+                     stamp_of(_linked_cache.get(universe))),
+        cache_status("Player badges", OWNED_BADGES_CACHE_TTL,
+                     [entry[0] for key, entry in _owned_badges_cache.items()
+                      if key[0] == universe],
+                     unit="player"),
+        cache_status("Tournament entries", TOURNAMENT_CACHE_SECONDS,
+                     [entry["at"] for slot, entry in _tournament_cache.items()
+                      if slot[0] == str(universe)],
+                     unit="record"),
+    ]
+    await ctx.send(view=simple_card(
+        "\n\n".join(entries)
+        + "\n\n-# Nothing refetches on a timer: the first command that needs "
+          "expired data fetches it. Someone missing from the linked accounts "
+          "is always read fresh.",
+        heading="🗄️ Cache",
+    ))
+
 async def announce_restart_done():
     """Tell the channel that ran !restart that the new process is up."""
     try:
