@@ -266,6 +266,8 @@ TOURNAMENT_ROLE_ID = (os.getenv("TOURNAMENT_ROLE_ID")
 # Every tournament winner holds this role, and each tournament's own champion
 # role sits directly below it in the list.
 CHAMPION_ROLE_ID = os.getenv("CHAMPION_ROLE_ID") or "1565808397109043260"
+# Held by whoever is wearing this server's tag, and only while they wear it.
+SERVER_TAG_ROLE_ID = os.getenv("SERVER_TAG_ROLE_ID") or "1565807324398882886"
 # A permanent record of every tournament that finishes: its top 3. Lives
 # outside the tournament's category, so !tournament cleanup never takes it.
 TOURNAMENT_LOG_CHANNEL_ID = (os.getenv("TOURNAMENT_LOG_CHANNEL_ID")
@@ -305,6 +307,7 @@ _synced = False
 _tournament_views_bound = False
 # Older champion roles are unhoisted once per process, in on_ready.
 _champion_roles_flattened = False
+_server_tag_sync_task = None
 _session = None
 
 # Which universe the command currently running should talk to. A ContextVar
@@ -1879,6 +1882,43 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
     if remove:
         await member.remove_roles(*remove, reason="RazzBot role sync")
     return add, remove, blocked
+
+def wears_server_tag(member):
+    tag = member.primary_guild
+    return bool(tag.identity_enabled) and tag.id == member.guild.id
+
+async def sync_server_tag_role(member):
+    """Give or take the tag role. Quietly skips a guild without that role."""
+    role = manageable_role(member.guild, int(SERVER_TAG_ROLE_ID))
+    if role is None:
+        return
+    wearing = wears_server_tag(member)
+    if wearing == (role in member.roles):
+        return
+    try:
+        if wearing:
+            await member.add_roles(role, reason="Wearing the server tag")
+        else:
+            await member.remove_roles(role, reason="Stopped wearing the server tag")
+    except discord.HTTPException as error:
+        print(f"Couldn't update the server tag role for {member.id}: {error}")
+
+async def sync_server_tag_roles():
+    """Catch up on tags changed while the bot wasn't listening."""
+    for guild in bot.guilds:
+        for member in guild.members:
+            await sync_server_tag_role(member)
+
+@bot.event
+async def on_user_update(_before, after):
+    for guild in after.mutual_guilds:
+        member = guild.get_member(after.id)
+        if member is not None:
+            await sync_server_tag_role(member)
+
+@bot.event
+async def on_member_join(member):
+    await sync_server_tag_role(member)
 
 # The Linked table as last read, per universe: {discord id: roblox id}.
 _linked_cache = {}
@@ -4159,10 +4199,14 @@ async def remember_invoker(ctx):
 
 @bot.event
 async def on_ready():
-    global _synced, _link_expiration_restore_task
+    global _synced, _link_expiration_restore_task, _server_tag_sync_task
     print(f"Logged in as {bot.user}")
 
     await announce_restart_done()
+
+    # Every ready, not just the first: a reconnect can miss tag changes too.
+    if _server_tag_sync_task is None or _server_tag_sync_task.done():
+        _server_tag_sync_task = asyncio.create_task(sync_server_tag_roles())
 
     if (
         not _link_expirations_restored
