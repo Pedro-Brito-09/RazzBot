@@ -5347,6 +5347,138 @@ async def invite(ctx):
 async def game(ctx):
     await ctx.send(GAME_URL)
 
+STATS_COLOR = discord.Color(0x3BA55D)
+
+async def fetch_game_stats(universe_id):
+    """The game page's public numbers, read live -> dict, or None on failure.
+
+    Three public endpoints, fetched together. Only the details call is
+    required; votes and the icon are decoration and may come back empty.
+    """
+    details, votes, icons = await asyncio.gather(
+        request_json(f"https://games.roblox.com/v1/games?universeIds={universe_id}",
+                     label=f"Game details {universe_id}"),
+        request_json(f"https://games.roblox.com/v1/games/votes?universeIds={universe_id}",
+                     label=f"Game votes {universe_id}"),
+        request_json(
+            "https://thumbnails.roblox.com/v1/games/icons"
+            f"?universeIds={universe_id}&size=512x512&format=Png&isCircular=false",
+            label=f"Game icon {universe_id}",
+        ),
+    )
+    game_data = next(iter(dig(details, "data", default=None) or []), None)
+    if not isinstance(game_data, dict):
+        return None
+    vote_data = next(iter(dig(votes, "data", default=None) or []), None) or {}
+    icon_data = next(iter(dig(icons, "data", default=None) or []), None) or {}
+    return {
+        **game_data,
+        "upVotes": vote_data.get("upVotes"),
+        "downVotes": vote_data.get("downVotes"),
+        "iconUrl": (icon_data.get("imageUrl")
+                    if icon_data.get("state") == "Completed" else None),
+    }
+
+def parse_roblox_time(text):
+    """Roblox's ISO stamps ('2025-10-20T21:16:12.25Z') -> epoch seconds."""
+    if not text:
+        return None
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+class GameStatsView(CardView):
+    """The live game page numbers, with a button to read them again."""
+
+    def __init__(self, stats):
+        super().__init__()
+        self.build(stats)
+
+    def build(self, stats):
+        self.clear_items()
+        container = discord.ui.Container(accent_colour=STATS_COLOR)
+
+        name = (stats.get("name") or "").strip() or "The game"
+        heading = f"## 📊 {name}\n-# Live stats from the game page"
+        if stats.get("iconUrl"):
+            container.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(heading),
+                accessory=discord.ui.Thumbnail(media=stats["iconUrl"]),
+            ))
+        else:
+            container.add_item(discord.ui.TextDisplay(heading))
+        container.add_item(discord.ui.Separator())
+
+        lines = [
+            f"🟢 **Playing now:** {format_number(stats.get('playing'))}",
+            f"👀 **Visits:** {format_number(stats.get('visits'))}",
+            f"⭐ **Favorites:** {format_number(stats.get('favoritedCount'))}",
+        ]
+        up, down = stats.get("upVotes"), stats.get("downVotes")
+        if isinstance(up, int) and isinstance(down, int):
+            total = up + down
+            rating = f" ({up / total:.0%} liked)" if total else ""
+            lines.append(f"👍 **Likes:** {format_number(up)}  ·  "
+                         f"👎 **Dislikes:** {format_number(down)}{rating}")
+        if stats.get("maxPlayers"):
+            lines.append(f"👥 **Server size:** {stats['maxPlayers']} players")
+        container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+
+        footer = []
+        created = parse_roblox_time(stats.get("created"))
+        updated = parse_roblox_time(stats.get("updated"))
+        if created:
+            footer.append(f"created <t:{created}:D>")
+        if updated:
+            footer.append(f"updated <t:{updated}:R>")
+        footer.append(f"fetched <t:{int(time.time())}:R>")
+        container.add_item(discord.ui.TextDisplay("-# " + "  ·  ".join(footer)))
+
+        note = dev_universe_note()
+        if note:
+            container.add_item(discord.ui.TextDisplay(note))
+
+        path = stats.get("canonicalUrlPath")
+        page_url = f"https://www.roblox.com{path}" if path else GAME_URL
+        refresh = discord.ui.Button(
+            label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄",
+        )
+        refresh.callback = self.refresh
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(
+            label="Game page", style=discord.ButtonStyle.link, url=page_url,
+        ))
+        row.add_item(refresh)
+        container.add_item(row)
+        self.add_item(container)
+
+    @keeps_context
+    async def refresh(self, interaction):
+        await interaction.response.defer()
+        stats = await fetch_game_stats(current_universe())
+        if stats is None:
+            await interaction.followup.send(
+                "Couldn't reach the game page right now. Try again in a bit.",
+                ephemeral=True,
+            )
+            return
+        self.build(stats)
+        await interaction.edit_original_response(view=self)
+
+@bot.hybrid_command(name="stats", description="Live game stats: players online, visits, likes and favorites")
+async def stats_command(ctx):
+    await ctx.defer()
+    stats = await fetch_game_stats(current_universe())
+    if stats is None:
+        await ctx.send(view=simple_card(
+            "Couldn't reach the game page right now. Try again in a bit.",
+            colour=discord.Color.red(),
+        ))
+        return
+    view = GameStatsView(stats)
+    view.message = await ctx.send(view=view)
+
 @bot.hybrid_command(description="Get the link to the Roblox group")
 async def group(ctx):
     await ctx.send(GROUP_URL)
