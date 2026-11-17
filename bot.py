@@ -1388,37 +1388,72 @@ async def list_data_stores():
         label="list_data_stores",
     )
 
-async def list_data_store_keys(datastore, prefix=None, *, limit=DATASTORE_LIST_LIMIT):
+# Listing a store's entries returns each key with its scope in front --
+# "global/114213348" -- and the list filter matches against that form too.
+DEFAULT_ENTRY_SCOPE = "global/"
+
+def data_store_entries_url(datastore):
+    return (
+        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}"
+        f"/data-stores/{quote(datastore, safe='')}/entries"
+    )
+
+async def data_store_scope_prefix(datastore):
+    """"global/" when this store lists its keys scoped, else "".
+
+    One small page tells: every listed id carries the scope or none do.
+    """
+    status, ids, _ = await walk_cloud_list(
+        data_store_entries_url(datastore), "dataStoreEntries",
+        label=f"data_store_scope_prefix({datastore})", limit=1,
+    )
+    if status == "ok" and ids and str(ids[0]).startswith(DEFAULT_ENTRY_SCOPE):
+        return DEFAULT_ENTRY_SCOPE
+    return ""
+
+def unscoped_key(identifier, scope_prefix):
+    """The key `!datastore get` takes. Other scopes keep their prefix."""
+    if scope_prefix and identifier.startswith(scope_prefix):
+        return identifier[len(scope_prefix):]
+    return identifier
+
+async def list_data_store_keys(datastore, prefix=None, *, limit=DATASTORE_LIST_LIMIT,
+                               scope_prefix=None):
     """Keys in one data store, as (status, keys, truncated).
 
+    Keys come back without the default scope, ready for `!datastore get`.
     A prefix is pushed to Roblox, which is the only way to narrow a store
     holding more keys than the walk limit. If it refuses the expression the
     walk runs unfiltered and the prefix is applied here instead.
     """
-    url = (
-        f"https://apis.roblox.com/cloud/v2/universes/{current_universe()}"
-        f"/data-stores/{quote(datastore, safe='')}/entries"
-    )
+    url = data_store_entries_url(datastore)
     label = f"list_data_store_keys({datastore})"
+    if scope_prefix is None:
+        scope_prefix = await data_store_scope_prefix(datastore)
+
+    def strip(result):
+        status, ids, truncated = result
+        return status, [unscoped_key(i, scope_prefix) for i in ids], truncated
 
     if not prefix:
-        return await walk_cloud_list(url, "dataStoreEntries", label=label, limit=limit)
+        return strip(await walk_cloud_list(url, "dataStoreEntries", label=label, limit=limit))
 
+    full_prefix = scope_prefix + prefix
     # The filter is a quoted string, so the prefix can't carry its own quote.
-    escaped = prefix.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = full_prefix.replace("\\", "\\\\").replace('"', '\\"')
     expression = 'id.startsWith("' + escaped + '")'
     status, keys, truncated = await walk_cloud_list(
         url, "dataStoreEntries", label=label,
         query="filter=" + quote(expression, safe=""), limit=limit,
     )
     if status != "rejected":
-        return status, keys, truncated
+        return strip((status, keys, truncated))
 
     print(f"{label}: filter refused, narrowing locally instead")
     status, keys, truncated = await walk_cloud_list(
         url, "dataStoreEntries", label=label, limit=limit,
     )
-    return status, [key for key in keys if key.startswith(prefix)], truncated
+    return strip((status, [key for key in keys if key.startswith(full_prefix)], truncated))
 
 # Where a key that isn't a player ID can start. Keys list in sorted order,
 # digits first, so in a store with a key per player the named keys come
@@ -1431,10 +1466,11 @@ DATASTORE_WALK_CONCURRENCY = 4
 async def list_data_store_named_keys(datastore):
     """Keys not starting with a digit, as (status, keys, truncated)."""
     semaphore = asyncio.Semaphore(DATASTORE_WALK_CONCURRENCY)
+    scope_prefix = await data_store_scope_prefix(datastore)
 
     async def walk(start):
         async with semaphore:
-            return await list_data_store_keys(datastore, start)
+            return await list_data_store_keys(datastore, start, scope_prefix=scope_prefix)
 
     results = await asyncio.gather(*(walk(start) for start in NAMED_KEY_STARTS))
     keys, truncated = [], False
