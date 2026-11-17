@@ -209,18 +209,6 @@ def format_date(timestamp):
     return f"{moment:%b} {moment.day}, {moment.year}"
 
 
-def format_ago(timestamp, now=None):
-    now = now if now is not None else datetime.now(timezone.utc).timestamp()
-    seconds = max(0, int(now - timestamp))
-    for size, unit in ((365 * 86400, "year"), (30 * 86400, "month"),
-                       (7 * 86400, "week"), (86400, "day"), (3600, "hour"),
-                       (60, "minute")):
-        if seconds >= size:
-            count = seconds // size
-            return f"{count} {unit}{'' if count == 1 else 's'} ago"
-    return "just now"
-
-
 def fit_text(text, face, size, max_width, *, min_size, **style):
     """The largest size from `size` down to `min_size` that fits, or None."""
     while size >= min_size:
@@ -630,11 +618,11 @@ def compose_profile_card(*, username, avatar_png=None, tag=None, stars=0,
         games_played, wins, win_streak, flags_reached, kills, deaths,
         furthest_round, f"{format_count(login_streak)} / {format_count(login_streak_best)}",
     ])
-    left = [f"ID {user_id}"] if user_id is not None else []
-    if joined is not None:
-        left.append(f"joined {format_date(joined)}")
-    right = f"last seen {format_ago(last_seen)}" if last_seen is not None else ""
-    draw_footer(above, " · ".join(left), right, footer_outline)
+    # Last seen lives in the message under the card, as a Discord timestamp
+    # that stays current; baked into the picture it would go stale.
+    left = f"ID {user_id}" if user_id is not None else ""
+    right = f"joined {format_date(joined)}" if joined is not None else ""
+    draw_footer(above, left, right, footer_outline)
 
     corners = rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24)
     return clip_to(below, corners), clip_to(above, corners), banner
