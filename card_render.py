@@ -12,7 +12,9 @@ asyncio.to_thread so a render never blocks the gateway.
 
 import functools
 import io
+import math
 import os
+import threading
 from datetime import datetime, timezone
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
@@ -394,8 +396,11 @@ def draw_stars_strip(canvas, stars, stars_all_time):
     return left
 
 
-def draw_name_banner(canvas, username, max_right):
-    """The purple name strip. Long names shrink, then lose their tail."""
+def draw_name_banner(canvas, username, max_right, with_text=True):
+    """The purple name strip. Long names shrink, then lose their tail.
+
+    Returns where it landed, so an animated card can redraw the name alone.
+    """
     outline = rgba("#5E37B8")
     room = max_right - 130 - 74 - 36
     style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=5)
@@ -408,9 +413,20 @@ def draw_name_banner(canvas, username, max_right):
     width = 74 + name.width + 36
     height = 12 + name.height + 6
     body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER,
-                 lambda image, draw: name.draw(draw, 74, 12))
-    place(canvas, with_drop_shadow(body, 5), 130, 86 + (52 - name.height) / 2,
-          width, height)
+                 (lambda image, draw: name.draw(draw, 74, 12)) if with_text else None)
+    top = 86 + (52 - name.height) / 2
+    layer = with_drop_shadow(body, 5)
+    place(canvas, layer, 130, top, width, height)
+    # Where place() put the strip itself, inside the padded shadow layer.
+    x0 = px(130 + width / 2) - layer.width // 2 + px(12)
+    y0 = px(top + height / 2) - layer.height // 2 + px(12)
+    return {
+        "name": name,
+        "box": (x0, y0, x0 + body.width, y0 + body.height),
+        "mask": polygon_mask(width, height, CLIP_BANNER),
+        "text_at": (74, 12),
+        "outline": outline,
+    }
 
 
 def draw_tags(canvas, tags):
@@ -520,12 +536,46 @@ def open_image(data):
         return None
 
 
-def render_profile_card(*, username, avatar_png=None, tag=None, stars=0,
-                        stars_all_time=0, medals=(0, 0, 0, 0), games_played=0,
-                        wins=None, win_streak=0, flags_reached=0, kills=0,
-                        deaths=0, furthest_round=0, login_streak=0,
-                        login_streak_best=0, user_id=None, joined=None,
-                        last_seen=None, background_png=None):
+def compose_profile_card(*, username, avatar_png=None, tag=None, stars=0,
+                         stars_all_time=0, medals=(0, 0, 0, 0), games_played=0,
+                         wins=None, win_streak=0, flags_reached=0, kills=0,
+                         deaths=0, furthest_round=0, login_streak=0,
+                         login_streak_best=0, user_id=None, joined=None,
+                         last_seen=None, background_png=None, with_name=True):
+    """The card as two layers either side of the name: (below, above, banner).
+
+    The avatar tile overlaps the name banner, so an animated name has to go
+    between them. With with_name the name is drawn into `below` as usual.
+    """
+    avatar = open_image(avatar_png)
+    background = open_image(background_png)
+    size = (px(CARD_WIDTH), px(CARD_HEIGHT))
+
+    below = Image.new("RGBA", size, (0, 0, 0, 0))
+    footer_outline = draw_background(below, roblox_name_color(username), background)
+    stars_left = draw_stars_strip(below, stars, stars_all_time)
+    banner = draw_name_banner(below, username, stars_left - 16, with_text=with_name)
+
+    above = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw_avatar(above, avatar)
+    if tag:
+        draw_tags(above, [(str(tag).upper(), "#C9A6FF", "#7A52CC", None)])
+    draw_medals(above, medals)
+    draw_stat_grid(above, [
+        games_played, wins, win_streak, flags_reached, kills, deaths,
+        furthest_round, f"{format_count(login_streak)} / {format_count(login_streak_best)}",
+    ])
+    left = [f"ID {user_id}"] if user_id is not None else []
+    if joined is not None:
+        left.append(f"joined {format_date(joined)}")
+    right = f"last seen {format_ago(last_seen)}" if last_seen is not None else ""
+    draw_footer(above, " · ".join(left), right, footer_outline)
+
+    corners = rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24)
+    return clip_to(below, corners), clip_to(above, corners), banner
+
+
+def render_profile_card(**fields):
     """The /profile card as PNG bytes.
 
     `medals` is (gold, silver, bronze, diamond). `joined` and `last_seen`
@@ -533,31 +583,335 @@ def render_profile_card(*, username, avatar_png=None, tag=None, stars=0,
     `background_png` (a map thumbnail) replaces the backdrop, which is
     otherwise the username's Roblox chat colour.
     """
-    avatar = open_image(avatar_png)
-    background = open_image(background_png)
-
-    canvas = Image.new("RGBA", (px(CARD_WIDTH), px(CARD_HEIGHT)), (0, 0, 0, 0))
-    footer_outline = draw_background(canvas, roblox_name_color(username), background)
-
-    stars_left = draw_stars_strip(canvas, stars, stars_all_time)
-    draw_name_banner(canvas, username, stars_left - 16)
-    draw_avatar(canvas, avatar)
-    if tag:
-        draw_tags(canvas, [(str(tag).upper(), "#C9A6FF", "#7A52CC", None)])
-    draw_medals(canvas, medals)
-
-    draw_stat_grid(canvas, [
-        games_played, wins, win_streak, flags_reached, kills, deaths,
-        furthest_round, f"{format_count(login_streak)} / {format_count(login_streak_best)}",
-    ])
-
-    left = [f"ID {user_id}"] if user_id is not None else []
-    if joined is not None:
-        left.append(f"joined {format_date(joined)}")
-    right = f"last seen {format_ago(last_seen)}" if last_seen is not None else ""
-    draw_footer(canvas, " · ".join(left), right, footer_outline)
-
-    canvas = clip_to(canvas, rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24))
+    below, above, _ = compose_profile_card(**fields)
+    below.alpha_composite(above)
     out = io.BytesIO()
-    canvas.save(out, format="PNG", optimize=False, compress_level=6)
+    below.save(out, format="PNG", optimize=False, compress_level=6)
     return out.getvalue()
+
+
+# ---------------------------------------------------------------- animated name
+
+# One animated render at a time: its frames are held in memory until the
+# encoder has them all, and the VPS caps the bot at 400 MB.
+ANIMATION_LOCK = threading.Lock()
+# Frame counts and per-frame delays tried when fitting a seamless loop. GIF
+# delays are whole 10 ms steps, so these stay multiples of 10.
+LOOP_FRAMES = range(20, 49)
+LOOP_DELAYS_MS = (50, 60, 70, 80, 90, 100)
+# A motion that would turn less than this many times even in the longest
+# loop is held still: rounding it up to a whole turn would at least double
+# its speed, which looks further from the game than not moving.
+MIN_LOOP_CYCLES = 0.6
+# Effect gradients are smooth, so they're computed at this fraction of the
+# card's resolution and scaled up.
+GRADIENT_RESOLUTION = 0.5
+# Sequence lookup-table size.
+GRADIENT_SAMPLES = 512
+# GIF has one palette slot for "see-through", used for the rounded corners.
+GIF_TRANSPARENT = 255
+
+
+def _sequence_table(stops, kind):
+    """GRADIENT_SAMPLES values of a keypoint sequence, wrapping like ezVisualz.
+
+    ezVisualz scrolls a gradient by moving every keypoint along and wrapping
+    it round, so the sequence behaves as if it repeats: past the last
+    keypoint it carries on from the first one again.
+    """
+    points = sorted(stops)
+    extended = ([(points[-1][0] - 1, points[-1][1])] + points
+                + [(points[0][0] + 1, points[0][1])])
+    table = []
+    for i in range(GRADIENT_SAMPLES):
+        u = i / GRADIENT_SAMPLES
+        for (t0, v0), (t1, v1) in zip(extended, extended[1:]):
+            if t0 <= u < t1:
+                f = (u - t0) / (t1 - t0)
+                if kind == "color":
+                    table.append(bytes(round(a + (b - a) * f) for a, b in zip(v0, v1)))
+                else:
+                    # Transparency 0-1 -> opacity 255-0.
+                    table.append(bytes((round((1 - (v0 + (v1 - v0) * f)) * 255),)))
+                break
+    return table
+
+
+def _gradient_image(table, mode, angle, offset, box, size):
+    """A UIGradient-like fill for a `size` image: colours from `table`, along
+    `angle` (degrees clockwise), scrolled by `offset`, spanning `box`.
+
+    Like a UIGradient it spans the label's box, not the image, so a stroke
+    spilling outside the box gets the end colours.
+    """
+    k = GRADIENT_RESOLUTION
+    width, height = max(1, round(size[0] * k)), max(1, round(size[1] * k))
+    bx0, by0, bx1, by1 = (v * k for v in box)
+    cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
+    theta = math.radians(angle)
+    # Half the box's extent along the gradient's direction.
+    reach = max(1.0, (bx1 - bx0) / 2 * abs(math.cos(theta))
+                + (by1 - by0) / 2 * abs(math.sin(theta)))
+    far = max(math.hypot(x - cx, y - cy) for x in (0, width) for y in (0, height))
+    side = int(far * 2) + 4
+
+    row = bytearray()
+    samples = len(table)
+    for x in range(side):
+        t = min(1.0, max(0.0, (x + 0.5 - side / 2 + reach) / (2 * reach)))
+        row += table[int(((t - offset) % 1.0) * samples) % samples]
+    line = Image.frombytes(mode, (side, 1), bytes(row))
+    square = line.resize((side, side), Image.NEAREST).rotate(-angle, resample=Image.BILINEAR)
+    left, top = round(side / 2 - cx), round(side / 2 - cy)
+    crop = square.crop((left, top, left + width, top + height))
+    return crop.resize(size, Image.BILINEAR)
+
+
+def _loop_rates(effect):
+    """Every repeating motion in the effect, as (key, cycles per second)."""
+    rates = []
+    for part in ("fill", "stroke"):
+        layer = effect.get(part)
+        if not layer:
+            continue
+        rates.append(((part, "speed"), layer["speed"]))
+        if layer["transparency"]:
+            rates.append(((part, "transparency_speed"), layer["transparency_speed"]))
+        angle = layer["angle"]
+        if isinstance(angle, tuple) and angle[0] == "spin":
+            rates.append(((part, "spin"), angle[2] / 360))
+        elif isinstance(angle, tuple) and angle[0] == "wobble":
+            rates.append(((part, "wobble"), angle[3] / (2 * math.pi)))
+    if effect.get("pulse"):
+        rates.append((("pulse", "pulse"), effect["pulse"][2] / (2 * math.pi)))
+    return [(key, rate) for key, rate in rates if rate]
+
+
+def plan_loop(effect):
+    """Frames, delay (ms) and whole-cycle counts per motion for a seamless loop.
+
+    Each motion is rounded to a whole number of cycles over the loop (or
+    held still if it would barely move), picking the frame count and delay
+    that change the effect's speeds the least.
+    """
+    rates = _loop_rates(effect)
+    # A motion that can't get far even in the longest loop is held still;
+    # every other one has to move, whatever loop length is picked.
+    longest = max(LOOP_FRAMES) * max(LOOP_DELAYS_MS) / 1000
+    moving = {key for key, rate in rates if abs(rate) * longest >= MIN_LOOP_CYCLES}
+    best = None
+    for delay in LOOP_DELAYS_MS:
+        for frames in LOOP_FRAMES:
+            duration = frames * delay / 1000
+            # Fewer frames save memory, but long delays look choppy; the
+            # latter matters more.
+            cost, cycles = frames * 0.001 + (delay - 50) * 0.002, {}
+            for key, rate in rates:
+                if key not in moving:
+                    cycles[key] = 0
+                    continue
+                actual = abs(rate) * duration
+                whole = max(1, round(actual))
+                cost += abs(whole - actual) / actual
+                cycles[key] = whole if rate > 0 else -whole
+            if best is None or cost < best[0]:
+                best = (cost, frames, delay, cycles)
+    _, frames, delay, cycles = best
+    return frames, delay, cycles
+
+
+def _layer_state(layer, part, cycles, phase):
+    """Angle, colour offset and transparency offset at loop position `phase` (0-1)."""
+    angle = layer["angle"]
+    if isinstance(angle, tuple) and angle[0] == "spin":
+        angle = angle[1] + 360 * cycles.get((part, "spin"), 0) * phase
+    elif isinstance(angle, tuple) and angle[0] == "wobble":
+        _, centre, amplitude, _ = angle
+        angle = centre + amplitude * math.sin(
+            2 * math.pi * cycles.get((part, "wobble"), 0) * phase)
+    offset = layer["offset"] + cycles.get((part, "speed"), 0) * phase
+    transparency_offset = cycles.get((part, "transparency_speed"), 0) * phase
+    return angle, offset, transparency_offset
+
+
+def _stroke_factor(effect, cycles, phase):
+    """The card outline's width multiplier for a pulsing stroke.
+
+    ezVisualz pulses a thin in-game stroke by up to 3x; the card's outline
+    is already chunky, so the swing is toned down to stay readable.
+    """
+    pulse = effect.get("pulse")
+    if not pulse:
+        return 1.0
+    low, high, _ = pulse
+    wave = (math.sin(2 * math.pi * cycles.get(("pulse", "pulse"), 0) * phase) + 1) / 2
+    multiplier = low + (high - low) * wave
+    return min(1.8, max(0.6, 1 + (multiplier - 1) * 0.35))
+
+
+class NameAnimator:
+    """Draws the name banner's text for one frame of a username effect."""
+
+    def __init__(self, banner, effect, cycles):
+        self.effect = effect
+        self.cycles = cycles
+        name = banner["name"]
+        self.name = name
+        x0, y0, x1, y1 = banner["box"]
+        self.size = (x1 - x0, y1 - y0)
+        self.clip = banner["mask"]
+        tx, ty = banner["text_at"]
+        self.origin = (px(tx), px(ty + name.baseline))
+        self.stroke_width = round(name.stroke * SCALE / 2)
+        # The label's box, which the gradients span.
+        self.text_box = (px(tx), px(ty), px(tx + name.width), px(ty + name.height))
+        outline = banner["outline"]
+
+        self.fill_mask = self._mask(0)
+        self.full_mask = self._mask(self.stroke_width)
+        # Under every effect: the card's own shadow and purple outline, so
+        # transparent parts of an effect fall back to the normal look.
+        base = Image.new("RGBA", self.size, (0, 0, 0, 0))
+        base.paste(outline, (0, 0), self._mask(self.stroke_width, dy=px(name.shadow)))
+        base.paste(outline, (0, 0), self.full_mask)
+        if not effect.get("fill"):
+            base.paste(WHITE, (0, 0), self.fill_mask)
+        self.base = base
+
+        self.tables = {}
+        for part in ("fill", "stroke"):
+            layer = effect.get(part)
+            if layer:
+                self.tables[part] = (
+                    _sequence_table(layer["colors"], "color"),
+                    _sequence_table(layer["transparency"], "alpha")
+                    if layer["transparency"] else None,
+                )
+
+    def _mask(self, stroke_width, dy=0):
+        mask = Image.new("L", self.size, 0)
+        ImageDraw.Draw(mask).text(
+            (self.origin[0], self.origin[1] + dy), self.name.text, font=self.name.font,
+            fill=255, anchor="ls", stroke_width=stroke_width, stroke_fill=255,
+        )
+        return mask
+
+    def _paint(self, image, part, mask, phase):
+        layer = self.effect[part]
+        colors, alphas = self.tables[part]
+        angle, offset, transparency_offset = _layer_state(layer, part, self.cycles, phase)
+        color = _gradient_image(colors, "RGB", angle, offset, self.text_box, self.size)
+        if alphas is not None:
+            mask = ImageChops.multiply(mask, _gradient_image(
+                alphas, "L", angle, transparency_offset, self.text_box, self.size))
+        image.paste(color, (0, 0), mask)
+
+    def frame(self, phase):
+        """The text layer (banner-sized, clipped to the strip) at `phase` 0-1."""
+        image = self.base.copy()
+        if self.effect.get("stroke"):
+            factor = _stroke_factor(self.effect, self.cycles, phase)
+            width = max(1, round(self.stroke_width * factor))
+            mask = self.full_mask if width == self.stroke_width else self._mask(width)
+            self._paint(image, "stroke", mask, phase)
+            if not self.effect.get("fill"):
+                image.paste(WHITE, (0, 0), self.fill_mask)
+        if self.effect.get("fill"):
+            self._paint(image, "fill", self.fill_mask, phase)
+        return clip_to(image, self.clip)
+
+
+def _even_box(box, size):
+    """Grow a box to even coordinates, so it halves exactly."""
+    x0, y0, x1, y1 = box
+    x0, y0 = x0 - x0 % 2, y0 - y0 % 2
+    x1, y1 = min(size[0], x1 + x1 % 2), min(size[1], y1 + y1 % 2)
+    return x0, y0, x1, y1
+
+
+def render_profile_card_animated(effect, image_format="gif", **fields):
+    """The card with the username effect playing, as (bytes, extension).
+
+    Rendered at half the PNG's resolution, since every frame is held in
+    memory until encoded. Only the name banner changes between frames, so
+    it's the only part redrawn.
+    """
+    with ANIMATION_LOCK:
+        below, above, banner = compose_profile_card(with_name=False, **fields)
+        frames_count, delay, cycles = plan_loop(effect)
+        animator = NameAnimator(banner, effect, cycles)
+
+        full_size = below.size
+        half_size = (full_size[0] // 2, full_size[1] // 2)
+        region = _even_box(banner["box"], full_size)
+        bx0, by0 = banner["box"][:2]
+        below_region, above_region = below.crop(region), above.crop(region)
+        still = below.copy()
+        still.alpha_composite(above)
+        still = still.resize(half_size, Image.LANCZOS)
+        del below, above
+
+        def region_frame(index):
+            patch = below_region.copy()
+            patch.alpha_composite(animator.frame(index / frames_count),
+                                  (bx0 - region[0], by0 - region[1]))
+            patch.alpha_composite(above_region)
+            return patch.resize(((region[2] - region[0]) // 2, (region[3] - region[1]) // 2),
+                                Image.LANCZOS)
+
+        at = (region[0] // 2, region[1] // 2)
+        out = io.BytesIO()
+        if image_format == "webp":
+            frames = []
+            for index in range(frames_count):
+                frame = still.copy()
+                frame.paste(region_frame(index), at)
+                frames.append(frame)
+            frames[0].save(out, format="WEBP", save_all=True, append_images=frames[1:],
+                           duration=delay, loop=0, quality=88, method=4)
+            return out.getvalue(), "webp"
+
+        patches = [region_frame(index) for index in range(frames_count)]
+        frames = _gif_frames(still, patches, at)
+        frames[0].save(out, format="GIF", save_all=True, append_images=frames[1:],
+                       duration=delay, loop=0, transparency=GIF_TRANSPARENT,
+                       disposal=1, optimize=False)
+        return out.getvalue(), "gif"
+
+
+def _gif_frames(still, patches, at):
+    """Palette frames sharing one palette, differing only inside the patch.
+
+    Quantising each whole frame would dither the still parts differently
+    every time, and the GIF would then store the whole card per frame. So
+    the still card is quantised once, and each frame only its patch.
+    """
+    matte = Image.new("RGB", still.size, (0, 0, 0))
+    matte.paste(still, (0, 0), still)
+    # The palette has to cover the effect's colours as well as the card's.
+    samples = patches[::max(1, len(patches) // 6)]
+    sheet = Image.new("RGB", (max(still.width, max(p.width for p in samples)),
+                              still.height + sum(p.height for p in samples)))
+    sheet.paste(matte, (0, 0))
+    y = still.height
+    for patch in samples:
+        sheet.paste(patch.convert("RGB"), (0, y))
+        y += patch.height
+    palette = sheet.quantize(colors=GIF_TRANSPARENT, method=Image.Quantize.MEDIANCUT)
+    # Fill the palette out to 256 and give the see-through slot a colour
+    # nothing on the card will be matched to.
+    entries = palette.getpalette()[: GIF_TRANSPARENT * 3]
+    entries += [0, 0, 0] * (GIF_TRANSPARENT - len(entries) // 3)
+    palette.putpalette(entries + [255, 0, 254])
+
+    base = matte.quantize(palette=palette, dither=Image.Dither.FLOYDSTEINBERG)
+    see_through = still.getchannel("A").point(lambda a: 255 if a < 128 else 0)
+    base.paste(GIF_TRANSPARENT, (0, 0), see_through)
+
+    frames = []
+    for patch in patches:
+        frame = base.copy()
+        frame.paste(patch.convert("RGB").quantize(
+            palette=palette, dither=Image.Dither.FLOYDSTEINBERG), at)
+        frames.append(frame)
+    return frames

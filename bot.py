@@ -27,8 +27,9 @@ from datetime import datetime, time as datetime_time, timedelta, timezone
 # `pip install` still boots -- !restart installs it, then restarts again.
 try:
     import card_render
+    import username_effects
 except ImportError as error:
-    card_render = None
+    card_render = username_effects = None
     print(f"image cards disabled: {error}")
 
 # aiohttp's default UA ("Python/3.x aiohttp/3.x") appears to get blackholed by
@@ -2961,7 +2962,7 @@ class BadgesCardView(CardView):
 class MapsCardView(CardView):
     pass
 
-PROFILE_CARD_FILENAME = "profile.png"
+PROFILE_CARD_FILENAME = "profile"
 
 def profile_card_fields(entry, *, user_id, username, wins=None, avatar_png=None,
                         background_png=None):
@@ -3248,13 +3249,16 @@ class ProfileCardView(ProfileView):
     real components, and their callbacks are ProfileView's.
     """
 
-    def __init__(self, card_png, *, user_id, username, restriction=None,
-                 guild=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
+    def __init__(self, card_image, *, user_id, username, extension="png",
+                 restriction=None, guild=None, parent=None, note=None,
+                 timeout=MAP_VIEW_TIMEOUT):
         # Skip ProfileView's text layout; only its callbacks are wanted.
         CardView.__init__(self, parent=parent, timeout=timeout)
         self.user_id = user_id
         self.username = username
-        self.card_png = card_png
+        self.card_image = card_image
+        # png, or gif/webp when the username effect plays.
+        self.filename = f"{PROFILE_CARD_FILENAME}.{extension}"
         # Achievement roles are per-guild and only configured in the home
         # server, so the button only appears where it can do something.
         self.guild = guild
@@ -3266,15 +3270,17 @@ class ProfileCardView(ProfileView):
 
         gallery = discord.ui.MediaGallery()
         gallery.add_item(
-            media=f"attachment://{PROFILE_CARD_FILENAME}",
+            media=f"attachment://{self.filename}",
             description=f"{username}'s profile",
         )
         self.add_item(gallery)
+        if note:
+            self.add_item(discord.ui.TextDisplay(note))
 
         self.add_item(self.profile_buttons())
 
     def card_files(self):
-        return [discord.File(io.BytesIO(self.card_png), filename=PROFILE_CARD_FILENAME)]
+        return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
 
 async def build_badges_view(user_id, username, parent=None):
     """Every game badge, marked owned or not for this player."""
@@ -3743,8 +3749,15 @@ async def build_profile_view(user_id, username, parent=None, guild=None):
         guild=guild, parent=parent,
     )
 
-async def build_profile_card_view(user_id, username, parent=None, guild=None):
-    """The image version of build_profile_view, or None without saved data."""
+async def build_profile_card_view(user_id, username, parent=None, guild=None, *,
+                                  effect_name=None, image_format="gif", note=False):
+    """The image version of build_profile_view, or None without saved data.
+
+    The player's equipped username effect plays on the name when it maps to
+    an ezVisualz preset, which makes the card a GIF (or WebP); otherwise
+    it's a PNG. effect_name forces an effect, for previews. note=True adds
+    a line saying which effect was used and how long it took.
+    """
     entry = await fetch_entry(str(user_id), datastore="Main_Data")
     if not entry:
         return None
@@ -3759,12 +3772,38 @@ async def build_profile_card_view(user_id, username, parent=None, guild=None):
         entry, user_id=user_id, username=username, wins=wins,
         avatar_png=avatar_png, background_png=background_png,
     )
+
+    equipped = dig(entry.get("Data") or {}, "UsernameEffects", "Equipped")
+    wanted = effect_name or (equipped if isinstance(equipped, str) else None)
+    effect = username_effects.resolve_effect(wanted)
+
+    started = time.monotonic()
     # Pillow holds the GIL for most of a render, but a thread still keeps
     # the gateway heartbeat from waiting on the whole thing.
-    card_png = await asyncio.to_thread(card_render.render_profile_card, **fields)
+    if effect:
+        image, extension = await asyncio.to_thread(
+            card_render.render_profile_card_animated, effect, image_format, **fields
+        )
+    else:
+        image = await asyncio.to_thread(card_render.render_profile_card, **fields)
+        extension = "png"
+
+    line = None
+    if note:
+        if effect:
+            source = f"`{wanted}` → `{effect['name']}`"
+        elif wanted and wanted.lower() == "none":
+            source = "off"
+        elif wanted:
+            source = f"`{wanted}` (no matching preset, so no animation)"
+        else:
+            source = "none equipped"
+        line = (f"-# effect: {source} · {extension} · {len(image) // 1024} KB"
+                f" · {time.monotonic() - started:.1f}s")
+
     return ProfileCardView(
-        card_png, user_id=user_id, username=username,
-        restriction=restriction, guild=guild, parent=parent,
+        image, user_id=user_id, username=username, extension=extension,
+        restriction=restriction, guild=guild, parent=parent, note=line,
     )
 
 def build_map_container(entry, *, headshot=None, creator_text="Unknown",
@@ -5075,19 +5114,43 @@ async def profile_command(ctx, username: str = None):
 
     view.message = await ctx.send(view=view)
 
+PREVIEW_IMAGE_FORMATS = ("gif", "webp")
+
 @bot.command(name="testprofile", hidden=True)
 @commands.is_owner()
-async def test_profile_card(ctx, username: str = None):
-    """Owner-only preview of the image profile card, before /profile uses it."""
+async def test_profile_card(ctx, username: str = None, effect: str = None,
+                            image_format: str = "gif"):
+    """Owner-only preview of the image profile card, before /profile uses it.
+
+    `!testprofile [username|me] [effect|none] [gif|webp]`. The effect is
+    their equipped one unless named: any ezVisualz preset (RainbowStroke,
+    GoldStroke, ...). `!testprofile me list` lists the presets.
+    """
     if card_render is None:
         await ctx.send("Image cards need Pillow — run `!restart` to install it.")
         return
+    if effect and effect.lower() == "list":
+        await ctx.send("Presets: " + ", ".join(f"`{n}`" for n in username_effects.PRESET_NAMES))
+        return
+    image_format = (image_format or "gif").lower()
+    if image_format not in PREVIEW_IMAGE_FORMATS:
+        await ctx.send("Format is `gif` or `webp`.")
+        return
+    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
+        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
+        return
+
     async with ctx.typing():
-        user_id, canonical = await resolve_command_user(ctx, username)
+        lookup = None if username in (None, "me") else username
+        user_id, canonical = await resolve_command_user(ctx, lookup)
         if user_id is None:
             return
 
-        view = await build_profile_card_view(user_id, canonical, guild=ctx.guild)
+        view = await build_profile_card_view(
+            user_id, canonical, guild=ctx.guild,
+            # "none" can't match a preset, so it shows the still card.
+            effect_name=effect, image_format=image_format, note=True,
+        )
         if view is None:
             await ctx.send(f"No game data saved for **{canonical}**.")
             return
