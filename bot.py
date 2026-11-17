@@ -2,6 +2,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import os
+import sys
+import signal
 import aiohttp
 import json
 import base64
@@ -21,7 +23,13 @@ from typing import Literal, Optional
 from urllib.parse import quote, unquote
 from datetime import datetime, time as datetime_time, timedelta, timezone
 
-import card_render
+# The image cards need Pillow. Guarded so a checkout pulled before
+# `pip install` still boots -- !restart installs it, then restarts again.
+try:
+    import card_render
+except ImportError as error:
+    card_render = None
+    print(f"image cards disabled: {error}")
 
 # aiohttp's default UA ("Python/3.x aiohttp/3.x") appears to get blackholed by
 # Roblox's edge: requests that work instantly under curl never return headers.
@@ -5022,6 +5030,9 @@ async def profile_command(ctx, username: str = None):
 @commands.is_owner()
 async def test_profile_card(ctx, username: str = None):
     """Owner-only preview of the image profile card, before /profile uses it."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
     async with ctx.typing():
         user_id, canonical = await resolve_command_user(ctx, username)
         if user_id is None:
@@ -5675,10 +5686,107 @@ async def run_git(*args):
         return 1, "git timed out after 60s"
     return process.returncode, output.decode(errors="replace").strip()
 
+# The bot's own venv, so `pip` and `python` in !sh mean the bot's.
+VENV_BIN = os.path.dirname(sys.executable)
+SHELL_TIMEOUT = 120
+PIP_TIMEOUT = 600
+# Room for the code block and header inside Discord's 2000 characters.
+SHELL_REPLY_LIMIT = 1800
+
+async def run_process(*args, shell=False, timeout=60):
+    """Run a command in the bot's folder -> (exit code, combined output).
+
+    It gets its own process group, so a timeout kills whatever it spawned
+    too, not just the outer shell.
+    """
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+           "PATH": VENV_BIN + os.pathsep + os.environ.get("PATH", "")}
+    options = dict(
+        cwd=BOT_DIR, env=env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    if os.name == "posix":
+        options["start_new_session"] = True
+    if shell:
+        process = await asyncio.create_subprocess_shell(args[0], **options)
+    else:
+        process = await asyncio.create_subprocess_exec(*args, **options)
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        return None, f"timed out after {timeout}s"
+    return process.returncode, output.decode(errors="replace").strip()
+
+async def install_requirements():
+    """pip install the checkout's requirements into the bot's venv."""
+    return await run_process(
+        sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+        "--disable-pip-version-check", "-r",
+        os.path.join(BOT_DIR, "requirements.txt"),
+        timeout=PIP_TIMEOUT,
+    )
+
+def strip_code_block(text):
+    """Accept `cmd`, ```cmd``` or a ```sh fenced block as well as plain text."""
+    text = text.strip()
+    if text.startswith("```") and text.endswith("```") and len(text) >= 6:
+        text = text[3:-3]
+        first, _, rest = text.partition("\n")
+        if rest and first.strip().isalnum():
+            text = rest
+    elif text.startswith("`") and text.endswith("`") and len(text) >= 2:
+        text = text[1:-1]
+    return text.strip()
+
+@bot.command(name="sh", hidden=True)
+@is_admin()
+async def admin_shell(ctx, *, command: str):
+    """Run a shell command on the VPS: `!sh git log -3`.
+
+    Runs as the bot's own user in its folder, with the venv first on PATH.
+    That user can't sudo and can only write to the bot's folder, so it's for
+    pip, git, logs and looking around -- not system administration. Output
+    over a message's worth comes back as a file.
+    """
+    command = strip_code_block(command)
+    if not command:
+        await ctx.send("Give it something to run: `!sh git status`.")
+        return
+
+    started = time.monotonic()
+    async with ctx.typing():
+        code, output = await run_process(command, shell=True, timeout=SHELL_TIMEOUT)
+    elapsed = time.monotonic() - started
+
+    status = "⏱️ timed out" if code is None else ("✅" if code == 0 else f"❌ exit {code}")
+    header = f"{status} · {elapsed:.1f}s · `{command[:200]}`"
+    if not output:
+        await ctx.send(f"{header}\n-# no output")
+        return
+    if len(output) <= SHELL_REPLY_LIMIT:
+        # A stray ``` in the output would close the block early.
+        safe = output.replace("```", "`​``")
+        await ctx.send(f"{header}\n```\n{safe}\n```")
+        return
+    await ctx.send(
+        f"{header}\n-# {len(output.splitlines())} lines, attached",
+        file=discord.File(io.BytesIO(output.encode("utf-8")), filename="output.txt"),
+    )
+
 @bot.command(name="restart", hidden=True)
 @is_admin()
 async def admin_restart(ctx):
-    """Pull the latest main and restart the bot."""
+    """Pull the latest main, install its requirements, and restart the bot."""
     async with ctx.typing():
         _, before = await run_git("rev-parse", "--short", "HEAD")
         code, output = await run_git("pull", "--ff-only", "origin", "main")
@@ -5700,10 +5808,17 @@ async def admin_restart(ctx):
                 "diff", "--name-only", f"{before}..{after}"
             )
             if "requirements.txt" in changed.splitlines():
-                lines.append(
-                    "⚠️ `requirements.txt` changed — run `pip install` on "
-                    "the VPS, or the restart may crash."
-                )
+                lines.append("📦 `requirements.txt` changed.")
+
+        # Every time, not only when the file changed: a pull that happened
+        # outside !restart (the boot-time updater) never installed anything.
+        code, output = await install_requirements()
+        if code != 0:
+            lines.append(
+                f"❌ `pip install` failed, not restarting.\n```\n{output[-1500:]}\n```"
+            )
+            await ctx.send("\n".join(lines))
+            return
 
     try:
         with open(RESTART_NOTICE_PATH, "w") as f:

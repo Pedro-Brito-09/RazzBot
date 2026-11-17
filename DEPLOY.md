@@ -172,6 +172,19 @@ The restart automatically runs the updater before launching the bot.
 
 If dependencies changed, re-run the `pip install` line from step 4 before restarting.
 
+### From Discord
+
+Both of these answer only to `ADMIN_USER_ID`:
+
+- `!restart` pulls `main`, runs `pip install -r requirements.txt` into the
+  venv, and restarts. If the pull or the install fails, the bot keeps
+  running the old code and posts the error.
+- `!sh <command>` runs a shell command in `/opt/razzbot` as the `razzbot`
+  user, with the venv first on `PATH` (so `pip` and `python` are the bot's).
+  It times out after 120s. Long output comes back as `output.txt`. The unit's
+  sandboxing still applies: no `sudo`, and only `/opt/razzbot` is writable.
+  So `systemctl`, `apt` and editing `/etc/razzbot.env` still need SSH.
+
 ## Notes
 
 - **No inbound ports needed.** The bot is an outbound websocket client, so the Oracle
