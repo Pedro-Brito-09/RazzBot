@@ -2507,6 +2507,19 @@ async def fetch_headshots(user_ids):
 # Square, for the image cards' framed avatar tile.
 AVATAR_IMAGE_SIZE = "420x420"
 
+async def download_bytes(url, label):
+    """GET a file's raw bytes, or None. For images the cards draw in."""
+    try:
+        session = await get_session()
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                print(f"{label} -> HTTP {resp.status}")
+                return None
+            return await resp.read()
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        print(f"{label} -> {type(e).__name__}: {e}")
+        return None
+
 async def fetch_avatar_png(user_id):
     """A player's square headshot as PNG bytes, or None if it can't be had."""
     url = (
@@ -2517,16 +2530,49 @@ async def fetch_avatar_png(user_id):
     item = next(iter((data or {}).get("data") or []), None)
     if not item or item.get("state") != "Completed" or not item.get("imageUrl"):
         return None
-    try:
-        session = await get_session()
-        async with session.get(item["imageUrl"]) as resp:
-            if resp.status != 200:
-                print(f"fetch_avatar_png -> HTTP {resp.status}")
-                return None
-            return await resp.read()
-    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-        print(f"fetch_avatar_png -> {type(e).__name__}: {e}")
+    return await download_bytes(item["imageUrl"], "fetch_avatar_png")
+
+# A player's chosen profile card background lives in the Roles data store,
+# which the API key can already write, one small entry per player:
+# {"MapId": <community map id>}.
+PROFILE_BACKGROUND_KEY = "Background_{}"
+
+async def fetch_profile_background_map_id(user_id):
+    """The map whose thumbnail backs this player's card, or None."""
+    value = await fetch_entry(
+        PROFILE_BACKGROUND_KEY.format(user_id), datastore=ROLES_DATASTORE
+    )
+    map_id = value.get("MapId") if isinstance(value, dict) else None
+    return map_id if isinstance(map_id, int) else None
+
+async def save_profile_background(user_id, map_id):
+    """Point the player's card at a map. True when it was saved."""
+    status = await update_entry_with_retry(
+        PROFILE_BACKGROUND_KEY.format(user_id), ROLES_DATASTORE,
+        lambda _stored: {"MapId": int(map_id)}, default={},
+    )
+    return status == "ok"
+
+async def clear_profile_background(user_id):
+    """Back to the chat-colour backdrop. True when it's gone."""
+    return await delete_entry_resource(
+        PROFILE_BACKGROUND_KEY.format(user_id), ROLES_DATASTORE
+    )
+
+async def fetch_profile_background_png(user_id):
+    """The chosen map's thumbnail as PNG bytes, or None.
+
+    None also covers a map that has since been deleted, made private or
+    lost its thumbnail -- the card then falls back to the chat colour.
+    """
+    map_id = await fetch_profile_background_map_id(user_id)
+    if map_id is None:
         return None
+    entry = (await get_community_maps() or {}).get(map_id)
+    if not entry or entry.get("Privacy") != "Public":
+        return None
+    url = await fetch_map_thumbnail(entry)
+    return await download_bytes(url, "fetch_profile_background_png") if url else None
 
 async def fetch_map_thumbnails(entries):
     """ThumbnailId image URLs keyed by map ID. One batched request.
@@ -2917,7 +2963,8 @@ class MapsCardView(CardView):
 
 PROFILE_CARD_FILENAME = "profile.png"
 
-def profile_card_fields(entry, *, user_id, username, wins=None, avatar_png=None):
+def profile_card_fields(entry, *, user_id, username, wins=None, avatar_png=None,
+                        background_png=None):
     """render_profile_card's arguments, read out of a Main_Data entry."""
     data = entry.get("Data") if isinstance(entry, dict) else None
     data = data if isinstance(data, dict) else {}
@@ -2958,6 +3005,7 @@ def profile_card_fields(entry, *, user_id, username, wins=None, avatar_png=None)
         user_id=user_id,
         joined=timestamp(meta.get("ProfileCreateTime")),
         last_seen=timestamp(data.get("LastLogin")),
+        background_png=background_png,
     )
 
 class ProfileView(CardView):
@@ -3701,14 +3749,15 @@ async def build_profile_card_view(user_id, username, parent=None, guild=None):
     if not entry:
         return None
 
-    avatar_png, wins, restriction = await asyncio.gather(
+    avatar_png, wins, restriction, background_png = await asyncio.gather(
         fetch_avatar_png(user_id),
         fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins"),
         fetch_user_restriction(user_id),
+        fetch_profile_background_png(user_id),
     )
     fields = profile_card_fields(
         entry, user_id=user_id, username=username, wins=wins,
-        avatar_png=avatar_png,
+        avatar_png=avatar_png, background_png=background_png,
     )
     # Pillow holds the GIL for most of a render, but a thread still keeps
     # the gateway heartbeat from waiting on the whole thing.
@@ -5044,6 +5093,106 @@ async def test_profile_card(ctx, username: str = None):
             return
 
     view.message = await ctx.send(view=view, files=view.card_files())
+
+# Typed instead of a map to go back to the chat-colour backdrop.
+CLEAR_BACKGROUND_WORDS = {"none", "clear", "reset", "off", "default"}
+MAP_AUTOCOMPLETE_LIMIT = 25
+
+def find_public_map(maps_by_id, query):
+    """A public map by ID or best name match, or None."""
+    cleaned = query.strip()
+    if cleaned.isdigit():
+        entry = maps_by_id.get(int(cleaned))
+        return entry if entry and entry.get("Privacy") == "Public" else None
+    matches = search_public_maps(maps_by_id, cleaned, limit=1)
+    return matches[0] if matches else None
+
+@bot.hybrid_command(
+    name="background",
+    description="Use a map's thumbnail as your profile card background",
+)
+@app_commands.describe(
+    query="A public map's ID or name. Leave it out to go back to your chat color.",
+)
+@app_commands.rename(query="map")
+async def background_command(ctx, *, query: str = None):
+    """Set your profile card background to a public map's thumbnail.
+
+    `!background <map>` to pick one, `!background` alone to go back to
+    your Roblox chat colour.
+    """
+    await ctx.defer()
+
+    user_id = await fetch_linked_user_id(ctx.author.id)
+    if user_id is None:
+        await ctx.send(
+            "Link your Roblox account with `/link` first — the background "
+            "belongs to your player profile."
+        )
+        return
+
+    if not query or query.strip().lower() in CLEAR_BACKGROUND_WORDS:
+        if not await clear_profile_background(user_id):
+            await ctx.send("Couldn't reset your background right now. Try again in a bit.")
+            return
+        await ctx.send(view=simple_card(
+            "Your profile card is back to your Roblox chat color.",
+            heading="🎨 Background reset",
+        ))
+        return
+
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        await ctx.send("Failed to fetch the community map list.")
+        return
+
+    entry = find_public_map(maps_by_id, query)
+    if entry is None:
+        await ctx.send(f"No public map found for **{discord.utils.escape_markdown(query.strip())}**.")
+        return
+
+    name = entry.get("Name") or f"Map {entry.get('Id')}"
+    thumbnail = await fetch_map_thumbnail(entry)
+    if not thumbnail:
+        await ctx.send(f"**{name}** has no thumbnail to use as a background.")
+        return
+
+    if not await save_profile_background(user_id, entry["Id"]):
+        await ctx.send("Couldn't save your background right now. Try again in a bit.")
+        return
+
+    view = discord.ui.LayoutView()
+    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
+    container.add_item(discord.ui.TextDisplay(
+        f"## 🖼️ Background set\n"
+        f"Your profile card now uses **{name}** (`{entry['Id']}`).\n"
+        f"-# Run `/background` with no map to go back to your chat color."
+    ))
+    gallery = discord.ui.MediaGallery()
+    gallery.add_item(media=thumbnail, description=name)
+    container.add_item(gallery)
+    view.add_item(container)
+    await ctx.send(view=view)
+
+@background_command.autocomplete("query")
+async def background_map_autocomplete(interaction, current: str):
+    # Autocomplete has ~3s to answer, so it only reads an index that's
+    # already loaded, and starts loading one for the next keystroke.
+    cached = _maps_cache.get(current_universe())
+    if not cached:
+        asyncio.create_task(get_community_maps())
+        return []
+    current = current.strip()
+    if not current:
+        return []
+    matches = search_public_maps(cached["by_id"], current, limit=MAP_AUTOCOMPLETE_LIMIT)
+    return [
+        app_commands.Choice(
+            name=f"{entry.get('Name') or 'Unnamed'} · {entry['Id']}"[:100],
+            value=str(entry["Id"]),
+        )
+        for entry in matches
+    ]
 
 # How many rows /topmaps and /topcreators list.
 TOP_LIST_LIMIT = 50

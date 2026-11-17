@@ -245,43 +245,95 @@ def profile_icon(name, size):
     return load_icon("profile", name, size)
 
 
-def draw_sky(canvas):
-    """The stand-in scene: sky, a dotted pillar, a hill, blocks and a flag."""
-    width, height = px(CARD_WIDTH), px(CARD_HEIGHT)
-    stops = ((0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")))
+# Roblox's classic chat name colours, in the order its hash indexes them.
+ROBLOX_NAME_COLORS = (
+    (253, 41, 67),     # Bright red
+    (1, 162, 255),     # Bright blue
+    (2, 184, 87),      # Earth green
+    (107, 50, 124),    # Bright violet
+    (218, 133, 65),    # Bright orange
+    (245, 205, 48),    # Bright yellow
+    (232, 186, 200),   # Light reddish violet
+    (215, 197, 154),   # Brick yellow
+)
+
+
+def roblox_name_color(username):
+    """The colour Roblox's classic chat gave this username.
+
+    A port of the legacy chat's GetNameValue: character codes summed, with
+    the sign flipping every two characters counted from the end.
+    """
+    data = str(username).encode("utf-8")
+    value = 0
+    for index, code in enumerate(data, start=1):
+        reverse_index = len(data) - index + 1
+        if len(data) % 2 == 1:
+            reverse_index -= 1
+        value += -code if reverse_index % 4 >= 2 else code
+    # Python's % is floored like Lua's, so negative sums land the same way.
+    return ROBLOX_NAME_COLORS[value % len(ROBLOX_NAME_COLORS)]
+
+
+def shade(color, factor):
+    """Darken (factor < 1) towards black or lighten (> 1) towards white."""
+    if factor <= 1:
+        return tuple(round(c * factor) for c in color[:3])
+    mix = factor - 1
+    return tuple(round(c + (255 - c) * mix) for c in color[:3])
+
+
+def vertical_gradient(width, height, stops):
+    """An RGBA image fading through (position 0-1, rgba) stops, top to bottom."""
     column = Image.new("RGBA", (1, height))
     for y in range(height):
-        t = y / (height - 1)
+        t = y / max(1, height - 1)
         for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
             if t <= t1:
-                f = (t - t0) / (t1 - t0)
-                column.putpixel((0, y), tuple(round(a + (b - a) * f) for a, b in zip(c0, c1)))
+                f = (t - t0) / (t1 - t0) if t1 > t0 else 0
+                column.putpixel((0, y), tuple(round(a + (b - a) * f)
+                                              for a, b in zip(c0, c1)))
                 break
-    canvas.alpha_composite(column.resize((width, height)))
+    return column.resize((width, height))
+
+
+def draw_background(canvas, color, image=None):
+    """Fill the card: a map thumbnail, or a gradient of the player's colour.
+
+    Returns the colour the footer text should be outlined in.
+    """
+    width, height = px(CARD_WIDTH), px(CARD_HEIGHT)
+    # The colour goes down first in both cases, so a thumbnail with
+    # transparent areas shows it rather than holes in the card.
+    canvas.alpha_composite(vertical_gradient(width, height, (
+        (0.0, shade(color, 0.85) + (255,)),
+        (0.62, color[:3] + (255,)),
+        (1.0, shade(color, 1.35) + (255,)),
+    )))
+    if image is not None:
+        # Cover: scale to fill, crop the overflow evenly.
+        scale = max(width / image.width, height / image.height)
+        size = (max(width, round(image.width * scale)),
+                max(height, round(image.height * scale)))
+        cover = image.convert("RGBA").resize(size, Image.LANCZOS)
+        left, top = (cover.width - width) // 2, (cover.height - height) // 2
+        canvas.alpha_composite(cover.crop((left, top, left + width, top + height)))
+        # Darken the bottom edge so the footer reads over any scene.
+        canvas.alpha_composite(vertical_gradient(width, height, (
+            (0.0, (0, 0, 0, 0)), (0.7, (0, 0, 0, 0)), (1.0, (0, 0, 0, 120)),
+        )))
+        return (16, 18, 30, 255)
 
     # Dotted pillar: 12px tiles with a ~2.3px dot in the middle of each.
-    pillar = Image.new("RGBA", (px(120), px(300)), rgba("#2B5FBF"))
+    pillar = Image.new("RGBA", (px(120), px(300)), shade(color, 0.72) + (255,))
     dots = ImageDraw.Draw(pillar)
     for gx in range(10):
         for gy in range(25):
             cx, cy = 6 + gx * 12, 6 + gy * 12
             dots.ellipse((px(cx - 2.3), px(cy - 2.3), px(cx + 2.3), px(cy + 2.3)),
-                         fill=rgba("#1C468F"))
+                         fill=shade(color, 0.55) + (255,))
     place(canvas, pillar, 700, -30, 120, 300, rotate=-6)
-
-    def ellipse(draw, k):
-        draw.ellipse((0, 0, 1080 * k - 1, 170 * k - 1), fill=255)
-    hill = Image.new("RGBA", (px(1080), px(170)), rgba("#4F8E3A"))
-    place(canvas, clip_to(hill, shape_mask(1080, 170, ellipse)), -60, 460, 1080, 170)
-
-    red = clip_to(Image.new("RGBA", (px(70), px(70)), rgba("#D8343A")), rounded_mask(70, 70, 10))
-    place(canvas, red, 120, 450, 70, 70, rotate=-10)
-    grey = clip_to(Image.new("RGBA", (px(60), px(60)), rgba("#5A6070")), rounded_mask(60, 60, 8))
-    place(canvas, grey, 820, 470, 60, 60, rotate=14)
-
-    place(canvas, Image.new("RGBA", (px(7), px(110)), rgba("#2A2F3C")), 560, 150, 7, 110, rotate=10)
-    pennant = strip(44, 32, rgba("#E8333A"), ((0, 0), (100, 50), (0, 100)))
-    place(canvas, pennant, 568, 146, 44, 32, rotate=10)
+    return shade(color, 0.4) + (255,)
 
 
 def draw_avatar(canvas, avatar):
@@ -425,9 +477,8 @@ def draw_stat_grid(canvas, values):
         place(canvas, with_drop_shadow(body, 5), left, top, cell_width, cell_height)
 
 
-def draw_footer(canvas, left_text, right_text):
-    """White footer text with a hard shadow and a soft glow over the hill."""
-    dark = rgba("#2E5E22")
+def draw_footer(canvas, left_text, right_text, dark):
+    """White footer text with a hard shadow and a soft glow behind it."""
     parts = [Text(t, HAND, 20) for t in (left_text, right_text)]
     top = CARD_HEIGHT - 20 - max(p.height for p in parts)
     positions = [(40, top), (CARD_WIDTH - 40 - parts[1].width, top)]
@@ -445,27 +496,35 @@ def draw_footer(canvas, left_text, right_text):
         part.draw(draw, x, y)
 
 
+def open_image(data):
+    """Decode image bytes to RGBA, or None for missing or unreadable data."""
+    if not data:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            return image.convert("RGBA")
+    except Exception:
+        return None
+
+
 def render_profile_card(*, username, avatar_png=None, tag=None, stars=0,
                         stars_all_time=0, medals=(0, 0, 0, 0), games_played=0,
                         wins=None, win_streak=0, flags_reached=0, kills=0,
                         deaths=0, furthest_round=0, login_streak=0,
                         login_streak_best=0, user_id=None, joined=None,
-                        last_seen=None):
+                        last_seen=None, background_png=None):
     """The /profile card as PNG bytes.
 
     `medals` is (gold, silver, bronze, diamond). `joined` and `last_seen`
     are Unix timestamps or None. `wins` is None when the board was down.
+    `background_png` (a map thumbnail) replaces the backdrop, which is
+    otherwise the username's Roblox chat colour.
     """
-    avatar = None
-    if avatar_png:
-        try:
-            with Image.open(io.BytesIO(avatar_png)) as image:
-                avatar = image.convert("RGBA")
-        except Exception:
-            avatar = None
+    avatar = open_image(avatar_png)
+    background = open_image(background_png)
 
     canvas = Image.new("RGBA", (px(CARD_WIDTH), px(CARD_HEIGHT)), (0, 0, 0, 0))
-    draw_sky(canvas)
+    footer_outline = draw_background(canvas, roblox_name_color(username), background)
 
     stars_left = draw_stars_strip(canvas, stars, stars_all_time)
     draw_name_banner(canvas, username, stars_left - 16)
@@ -483,7 +542,7 @@ def render_profile_card(*, username, avatar_png=None, tag=None, stars=0,
     if joined is not None:
         left.append(f"joined {format_date(joined)}")
     right = f"last seen {format_ago(last_seen)}" if last_seen is not None else ""
-    draw_footer(canvas, " · ".join(left), right)
+    draw_footer(canvas, " · ".join(left), right, footer_outline)
 
     canvas = clip_to(canvas, rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24))
     out = io.BytesIO()
