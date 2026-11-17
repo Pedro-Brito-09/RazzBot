@@ -1,0 +1,491 @@
+"""Image cards drawn with Pillow, in the Party Chaos menu style.
+
+The designs are authored as HTML/CSS (torn paper strips, chunky outlined
+lettering, a sky scene) and redrawn here by hand, because a headless browser
+doesn't fit in the VPS's memory budget. Coordinates are written in the
+design's CSS pixels and scaled by SCALE when drawn, so the numbers can be
+checked against the HTML template directly.
+
+Everything here is synchronous and CPU-bound: call it through
+asyncio.to_thread so a render never blocks the gateway.
+"""
+
+import functools
+import io
+import os
+from datetime import datetime, timezone
+
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+SCALE = 2
+# Polygons and rounded corners are drawn this many times larger and scaled
+# down, since Pillow draws them without antialiasing.
+SUPERSAMPLE = 4
+
+DISPLAY = "LuckiestGuy-Regular.ttf"
+HAND = "PatrickHand-Regular.ttf"
+WHITE = (255, 255, 255, 255)
+# rgba(20,20,60,0.25), the design's hard drop shadow.
+SHADOW = (20, 20, 60, 64)
+
+# Torn-edge outlines from the template, as clip-path percentages.
+CLIP_BANNER = ((2, 0), (98, 0), (100, 18), (97, 40), (100, 62), (98, 100),
+               (2, 100), (0, 80), (2.5, 58), (0, 36), (2, 14))
+CLIP_STARS = ((2, 0), (98, 0), (100, 18), (97.5, 40), (100, 62), (98, 100),
+              (2, 100), (0, 80), (2.5, 58), (0, 36), (2, 14))
+CLIP_TAG = ((3, 0), (97, 0), (100, 20), (96, 45), (100, 70), (97, 100),
+            (3, 100), (0, 78), (4, 52), (0, 26))
+CLIP_MEDAL = ((4, 0), (96, 0), (100, 22), (95, 48), (100, 74), (96, 100),
+              (4, 100), (0, 76), (5, 50), (0, 24))
+CLIP_STAT = ((3, 0), (97, 0), (100, 20), (96.5, 45), (100, 70), (97, 100),
+             (3, 100), (0, 78), (3.5, 52), (0, 26))
+
+
+def px(value):
+    """Design pixels to output pixels."""
+    return round(value * SCALE)
+
+
+def rgba(hex_color, alpha=255):
+    hex_color = hex_color.lstrip("#")
+    return (int(hex_color[0:2], 16), int(hex_color[2:4], 16),
+            int(hex_color[4:6], 16), alpha)
+
+
+@functools.lru_cache(maxsize=None)
+def load_font(face, size):
+    return ImageFont.truetype(os.path.join(ASSETS, "fonts", face), px(size))
+
+
+@functools.lru_cache(maxsize=None)
+def load_icon(folder, name, size):
+    path = os.path.join(ASSETS, folder, f"{name}.png")
+    with Image.open(path) as image:
+        return image.convert("RGBA").resize((px(size), px(size)), Image.LANCZOS)
+
+
+class Text:
+    """One line of text laid out the way the browser would.
+
+    Sizes are CSS pixels. `stroke` is the -webkit-text-stroke width; with
+    paint-order: stroke fill only its outer half shows, so half is drawn.
+    `shadow` is a hard text-shadow straight down, in the stroke colour.
+    """
+
+    def __init__(self, text, face, size, *, line_height=None, fill=WHITE,
+                 stroke=0, stroke_color=None, shadow=0):
+        self.text = text
+        self.font = load_font(face, size)
+        self.fill = fill
+        self.stroke = stroke
+        self.stroke_color = stroke_color
+        self.shadow = shadow
+        ascent, descent = self.font.getmetrics()
+        content = (ascent + descent) / SCALE
+        self.width = self.font.getlength(text) / SCALE
+        self.height = size * line_height if line_height else content
+        # The line box centres the font's content area, as CSS half-leading does.
+        self.baseline = (self.height - content) / 2 + ascent / SCALE
+
+    def draw(self, draw, x, y):
+        """Draw with the line box's top-left at design point (x, y)."""
+        origin = (px(x), px(y + self.baseline))
+        width = round(self.stroke * SCALE / 2)
+        if self.shadow:
+            draw.text((origin[0], origin[1] + px(self.shadow)), self.text,
+                      font=self.font, fill=self.stroke_color, anchor="ls",
+                      stroke_width=width, stroke_fill=self.stroke_color)
+        draw.text(origin, self.text, font=self.font, fill=self.fill,
+                  anchor="ls", stroke_width=width, stroke_fill=self.stroke_color)
+
+
+def shape_mask(width, height, paint):
+    """An antialiased L mask; `paint(draw, k)` draws at k output pixels per design pixel."""
+    k = SCALE * SUPERSAMPLE
+    big = Image.new("L", (round(width * k), round(height * k)), 0)
+    paint(ImageDraw.Draw(big), k)
+    return big.resize((px(width), px(height)), Image.LANCZOS)
+
+
+def polygon_mask(width, height, clip):
+    def paint(draw, k):
+        draw.polygon([(x / 100 * width * k, y / 100 * height * k)
+                      for x, y in clip], fill=255)
+    return shape_mask(width, height, paint)
+
+
+def rounded_mask(width, height, radius):
+    def paint(draw, k):
+        draw.rounded_rectangle((0, 0, width * k - 1, height * k - 1),
+                               radius=radius * k, fill=255)
+    return shape_mask(width, height, paint)
+
+
+def clip_to(image, mask):
+    """Multiply the image's alpha by the mask, like CSS clip-path."""
+    image.putalpha(ImageChops.multiply(image.getchannel("A"), mask))
+    return image
+
+
+def with_drop_shadow(body, offset, pad=12):
+    """Pad the body and put the design's hard shadow `offset` px below it."""
+    pad_px = px(pad)
+    layer = Image.new("RGBA", (body.width + 2 * pad_px, body.height + 2 * pad_px),
+                      (0, 0, 0, 0))
+    if offset:
+        shadow = Image.new("RGBA", body.size, SHADOW[:3] + (0,))
+        shadow.putalpha(body.getchannel("A").point(lambda a: a * SHADOW[3] // 255))
+        layer.alpha_composite(shadow, (pad_px, pad_px + px(offset)))
+    layer.alpha_composite(body, (pad_px, pad_px))
+    return layer
+
+
+def place(canvas, layer, left, top, width, height, rotate=0):
+    """Composite a layer so its centre lands on the element box's centre.
+
+    The layer may be padded (for shadows) but must be padded evenly, so its
+    centre is the element's. CSS rotates clockwise, Pillow anticlockwise.
+    """
+    if rotate:
+        layer = layer.rotate(-rotate, resample=Image.BICUBIC, expand=True)
+    cx, cy = px(left + width / 2), px(top + height / 2)
+    canvas.alpha_composite(layer, (cx - layer.width // 2, cy - layer.height // 2))
+
+
+def strip(width, height, color, clip, draw_content=None):
+    """A torn paper strip: a coloured box clipped to a ragged outline."""
+    body = Image.new("RGBA", (px(width), px(height)), color)
+    if draw_content:
+        draw_content(body, ImageDraw.Draw(body))
+    return clip_to(body, polygon_mask(width, height, clip))
+
+
+def paste_icon(image, icon, x, y):
+    image.alpha_composite(icon, (px(x), px(y)))
+
+
+# ---------------------------------------------------------------- formatting
+
+def format_count(value):
+    """Thousands separators, one decimal only when there is one."""
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        value = round(value, 1)
+        if value.is_integer():
+            value = int(value)
+    return f"{value:,}"
+
+
+def compact_count(value):
+    """1.2M / 34.5K, for numbers too wide for their strip."""
+    if not isinstance(value, (int, float)):
+        return format_count(value)
+    for size, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(value) >= size:
+            short = f"{value / size:.1f}".rstrip("0").rstrip(".")
+            return f"{short}{suffix}"
+    return format_count(value)
+
+
+def format_date(timestamp):
+    moment = datetime.fromtimestamp(timestamp, timezone.utc)
+    return f"{moment:%b} {moment.day}, {moment.year}"
+
+
+def format_ago(timestamp, now=None):
+    now = now if now is not None else datetime.now(timezone.utc).timestamp()
+    seconds = max(0, int(now - timestamp))
+    for size, unit in ((365 * 86400, "year"), (30 * 86400, "month"),
+                       (7 * 86400, "week"), (86400, "day"), (3600, "hour"),
+                       (60, "minute")):
+        if seconds >= size:
+            count = seconds // size
+            return f"{count} {unit}{'' if count == 1 else 's'} ago"
+    return "just now"
+
+
+def fit_text(text, face, size, max_width, *, min_size, **style):
+    """The largest size from `size` down to `min_size` that fits, or None."""
+    while size >= min_size:
+        candidate = Text(text, face, size, **style)
+        if candidate.width <= max_width:
+            return candidate
+        size -= 1
+    return None
+
+
+# ---------------------------------------------------------------- profile card
+
+CARD_WIDTH, CARD_HEIGHT = 960, 560
+
+# (icon, label, strip colour, outline colour), in grid order.
+PROFILE_STATS = (
+    ("gamepad", "games played", "#6CC4F4", "#2A78B8"),
+    ("trophy", "wins", "#FFD64F", "#A87A00"),
+    ("fire", "win streak", "#FFA851", "#C4610F"),
+    ("flag", "flags reached", "#FF7A6B", "#C23A2E"),
+    ("swords", "kills", "#A57CF7", "#5E37B8"),
+    ("skull", "deaths", "#8D9BB8", "#3E4A66"),
+    ("trend", "furthest round", "#8BE04E", "#3F8F1E"),
+    ("calendar", "login streak", "#7FE8C2", "#239372"),
+)
+
+# (icon, strip colour, outline colour), in the card's left-to-right order.
+PROFILE_MEDALS = (
+    ("medal-gold", "#FFD64F", "#A87A00"),
+    ("medal-silver", "#B3B8C2", "#5E6573"),
+    ("medal-bronze", "#D98A5B", "#8F4A1F"),
+    ("medal-diamond", "#A988D9", "#5E3C93"),
+)
+
+
+def profile_icon(name, size):
+    return load_icon("profile", name, size)
+
+
+def draw_sky(canvas):
+    """The stand-in scene: sky, a dotted pillar, a hill, blocks and a flag."""
+    width, height = px(CARD_WIDTH), px(CARD_HEIGHT)
+    stops = ((0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")))
+    column = Image.new("RGBA", (1, height))
+    for y in range(height):
+        t = y / (height - 1)
+        for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+            if t <= t1:
+                f = (t - t0) / (t1 - t0)
+                column.putpixel((0, y), tuple(round(a + (b - a) * f) for a, b in zip(c0, c1)))
+                break
+    canvas.alpha_composite(column.resize((width, height)))
+
+    # Dotted pillar: 12px tiles with a ~2.3px dot in the middle of each.
+    pillar = Image.new("RGBA", (px(120), px(300)), rgba("#2B5FBF"))
+    dots = ImageDraw.Draw(pillar)
+    for gx in range(10):
+        for gy in range(25):
+            cx, cy = 6 + gx * 12, 6 + gy * 12
+            dots.ellipse((px(cx - 2.3), px(cy - 2.3), px(cx + 2.3), px(cy + 2.3)),
+                         fill=rgba("#1C468F"))
+    place(canvas, pillar, 700, -30, 120, 300, rotate=-6)
+
+    def ellipse(draw, k):
+        draw.ellipse((0, 0, 1080 * k - 1, 170 * k - 1), fill=255)
+    hill = Image.new("RGBA", (px(1080), px(170)), rgba("#4F8E3A"))
+    place(canvas, clip_to(hill, shape_mask(1080, 170, ellipse)), -60, 460, 1080, 170)
+
+    red = clip_to(Image.new("RGBA", (px(70), px(70)), rgba("#D8343A")), rounded_mask(70, 70, 10))
+    place(canvas, red, 120, 450, 70, 70, rotate=-10)
+    grey = clip_to(Image.new("RGBA", (px(60), px(60)), rgba("#5A6070")), rounded_mask(60, 60, 8))
+    place(canvas, grey, 820, 470, 60, 60, rotate=14)
+
+    place(canvas, Image.new("RGBA", (px(7), px(110)), rgba("#2A2F3C")), 560, 150, 7, 110, rotate=10)
+    pennant = strip(44, 32, rgba("#E8333A"), ((0, 0), (100, 50), (0, 100)))
+    place(canvas, pennant, 568, 146, 44, 32, rotate=10)
+
+
+def draw_avatar(canvas, avatar):
+    """The white-framed avatar tile, tilted, with a placeholder if missing."""
+    outer, border, radius = 154, 7, 24
+    tile = Image.new("RGBA", (px(outer), px(outer)), WHITE)
+    tile = clip_to(tile, rounded_mask(outer, outer, radius))
+    inner_size = outer - 2 * border
+    inner = Image.new("RGBA", (px(inner_size), px(inner_size)), rgba("#0F1B33"))
+    if avatar is not None:
+        side = min(avatar.size)
+        left, top = (avatar.width - side) // 2, (avatar.height - side) // 2
+        face = avatar.crop((left, top, left + side, top + side))
+        inner.alpha_composite(face.resize(inner.size, Image.LANCZOS))
+    else:
+        mark = Text("?", DISPLAY, 72, line_height=1, stroke=8,
+                    stroke_color=rgba("#2A3B5E"))
+        mark.draw(ImageDraw.Draw(inner), (inner_size - mark.width) / 2,
+                  (inner_size - mark.height) / 2 + 4)
+    inner = clip_to(inner, rounded_mask(inner_size, inner_size, radius - border))
+    tile.alpha_composite(inner, (px(border), px(border)))
+    place(canvas, with_drop_shadow(tile, 7), 40, 64, outer, outer, rotate=-5)
+
+
+def draw_stars_strip(canvas, stars, stars_all_time):
+    outline = rgba("#C4610F")
+    value = Text(format_count(stars), DISPLAY, 40, line_height=1, stroke=8,
+                 stroke_color=outline, shadow=4)
+    caption = Text(f"stars · {format_count(stars_all_time)} all time", HAND, 19,
+                   line_height=1.1, stroke=4, stroke_color=outline)
+    column = value.height + caption.height
+    inner = max(56, column)
+    width = 16 + 56 + 12 + max(value.width, caption.width) + 24
+    height = 10 + inner + 10
+
+    def content(image, draw):
+        paste_icon(image, profile_icon("star", 56), 16, 10 + (inner - 56) / 2)
+        top = 10 + (inner - column) / 2
+        value.draw(draw, 16 + 56 + 12, top)
+        caption.draw(draw, 16 + 56 + 12, top + value.height)
+
+    left = CARD_WIDTH - 40 - width
+    body = strip(width, height, rgba("#FFA851"), CLIP_STARS, content)
+    place(canvas, with_drop_shadow(body, 5), left, 34, width, height, rotate=2)
+    return left
+
+
+def draw_name_banner(canvas, username, max_right):
+    """The purple name strip. Long names shrink, then lose their tail."""
+    outline = rgba("#5E37B8")
+    room = max_right - 130 - 74 - 36
+    style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=5)
+    name = fit_text(username, DISPLAY, 52, room, min_size=30, **style)
+    if name is None:
+        text = username
+        while text and Text(text + "…", DISPLAY, 30, **style).width > room:
+            text = text[:-1]
+        name = Text(text.rstrip() + "…", DISPLAY, 30, **style)
+    width = 74 + name.width + 36
+    height = 12 + name.height + 6
+    body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER,
+                 lambda image, draw: name.draw(draw, 74, 12))
+    place(canvas, with_drop_shadow(body, 5), 130, 86 + (52 - name.height) / 2,
+          width, height)
+
+
+def draw_tags(canvas, tags):
+    """The small pills under the name: (text, fill, outline, icon name or None)."""
+    left = 200
+    for text, fill, outline, icon in tags:
+        label = Text(text, DISPLAY, 20, stroke=5, stroke_color=rgba(outline))
+        if icon:
+            # padding 4px 18px 4px 12px, a 30px icon, 6px gap, text nudged 3px down.
+            inner = max(30, label.height + 3)
+            width = 12 + 30 + 6 + label.width + 18
+            height = 4 + inner + 4
+
+            def content(image, draw, label=label, inner=inner, icon=icon):
+                paste_icon(image, profile_icon(icon, 30), 12, 4 + (inner - 30) / 2)
+                label.draw(draw, 12 + 30 + 6, 4 + (inner - label.height - 3) / 2 + 3)
+        else:
+            width = 18 + label.width + 18
+            height = 7 + label.height + 4
+
+            def content(image, draw, label=label):
+                label.draw(draw, 18, 7)
+        body = strip(width, height, rgba(fill), CLIP_TAG, content)
+        place(canvas, with_drop_shadow(body, 4), left, 170, width, height)
+        left += width + 10
+
+
+def draw_medals(canvas, counts):
+    pills = []
+    for (icon, fill, outline), count in zip(PROFILE_MEDALS, counts):
+        label = Text(format_count(count), DISPLAY, 24, stroke=6,
+                     stroke_color=rgba(outline))
+        pills.append((icon, fill, label))
+    inner = max(24, max(label.height for _, _, label in pills) + 3)
+    height = 8 + inner + 8
+    widths = [14 + 34 + 7 + label.width + 14 for _, _, label in pills]
+    left = CARD_WIDTH - 40 - (sum(widths) + 10 * (len(pills) - 1))
+    for (icon, fill, label), width in zip(pills, widths):
+        def content(image, draw, icon=icon, label=label):
+            # A 42px medal with -9px/-4px margins: it spills over the strip's
+            # edges and gets clipped by them, as in the design.
+            paste_icon(image, profile_icon(icon, 42), 14 - 4, 8 + (inner - 24) / 2 - 9)
+            label.draw(draw, 14 + 34 + 7, 8 + (inner - label.height - 3) / 2 + 3)
+        body = strip(width, height, rgba(fill), CLIP_MEDAL, content)
+        place(canvas, with_drop_shadow(body, 4), left, 190, width, height)
+        left += width + 10
+
+
+def stat_value_text(value, outline, room):
+    """The stat number at the largest size that fits, compacting if needed."""
+    style = dict(line_height=1, stroke=7, stroke_color=outline)
+    text = value if isinstance(value, str) else format_count(value)
+    fitted = fit_text(text, DISPLAY, 30, room, min_size=22, **style)
+    if fitted is None and not isinstance(value, str):
+        fitted = fit_text(compact_count(value), DISPLAY, 30, room, min_size=18, **style)
+    return fitted or Text(text, DISPLAY, 18, **style)
+
+
+def draw_stat_grid(canvas, values):
+    columns, gap_x, gap_y, cell_height = 4, 14, 18, 96
+    cell_width = (CARD_WIDTH - 80 - gap_x * (columns - 1)) / columns
+    for index, ((icon, label, fill, outline), value) in enumerate(zip(PROFILE_STATS, values)):
+        dark = rgba(outline)
+        number = stat_value_text(value, dark, cell_width - 14 - 54 - 10 - 14)
+        caption = Text(label, HAND, 18, line_height=1.1, stroke=4, stroke_color=dark)
+
+        def content(image, draw, number=number, caption=caption, icon=icon):
+            paste_icon(image, profile_icon(icon, 54), 14, (cell_height - 54) / 2)
+            top = (cell_height - number.height - caption.height) / 2
+            number.draw(draw, 14 + 54 + 10, top)
+            caption.draw(draw, 14 + 54 + 10, top + number.height)
+
+        body = strip(cell_width, cell_height, rgba(fill), CLIP_STAT, content)
+        row, column = divmod(index, columns)
+        left = 40 + column * (cell_width + gap_x)
+        top = 264 + row * (cell_height + gap_y)
+        place(canvas, with_drop_shadow(body, 5), left, top, cell_width, cell_height)
+
+
+def draw_footer(canvas, left_text, right_text):
+    """White footer text with a hard shadow and a soft glow over the hill."""
+    dark = rgba("#2E5E22")
+    parts = [Text(t, HAND, 20) for t in (left_text, right_text)]
+    top = CARD_HEIGHT - 20 - max(p.height for p in parts)
+    positions = [(40, top), (CARD_WIDTH - 40 - parts[1].width, top)]
+
+    glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow)
+    for part, (x, y) in zip(parts, positions):
+        glow_draw.text((px(x), px(y + part.baseline)), part.text, font=part.font,
+                       fill=dark, anchor="ls")
+    canvas.alpha_composite(glow.filter(ImageFilter.GaussianBlur(px(3))))
+    draw = ImageDraw.Draw(canvas)
+    for part, (x, y) in zip(parts, positions):
+        draw.text((px(x), px(y + part.baseline + 2)), part.text, font=part.font,
+                  fill=dark, anchor="ls")
+        part.draw(draw, x, y)
+
+
+def render_profile_card(*, username, avatar_png=None, tag=None, stars=0,
+                        stars_all_time=0, medals=(0, 0, 0, 0), games_played=0,
+                        wins=None, win_streak=0, flags_reached=0, kills=0,
+                        deaths=0, furthest_round=0, login_streak=0,
+                        login_streak_best=0, user_id=None, joined=None,
+                        last_seen=None):
+    """The /profile card as PNG bytes.
+
+    `medals` is (gold, silver, bronze, diamond). `joined` and `last_seen`
+    are Unix timestamps or None. `wins` is None when the board was down.
+    """
+    avatar = None
+    if avatar_png:
+        try:
+            with Image.open(io.BytesIO(avatar_png)) as image:
+                avatar = image.convert("RGBA")
+        except Exception:
+            avatar = None
+
+    canvas = Image.new("RGBA", (px(CARD_WIDTH), px(CARD_HEIGHT)), (0, 0, 0, 0))
+    draw_sky(canvas)
+
+    stars_left = draw_stars_strip(canvas, stars, stars_all_time)
+    draw_name_banner(canvas, username, stars_left - 16)
+    draw_avatar(canvas, avatar)
+    if tag:
+        draw_tags(canvas, [(str(tag).upper(), "#C9A6FF", "#7A52CC", None)])
+    draw_medals(canvas, medals)
+
+    draw_stat_grid(canvas, [
+        games_played, wins, win_streak, flags_reached, kills, deaths,
+        furthest_round, f"{format_count(login_streak)} / {format_count(login_streak_best)}",
+    ])
+
+    left = [f"ID {user_id}"] if user_id is not None else []
+    if joined is not None:
+        left.append(f"joined {format_date(joined)}")
+    right = f"last seen {format_ago(last_seen)}" if last_seen is not None else ""
+    draw_footer(canvas, " · ".join(left), right)
+
+    canvas = clip_to(canvas, rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24))
+    out = io.BytesIO()
+    canvas.save(out, format="PNG", optimize=False, compress_level=6)
+    return out.getvalue()

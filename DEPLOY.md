@@ -60,8 +60,10 @@ sudo -u razzbot python3 -m venv /opt/razzbot/.venv
 sudo -u razzbot /opt/razzbot/.venv/bin/pip install --no-cache-dir -r /opt/razzbot/requirements.txt
 ```
 
-`--no-cache-dir` matters on a 1 GB box. All three deps ship manylinux wheels
-(x86_64 and aarch64), so nothing compiles.
+`--no-cache-dir` matters on a 1 GB box. Every dep ships manylinux wheels
+(x86_64 and aarch64), so nothing compiles. Pillow draws the image cards
+(`card_render.py`) from the fonts and icons in `assets/`; a render peaks at a
+few tens of MB and needs no system packages.
 
 ## 5. Secrets
 

@@ -21,6 +21,8 @@ from typing import Literal, Optional
 from urllib.parse import quote, unquote
 from datetime import datetime, time as datetime_time, timedelta, timezone
 
+import card_render
+
 # aiohttp's default UA ("Python/3.x aiohttp/3.x") appears to get blackholed by
 # Roblox's edge: requests that work instantly under curl never return headers.
 # Send a conventional UA instead.
@@ -379,6 +381,15 @@ class CardView(OwnedView, discord.ui.LayoutView):
         self.message = None
         self.parent = parent
 
+    def card_files(self):
+        """Fresh discord.File objects for the attachments this card shows.
+
+        Cards replace each other in one message, so every swap sends the new
+        card's files as the message's whole attachment list. Most cards have
+        none, which also clears an image card's picture on the way out.
+        """
+        return []
+
     def make_back_button(self):
         """A button returning to the card this one was opened from."""
         if self.parent is None:
@@ -405,7 +416,7 @@ class CardView(OwnedView, discord.ui.LayoutView):
         await interaction.response.defer()
         parent = self.parent
         parent.message = interaction.message
-        await interaction.edit_original_response(view=parent)
+        await show_card(interaction, parent)
 
     async def on_timeout(self):
         # children are Containers on a LayoutView, so walk down to the
@@ -419,6 +430,14 @@ class CardView(OwnedView, discord.ui.LayoutView):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
+
+async def show_card(interaction, view):
+    """Swap a deferred interaction's message over to another card."""
+    # Always replace the attachments: a card without files of its own
+    # would otherwise keep showing the previous card's picture.
+    files = view.card_files() if isinstance(view, CardView) else []
+    await interaction.edit_original_response(view=view, attachments=files)
+
 _account_link_lock = asyncio.Lock()
 _link_code_expirations = {}
 _link_code_tasks = {}
@@ -2477,6 +2496,30 @@ async def fetch_headshots(user_ids):
             headshots[item.get("targetId")] = item["imageUrl"]
     return headshots
 
+# Square, for the image cards' framed avatar tile.
+AVATAR_IMAGE_SIZE = "420x420"
+
+async def fetch_avatar_png(user_id):
+    """A player's square headshot as PNG bytes, or None if it can't be had."""
+    url = (
+        "https://thumbnails.roblox.com/v1/users/avatar-headshot"
+        f"?userIds={user_id}&size={AVATAR_IMAGE_SIZE}&format=Png&isCircular=false"
+    )
+    data = await request_json(url, label="fetch_avatar_png")
+    item = next(iter((data or {}).get("data") or []), None)
+    if not item or item.get("state") != "Completed" or not item.get("imageUrl"):
+        return None
+    try:
+        session = await get_session()
+        async with session.get(item["imageUrl"]) as resp:
+            if resp.status != 200:
+                print(f"fetch_avatar_png -> HTTP {resp.status}")
+                return None
+            return await resp.read()
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        print(f"fetch_avatar_png -> {type(e).__name__}: {e}")
+        return None
+
 async def fetch_map_thumbnails(entries):
     """ThumbnailId image URLs keyed by map ID. One batched request.
 
@@ -2864,6 +2907,51 @@ class BadgesCardView(CardView):
 class MapsCardView(CardView):
     pass
 
+PROFILE_CARD_FILENAME = "profile.png"
+
+def profile_card_fields(entry, *, user_id, username, wins=None, avatar_png=None):
+    """render_profile_card's arguments, read out of a Main_Data entry."""
+    data = entry.get("Data") if isinstance(entry, dict) else None
+    data = data if isinstance(data, dict) else {}
+    meta = entry.get("MetaData") if isinstance(entry, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    stats = data.get("Stats") if isinstance(data.get("Stats"), dict) else {}
+
+    def number(value):
+        return value if isinstance(value, (int, float)) else 0
+
+    def timestamp(value):
+        return value if isinstance(value, (int, float)) and value > 0 else None
+
+    # Medals are stored as the cup indexes they were won in, so the count is
+    # the length. The card orders them gold, silver, bronze, diamond.
+    medal_count = {
+        tier: len(dig(data, "Medals", tier, default=[]) or [])
+        for tier in MEDAL_TIERS
+    }
+    return dict(
+        username=username,
+        avatar_png=avatar_png,
+        tag=dig(data, "Tags", "Equipped"),
+        stars=number(data.get("Stars")),
+        stars_all_time=number(stats.get("AllTimeStars")),
+        medals=tuple(medal_count[t] for t in ("Gold", "Silver", "Bronze", "Diamond")),
+        games_played=number(stats.get("GamesPlayed")),
+        # Wins come from an ordered datastore, so they may be unavailable
+        # even when the rest of the profile loaded.
+        wins=wins,
+        win_streak=number(stats.get("WinStreak")),
+        flags_reached=number(stats.get("FlagsReached")),
+        kills=number(stats.get("Kills")),
+        deaths=number(stats.get("Deaths")),
+        furthest_round=number(stats.get("FurthestRound")),
+        login_streak=number(data.get("LoginStreak")),
+        login_streak_best=number(stats.get("HighestLoginStreak")),
+        user_id=user_id,
+        joined=timestamp(meta.get("ProfileCreateTime")),
+        last_seen=timestamp(data.get("LastLogin")),
+    )
+
 class ProfileView(CardView):
     """Components V2 profile card built from a Main_Data entry."""
 
@@ -2929,47 +3017,7 @@ class ProfileView(CardView):
             container.add_item(discord.ui.TextDisplay("\n\n".join(blocks)))
 
         # Buttons sit directly under the block above.
-        row = discord.ui.ActionRow()
-        maps_button = discord.ui.Button(
-            label="Maps",
-            style=discord.ButtonStyle.secondary,
-            emoji="🗺️",
-        )
-        maps_button.callback = self.show_created_maps
-        row.add_item(maps_button)
-
-        badges_button = discord.ui.Button(
-            label="Badges",
-            style=discord.ButtonStyle.secondary,
-            emoji="🎖️",
-        )
-        badges_button.callback = self.show_badges
-        row.add_item(badges_button)
-
-        medals_button = discord.ui.Button(
-            label="Medals",
-            style=discord.ButtonStyle.secondary,
-            emoji="🏅",
-        )
-        medals_button.callback = self.show_medals
-        row.add_item(medals_button)
-
-        if in_home_guild(self.guild):
-            achievements_button = discord.ui.Button(
-                label="Achievements",
-                style=discord.ButtonStyle.secondary,
-                emoji="💎",
-            )
-            achievements_button.callback = self.show_achievements
-            row.add_item(achievements_button)
-
-        # When this profile was opened from another card, offer the way back
-        # alongside its own actions rather than on a separate row.
-        back = self.make_back_button()
-        if back is not None:
-            row.add_item(back)
-
-        container.add_item(row)
+        container.add_item(self.profile_buttons())
 
         container.add_item(discord.ui.Separator())
 
@@ -3016,6 +3064,49 @@ class ProfileView(CardView):
 
         self.add_item(container)
 
+    def profile_buttons(self):
+        """Maps / Badges / Medals / Achievements, plus Back when nested."""
+        row = discord.ui.ActionRow()
+        maps_button = discord.ui.Button(
+            label="Maps",
+            style=discord.ButtonStyle.secondary,
+            emoji="🗺️",
+        )
+        maps_button.callback = self.show_created_maps
+        row.add_item(maps_button)
+
+        badges_button = discord.ui.Button(
+            label="Badges",
+            style=discord.ButtonStyle.secondary,
+            emoji="🎖️",
+        )
+        badges_button.callback = self.show_badges
+        row.add_item(badges_button)
+
+        medals_button = discord.ui.Button(
+            label="Medals",
+            style=discord.ButtonStyle.secondary,
+            emoji="🏅",
+        )
+        medals_button.callback = self.show_medals
+        row.add_item(medals_button)
+
+        if in_home_guild(self.guild):
+            achievements_button = discord.ui.Button(
+                label="Achievements",
+                style=discord.ButtonStyle.secondary,
+                emoji="💎",
+            )
+            achievements_button.callback = self.show_achievements
+            row.add_item(achievements_button)
+
+        # When this profile was opened from another card, offer the way back
+        # alongside its own actions rather than on a separate row.
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+        return row
+
     @keeps_context
     async def show_badges(self, interaction):
         # thinking=True would post a new message and
@@ -3030,7 +3121,7 @@ class ProfileView(CardView):
             return
 
         view.message = interaction.message
-        await interaction.edit_original_response(view=view)
+        await show_card(interaction, view)
 
     @keeps_context
     async def show_achievements(self, interaction):
@@ -3054,7 +3145,7 @@ class ProfileView(CardView):
             rules, guild, member, owner_id=self.owner_id, parent=self,
         )
         view.message = interaction.message
-        await interaction.edit_original_response(view=view)
+        await show_card(interaction, view)
 
     @keeps_context
     async def show_medals(self, interaction):
@@ -3071,7 +3162,7 @@ class ProfileView(CardView):
             return
 
         view.message = interaction.message
-        await interaction.edit_original_response(view=view)
+        await show_card(interaction, view)
 
     @keeps_context
     async def show_created_maps(self, interaction):
@@ -3091,7 +3182,43 @@ class ProfileView(CardView):
             return
 
         view.message = interaction.message
-        await interaction.edit_original_response(view=view)
+        await show_card(interaction, view)
+
+class ProfileCardView(ProfileView):
+    """The profile as a rendered image, with the same buttons under it.
+
+    On trial behind !testprofile before it replaces ProfileView. The stats
+    live in the picture (card_render.render_profile_card); the buttons stay
+    real components, and their callbacks are ProfileView's.
+    """
+
+    def __init__(self, card_png, *, user_id, username, restriction=None,
+                 guild=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
+        # Skip ProfileView's text layout; only its callbacks are wanted.
+        CardView.__init__(self, parent=parent, timeout=timeout)
+        self.user_id = user_id
+        self.username = username
+        self.card_png = card_png
+        # Achievement roles are per-guild and only configured in the home
+        # server, so the button only appears where it can do something.
+        self.guild = guild
+
+        # A ban isn't part of the design, so it rides above the picture.
+        ban_notice = format_ban_notice(restriction)
+        if ban_notice:
+            self.add_item(discord.ui.TextDisplay(ban_notice))
+
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(
+            media=f"attachment://{PROFILE_CARD_FILENAME}",
+            description=f"{username}'s profile",
+        )
+        self.add_item(gallery)
+
+        self.add_item(self.profile_buttons())
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_png), filename=PROFILE_CARD_FILENAME)]
 
 async def build_badges_view(user_id, username, parent=None):
     """Every game badge, marked owned or not for this player."""
@@ -3560,6 +3687,29 @@ async def build_profile_view(user_id, username, parent=None, guild=None):
         guild=guild, parent=parent,
     )
 
+async def build_profile_card_view(user_id, username, parent=None, guild=None):
+    """The image version of build_profile_view, or None without saved data."""
+    entry = await fetch_entry(str(user_id), datastore="Main_Data")
+    if not entry:
+        return None
+
+    avatar_png, wins, restriction = await asyncio.gather(
+        fetch_avatar_png(user_id),
+        fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins"),
+        fetch_user_restriction(user_id),
+    )
+    fields = profile_card_fields(
+        entry, user_id=user_id, username=username, wins=wins,
+        avatar_png=avatar_png,
+    )
+    # Pillow holds the GIL for most of a render, but a thread still keeps
+    # the gateway heartbeat from waiting on the whole thing.
+    card_png = await asyncio.to_thread(card_render.render_profile_card, **fields)
+    return ProfileCardView(
+        card_png, user_id=user_id, username=username,
+        restriction=restriction, guild=guild, parent=parent,
+    )
+
 def build_map_container(entry, *, headshot=None, creator_text="Unknown",
                         accent_colour=MAP_COLOR, banner=None, thumbnail=None):
     """The body of a map card, without any action buttons.
@@ -3709,7 +3859,7 @@ class MapView(CardView):
             return
 
         view.message = interaction.message
-        await interaction.edit_original_response(view=view)
+        await show_card(interaction, view)
 
 class DailyCupMapView(OwnedView, discord.ui.View):
     """The Daily Cup card's single experience Play action."""
@@ -4868,6 +5018,22 @@ async def profile_command(ctx, username: str = None):
 
     view.message = await ctx.send(view=view)
 
+@bot.command(name="testprofile", hidden=True)
+@commands.is_owner()
+async def test_profile_card(ctx, username: str = None):
+    """Owner-only preview of the image profile card, before /profile uses it."""
+    async with ctx.typing():
+        user_id, canonical = await resolve_command_user(ctx, username)
+        if user_id is None:
+            return
+
+        view = await build_profile_card_view(user_id, canonical, guild=ctx.guild)
+        if view is None:
+            await ctx.send(f"No game data saved for **{canonical}**.")
+            return
+
+    view.message = await ctx.send(view=view, files=view.card_files())
+
 # How many rows /topmaps and /topcreators list.
 TOP_LIST_LIMIT = 50
 # The prefix form takes either spelling; the slash form offers these two.
@@ -4907,7 +5073,7 @@ class RandomMapView(MapView):
             )
             return
         view.message = interaction.message
-        await interaction.edit_original_response(view=view)
+        await show_card(interaction, view)
 
 async def build_random_map_view(exclude=None):
     """A card for one public map, every map equally likely."""
