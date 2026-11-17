@@ -231,7 +231,9 @@ PROFILE_STATS = (
     ("swords", "kills", "#A57CF7", "#5E37B8"),
     ("skull", "deaths", "#8D9BB8", "#3E4A66"),
     ("trend", "furthest round", "#8BE04E", "#3F8F1E"),
-    ("calendar", "login streak", "#7FE8C2", "#239372"),
+    # Like the others: a light, bright strip in the hue of the icon's outline
+    # (#9A4A06), with a mid shade of it outlining the text.
+    ("calendar", "login streak", "#F6B85A", "#B6670C"),
 )
 
 # (icon, strip colour, outline colour), in the card's left-to-right order.
@@ -595,8 +597,7 @@ def render_profile_card(**fields):
 # One animated render at a time: its frames are held in memory until the
 # encoder has them all, and the VPS caps the bot at 400 MB.
 ANIMATION_LOCK = threading.Lock()
-# Frame counts and per-frame delays tried when fitting a seamless loop. GIF
-# delays are whole 10 ms steps, so these stay multiples of 10.
+# Frame counts and per-frame delays tried when fitting a seamless loop.
 LOOP_FRAMES = range(20, 49)
 LOOP_DELAYS_MS = (50, 60, 70, 80, 90, 100)
 # A motion that would turn less than this many times even in the longest
@@ -608,8 +609,8 @@ MIN_LOOP_CYCLES = 0.6
 GRADIENT_RESOLUTION = 0.5
 # Sequence lookup-table size.
 GRADIENT_SAMPLES = 512
-# GIF has one palette slot for "see-through", used for the rounded corners.
-GIF_TRANSPARENT = 255
+# Animated WebP quality; the card is flat colour, so it compresses well.
+WEBP_QUALITY = 88
 
 
 def _sequence_table(stops, kind):
@@ -829,9 +830,11 @@ def _even_box(box, size):
     return x0, y0, x1, y1
 
 
-def render_profile_card_animated(effect, image_format="gif", **fields):
-    """The card with the username effect playing, as (bytes, extension).
+def render_profile_card_animated(effect, **fields):
+    """The card with the username effect playing, as animated WebP bytes.
 
+    WebP rather than GIF: it keeps the full colour of the gradients and the
+    soft rounded corners, where GIF has 256 colours and on/off transparency.
     Rendered at half the PNG's resolution, since every frame is held in
     memory until encoded. Only the name banner changes between frames, so
     it's the only part redrawn.
@@ -851,67 +854,19 @@ def render_profile_card_animated(effect, image_format="gif", **fields):
         still = still.resize(half_size, Image.LANCZOS)
         del below, above
 
-        def region_frame(index):
+        at = (region[0] // 2, region[1] // 2)
+        patch_size = ((region[2] - region[0]) // 2, (region[3] - region[1]) // 2)
+        frames = []
+        for index in range(frames_count):
             patch = below_region.copy()
             patch.alpha_composite(animator.frame(index / frames_count),
                                   (bx0 - region[0], by0 - region[1]))
             patch.alpha_composite(above_region)
-            return patch.resize(((region[2] - region[0]) // 2, (region[3] - region[1]) // 2),
-                                Image.LANCZOS)
+            frame = still.copy()
+            frame.paste(patch.resize(patch_size, Image.LANCZOS), at)
+            frames.append(frame)
 
-        at = (region[0] // 2, region[1] // 2)
         out = io.BytesIO()
-        if image_format == "webp":
-            frames = []
-            for index in range(frames_count):
-                frame = still.copy()
-                frame.paste(region_frame(index), at)
-                frames.append(frame)
-            frames[0].save(out, format="WEBP", save_all=True, append_images=frames[1:],
-                           duration=delay, loop=0, quality=88, method=4)
-            return out.getvalue(), "webp"
-
-        patches = [region_frame(index) for index in range(frames_count)]
-        frames = _gif_frames(still, patches, at)
-        frames[0].save(out, format="GIF", save_all=True, append_images=frames[1:],
-                       duration=delay, loop=0, transparency=GIF_TRANSPARENT,
-                       disposal=1, optimize=False)
-        return out.getvalue(), "gif"
-
-
-def _gif_frames(still, patches, at):
-    """Palette frames sharing one palette, differing only inside the patch.
-
-    Quantising each whole frame would dither the still parts differently
-    every time, and the GIF would then store the whole card per frame. So
-    the still card is quantised once, and each frame only its patch.
-    """
-    matte = Image.new("RGB", still.size, (0, 0, 0))
-    matte.paste(still, (0, 0), still)
-    # The palette has to cover the effect's colours as well as the card's.
-    samples = patches[::max(1, len(patches) // 6)]
-    sheet = Image.new("RGB", (max(still.width, max(p.width for p in samples)),
-                              still.height + sum(p.height for p in samples)))
-    sheet.paste(matte, (0, 0))
-    y = still.height
-    for patch in samples:
-        sheet.paste(patch.convert("RGB"), (0, y))
-        y += patch.height
-    palette = sheet.quantize(colors=GIF_TRANSPARENT, method=Image.Quantize.MEDIANCUT)
-    # Fill the palette out to 256 and give the see-through slot a colour
-    # nothing on the card will be matched to.
-    entries = palette.getpalette()[: GIF_TRANSPARENT * 3]
-    entries += [0, 0, 0] * (GIF_TRANSPARENT - len(entries) // 3)
-    palette.putpalette(entries + [255, 0, 254])
-
-    base = matte.quantize(palette=palette, dither=Image.Dither.FLOYDSTEINBERG)
-    see_through = still.getchannel("A").point(lambda a: 255 if a < 128 else 0)
-    base.paste(GIF_TRANSPARENT, (0, 0), see_through)
-
-    frames = []
-    for patch in patches:
-        frame = base.copy()
-        frame.paste(patch.convert("RGB").quantize(
-            palette=palette, dither=Image.Dither.FLOYDSTEINBERG), at)
-        frames.append(frame)
-    return frames
+        frames[0].save(out, format="WEBP", save_all=True, append_images=frames[1:],
+                       duration=delay, loop=0, quality=WEBP_QUALITY, method=4)
+        return out.getvalue()

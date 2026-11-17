@@ -1388,7 +1388,7 @@ async def list_data_stores():
         label="list_data_stores",
     )
 
-async def list_data_store_keys(datastore, prefix=None):
+async def list_data_store_keys(datastore, prefix=None, *, limit=DATASTORE_LIST_LIMIT):
     """Keys in one data store, as (status, keys, truncated).
 
     A prefix is pushed to Roblox, which is the only way to narrow a store
@@ -1402,21 +1402,48 @@ async def list_data_store_keys(datastore, prefix=None):
     label = f"list_data_store_keys({datastore})"
 
     if not prefix:
-        return await walk_cloud_list(url, "dataStoreEntries", label=label)
+        return await walk_cloud_list(url, "dataStoreEntries", label=label, limit=limit)
 
-    expression = 'id.startsWith("' + prefix + '")'
+    # The filter is a quoted string, so the prefix can't carry its own quote.
+    escaped = prefix.replace("\\", "\\\\").replace('"', '\\"')
+    expression = 'id.startsWith("' + escaped + '")'
     status, keys, truncated = await walk_cloud_list(
         url, "dataStoreEntries", label=label,
-        query="filter=" + quote(expression, safe=""),
+        query="filter=" + quote(expression, safe=""), limit=limit,
     )
     if status != "rejected":
         return status, keys, truncated
 
     print(f"{label}: filter refused, narrowing locally instead")
     status, keys, truncated = await walk_cloud_list(
-        url, "dataStoreEntries", label=label
+        url, "dataStoreEntries", label=label, limit=limit,
     )
     return status, [key for key in keys if key.startswith(prefix)], truncated
+
+# Where a key that isn't a player ID can start. Keys list in sorted order,
+# digits first, so in a store with a key per player the named keys come
+# after every ID -- past the list limit. Asking per starting character
+# reaches them directly.
+NAMED_KEY_STARTS = string.ascii_letters + "_-.:@#$!~+"
+# Parallel Open Cloud requests for the per-character and per-store walks.
+DATASTORE_WALK_CONCURRENCY = 4
+
+async def list_data_store_named_keys(datastore):
+    """Keys not starting with a digit, as (status, keys, truncated)."""
+    semaphore = asyncio.Semaphore(DATASTORE_WALK_CONCURRENCY)
+
+    async def walk(start):
+        async with semaphore:
+            return await list_data_store_keys(datastore, start)
+
+    results = await asyncio.gather(*(walk(start) for start in NAMED_KEY_STARTS))
+    keys, truncated = [], False
+    for status, found, more in results:
+        if status != "ok":
+            return status, keys, truncated
+        keys.extend(found)
+        truncated = truncated or more
+    return "ok", sorted(set(keys)), truncated
 
 async def list_ordered_entries(datastore, scope, *, limit=ORDERED_LIST_LIMIT):
     """One page of an ordered store's scope, highest value first.
@@ -3257,7 +3284,7 @@ class ProfileCardView(ProfileView):
         self.user_id = user_id
         self.username = username
         self.card_image = card_image
-        # png, or gif/webp when the username effect plays.
+        # png, or webp when the username effect plays.
         self.filename = f"{PROFILE_CARD_FILENAME}.{extension}"
         # Achievement roles are per-guild and only configured in the home
         # server, so the button only appears where it can do something.
@@ -3750,11 +3777,11 @@ async def build_profile_view(user_id, username, parent=None, guild=None):
     )
 
 async def build_profile_card_view(user_id, username, parent=None, guild=None, *,
-                                  effect_name=None, image_format="gif", note=False):
+                                  effect_name=None, note=False):
     """The image version of build_profile_view, or None without saved data.
 
     The player's equipped username effect plays on the name when it maps to
-    an ezVisualz preset, which makes the card a GIF (or WebP); otherwise
+    an ezVisualz preset, which makes the card an animated WebP; otherwise
     it's a PNG. effect_name forces an effect, for previews. note=True adds
     a line saying which effect was used and how long it took.
     """
@@ -3781,9 +3808,10 @@ async def build_profile_card_view(user_id, username, parent=None, guild=None, *,
     # Pillow holds the GIL for most of a render, but a thread still keeps
     # the gateway heartbeat from waiting on the whole thing.
     if effect:
-        image, extension = await asyncio.to_thread(
-            card_render.render_profile_card_animated, effect, image_format, **fields
+        image = await asyncio.to_thread(
+            card_render.render_profile_card_animated, effect, **fields
         )
+        extension = "webp"
     else:
         image = await asyncio.to_thread(card_render.render_profile_card, **fields)
         extension = "png"
@@ -5114,15 +5142,12 @@ async def profile_command(ctx, username: str = None):
 
     view.message = await ctx.send(view=view)
 
-PREVIEW_IMAGE_FORMATS = ("gif", "webp")
-
 @bot.command(name="testprofile", hidden=True)
 @commands.is_owner()
-async def test_profile_card(ctx, username: str = None, effect: str = None,
-                            image_format: str = "gif"):
+async def test_profile_card(ctx, username: str = None, effect: str = None):
     """Owner-only preview of the image profile card, before /profile uses it.
 
-    `!testprofile [username|me] [effect|none] [gif|webp]`. The effect is
+    `!testprofile [username|me] [effect|none]`. The effect is
     their equipped one unless named: any ezVisualz preset (RainbowStroke,
     GoldStroke, ...). `!testprofile me list` lists the presets.
     """
@@ -5131,10 +5156,6 @@ async def test_profile_card(ctx, username: str = None, effect: str = None,
         return
     if effect and effect.lower() == "list":
         await ctx.send("Presets: " + ", ".join(f"`{n}`" for n in username_effects.PRESET_NAMES))
-        return
-    image_format = (image_format or "gif").lower()
-    if image_format not in PREVIEW_IMAGE_FORMATS:
-        await ctx.send("Format is `gif` or `webp`.")
         return
     if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
         await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
@@ -5149,7 +5170,7 @@ async def test_profile_card(ctx, username: str = None, effect: str = None,
         view = await build_profile_card_view(
             user_id, canonical, guild=ctx.guild,
             # "none" can't match a preset, so it shows the still card.
-            effect_name=effect, image_format=image_format, note=True,
+            effect_name=effect, note=True,
         )
         if view is None:
             await ctx.send(f"No game data saved for **{canonical}**.")
@@ -8134,6 +8155,11 @@ DATASTORE_USAGE = (
     "**`!datastore list`** — every data store in the universe\n"
     "**`!datastore list <store> [prefix]`** — the keys in one store\n"
     "**`!datastore get <store> <key> [--raw]`** — one entry, buffers decoded\n"
+    "**`!datastore find <text>`** — every store with a key starting with it\n"
+    "\n"
+    "-# `--no-digits` on `list` hides names made only of digits — the "
+    "per-player keys — to show what else a store holds.\n"
+    "-# `find <user id>` shows every store with an entry for that player.\n"
     "\n"
     "-# A store whose name has spaces needs quoting: "
     "`!datastore list \"Daily Cup Submissions\"`.\n"
@@ -8258,16 +8284,20 @@ async def send_datastore_value(ctx, title, text, language, notes, *, name_parts)
                           filename=datastore_filename(*name_parts)),
     )
 
-async def datastore_list_reply(ctx, arguments):
-    """!datastore list [store] [prefix]"""
+async def datastore_list_reply(ctx, arguments, *, hide_digits=False):
+    """!datastore list [store] [prefix] [--no-digits]"""
     store = arguments[0] if arguments else None
     prefix = " ".join(arguments[1:]) or None
 
     async with ctx.typing():
         if store is None:
             status, names, truncated = await list_data_stores()
+        elif hide_digits and not prefix:
+            status, names, truncated = await list_data_store_named_keys(store)
         else:
             status, names, truncated = await list_data_store_keys(store, prefix)
+    if hide_digits:
+        names = [name for name in names if not str(name).isdigit()]
 
     if status != "ok":
         await ctx.send(view=simple_card(
@@ -8277,7 +8307,10 @@ async def datastore_list_reply(ctx, arguments):
         return
 
     if not names:
-        if store is None:
+        if hide_digits:
+            empty = (f"Every key in `{store}` is all digits."
+                     if store is not None else "Every store name is all digits.")
+        elif store is None:
             empty = "This universe has no data stores the key can see."
         elif prefix:
             empty = f"No keys in `{store}` starting with `{prefix}`."
@@ -8304,6 +8337,8 @@ async def datastore_list_reply(ctx, arguments):
     else:
         heading = f"🔑 `{store}`"
         subtitle = counted + (f" starting with `{prefix}`" if prefix else "")
+        if hide_digits:
+            subtitle += " · all-digit keys hidden"
         footer = "Read one with `!datastore get`."
 
     if truncated:
@@ -8313,6 +8348,59 @@ async def datastore_list_reply(ctx, arguments):
         )
 
     view = PagedListView(heading, lines, subtitle=subtitle, footer=footer)
+    view.message = await ctx.send(view=view)
+
+# Keys shown per store in !datastore find.
+DATASTORE_FIND_KEYS = 5
+
+async def datastore_find_reply(ctx, text):
+    """!datastore find <text>: every store holding a key that starts with it."""
+    text = text.strip()
+    if not text:
+        await ctx.send(view=simple_card(
+            "Give it the start of a key: `!datastore find 114213348`.",
+            colour=discord.Color.red(),
+        ))
+        return
+
+    async with ctx.typing():
+        status, stores, _ = await list_data_stores()
+        if status != "ok":
+            await ctx.send(view=simple_card(
+                datastore_failure_text(status), colour=discord.Color.red(),
+            ))
+            return
+
+        semaphore = asyncio.Semaphore(DATASTORE_WALK_CONCURRENCY)
+
+        async def search(store):
+            async with semaphore:
+                return store, await list_data_store_keys(
+                    store, text, limit=DATASTORE_FIND_KEYS + 1
+                )
+
+        results = await asyncio.gather(*(search(store) for store in stores))
+
+    found, unreadable = [], []
+    for store, (status, keys, more) in results:
+        if status != "ok":
+            unreadable.append(store)
+        elif keys:
+            shown = ", ".join(f"`{key}`" for key in keys[:DATASTORE_FIND_KEYS])
+            if more or len(keys) > DATASTORE_FIND_KEYS:
+                shown += ", …"
+            found.append(f"**`{store}`** — {shown}")
+
+    lines = found or [f"No store has a key starting with `{text}`."]
+    footer = f"Searched {len(stores)} stores. Read one with `!datastore get <store> <key>`."
+    if unreadable:
+        footer += f" Couldn't read {len(unreadable)}: " + ", ".join(
+            f"`{store}`" for store in unreadable[:10])
+    view = PagedListView(
+        f"🔎 Keys starting with `{text}`", lines,
+        subtitle=f"{len(found)} store{'s' if len(found) != 1 else ''}",
+        footer=footer,
+    )
     view.message = await ctx.send(view=view)
 
 async def datastore_get_reply(ctx, arguments, *, raw):
@@ -8367,15 +8455,17 @@ async def datastore_get_reply(ctx, arguments, *, raw):
 @bot.command(name="datastore", hidden=True)
 @is_admin()
 async def admin_datastore(ctx, action: str = None, *arguments: str):
-    """!datastore list [store] [prefix] · !datastore get <store> <key>"""
+    """!datastore list [store] [prefix] [--no-digits] · get <store> <key> · find <text>"""
     verb = (action or "").strip().lower()
-    rest = [argument for argument in arguments if argument != "--raw"]
-    raw = len(rest) != len(arguments)
+    flags = {argument for argument in arguments if argument.startswith("--")}
+    rest = [argument for argument in arguments if argument not in flags]
 
     if verb == "list":
-        await datastore_list_reply(ctx, rest)
+        await datastore_list_reply(ctx, rest, hide_digits="--no-digits" in flags)
     elif verb == "get":
-        await datastore_get_reply(ctx, rest, raw=raw)
+        await datastore_get_reply(ctx, rest, raw="--raw" in flags)
+    elif verb == "find":
+        await datastore_find_reply(ctx, " ".join(rest))
     else:
         await ctx.send(view=simple_card(DATASTORE_USAGE, heading="🗄️ Data stores"))
 
