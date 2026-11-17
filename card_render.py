@@ -324,16 +324,29 @@ def draw_background(canvas, color, image=None):
         )))
         return (16, 18, 30, 255)
 
-    # Dotted pillar: 12px tiles with a ~2.3px dot in the middle of each.
-    pillar = Image.new("RGBA", (px(120), px(300)), shade(color, 0.72) + (255,))
-    dots = ImageDraw.Draw(pillar)
-    for gx in range(10):
-        for gy in range(25):
-            cx, cy = 6 + gx * 12, 6 + gy * 12
-            dots.ellipse((px(cx - 2.3), px(cy - 2.3), px(cx + 2.3), px(cy + 2.3)),
-                         fill=shade(color, 0.55) + (255,))
-    place(canvas, pillar, 700, -30, 120, 300, rotate=-6)
+    canvas.alpha_composite(dot_pattern(width, height, shade(color, 0.6) + (64,)))
     return shade(color, 0.4) + (255,)
+
+
+# Staggered polka dots: one at the tile's corner, one in its middle.
+DOT_TILE = 28
+DOT_RADIUS = 3.2
+
+
+def dot_pattern(width, height, fill):
+    """A full-size RGBA layer of staggered dots, tiled from one antialiased tile."""
+    def paint(draw, k):
+        for cx, cy in ((0, 0), (DOT_TILE, 0), (0, DOT_TILE), (DOT_TILE, DOT_TILE),
+                       (DOT_TILE / 2, DOT_TILE / 2)):
+            draw.ellipse(((cx - DOT_RADIUS) * k, (cy - DOT_RADIUS) * k,
+                          (cx + DOT_RADIUS) * k, (cy + DOT_RADIUS) * k), fill=255)
+    tile = Image.new("RGBA", (px(DOT_TILE), px(DOT_TILE)), fill[:3] + (0,))
+    tile.putalpha(shape_mask(DOT_TILE, DOT_TILE, paint).point(lambda a: a * fill[3] // 255))
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    for x in range(0, width, tile.width):
+        for y in range(0, height, tile.height):
+            layer.paste(tile, (x, y))
+    return layer
 
 
 def draw_avatar(canvas, avatar):
