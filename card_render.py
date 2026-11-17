@@ -119,6 +119,9 @@ def shape_mask(width, height, paint):
     return big.resize((px(width), px(height)), Image.LANCZOS)
 
 
+# Masks are only ever read, and most shapes repeat card to card (the eight
+# stat strips are one shape), so each is drawn at 8x and scaled down once.
+@functools.lru_cache(maxsize=128)
 def polygon_mask(width, height, clip):
     def paint(draw, k):
         draw.polygon([(x / 100 * width * k, y / 100 * height * k)
@@ -126,6 +129,7 @@ def polygon_mask(width, height, clip):
     return shape_mask(width, height, paint)
 
 
+@functools.lru_cache(maxsize=32)
 def rounded_mask(width, height, radius):
     def paint(draw, k):
         draw.rounded_rectangle((0, 0, width * k - 1, height * k - 1),
@@ -670,6 +674,9 @@ GRADIENT_RESOLUTION = 0.5
 GRADIENT_SAMPLES = 512
 # Animated WebP quality; the card is flat colour, so it compresses well.
 WEBP_QUALITY = 88
+# libwebp's speed/size trade-off, 0-6. 2 is as sharp as 4 here at ~60% of
+# the time; the file is a few percent bigger.
+WEBP_METHOD = 2
 
 
 def _sequence_table(stops, kind):
@@ -712,11 +719,20 @@ def _gradient_image(table, mode, angle, offset, box, size):
     # Half the box's extent along the gradient's direction.
     reach = max(1.0, (bx1 - bx0) / 2 * abs(math.cos(theta))
                 + (by1 - by0) / 2 * abs(math.sin(theta)))
+    samples = len(table)
+    if angle % 360 == 0:
+        # Not tilted: one row across the image, no rotation needed.
+        row = bytearray()
+        for x in range(width):
+            t = min(1.0, max(0.0, (x + 0.5 - cx + reach) / (2 * reach)))
+            row += table[int(((t - offset) % 1.0) * samples) % samples]
+        line = Image.frombytes(mode, (width, 1), bytes(row))
+        return line.resize(size, Image.BILINEAR)
+
     far = max(math.hypot(x - cx, y - cy) for x in (0, width) for y in (0, height))
     side = int(far * 2) + 4
 
     row = bytearray()
-    samples = len(table)
     for x in range(side):
         t = min(1.0, max(0.0, (x + 0.5 - side / 2 + reach) / (2 * reach)))
         row += table[int(((t - offset) % 1.0) * samples) % samples]
@@ -934,5 +950,10 @@ def render_profile_card_animated(effect, **fields):
 
         out = io.BytesIO()
         frames[0].save(out, format="WEBP", save_all=True, append_images=frames[1:],
-                       duration=delay, loop=0, quality=WEBP_QUALITY, method=4)
+                       duration=delay, loop=0, quality=WEBP_QUALITY, method=WEBP_METHOD,
+                       # No periodic keyframes: only the name changes, so
+                       # every frame after the first stores just that patch.
+                       # The defaults re-encode the whole card every few
+                       # frames -- 6x slower and 3-4x bigger, for nothing.
+                       kmin=0, kmax=0)
         return out.getvalue()
