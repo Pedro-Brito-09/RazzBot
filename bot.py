@@ -2601,6 +2601,53 @@ async def fetch_avatar_png(user_id):
 # {"MapId": <community map id>}.
 PROFILE_BACKGROUND_KEY = "Background_{}"
 
+# Every player's username flair lives in one Main_Data entry, a Luau buffer
+# mapping Roblox user ID -> {"Effect": "<ezVisualz preset name>"}.
+USERNAME_CUSTOMIZATION_KEY = "Username Customization"
+# The table grows with every player who picks a flair, so it's fetched at
+# most this often rather than once per profile.
+USERNAME_CUSTOMIZATION_TTL = 60
+# Keyed by universe: a !dev_ command must never poison the live cache.
+_username_customization_cache = {}
+_username_customization_locks = {}
+
+async def fetch_username_customizations():
+    """The whole flair table, cached for USERNAME_CUSTOMIZATION_TTL seconds.
+
+    On a failed refresh the previous table is kept, so a blip upstream only
+    costs a card its flair instead of breaking it.
+    """
+    universe = current_universe()
+
+    def fresh():
+        entry = _username_customization_cache.get(universe)
+        if entry and time.monotonic() - entry["at"] < USERNAME_CUSTOMIZATION_TTL:
+            return entry["table"]
+        return None
+
+    table = fresh()
+    if table is not None:
+        return table
+    async with _username_customization_locks.setdefault(universe, asyncio.Lock()):
+        # Whoever held the lock may have just refreshed it.
+        table = fresh()
+        if table is not None:
+            return table
+        raw = await fetch_entry(USERNAME_CUSTOMIZATION_KEY, datastore="Main_Data", raw=True)
+        # Decompressing and parsing it off the event loop, like the maps index.
+        table = await asyncio.to_thread(decode_entry_value, raw) if raw else None
+        if not isinstance(table, dict):
+            stale = _username_customization_cache.get(universe)
+            return stale["table"] if stale else {}
+        _username_customization_cache[universe] = {"table": table, "at": time.monotonic()}
+        return table
+
+async def fetch_equipped_username_effect(user_id):
+    """The preset name of the player's equipped username flair, or None."""
+    record = (await fetch_username_customizations()).get(str(user_id))
+    effect = record.get("Effect") if isinstance(record, dict) else None
+    return effect if isinstance(effect, str) and effect.strip() else None
+
 async def fetch_profile_background_map_id(user_id):
     """The map whose thumbnail backs this player's card, or None."""
     value = await fetch_entry(
@@ -3825,19 +3872,19 @@ async def build_profile_card_view(user_id, username, parent=None, guild=None, *,
     if not entry:
         return None
 
-    avatar_png, wins, restriction, background_png = await asyncio.gather(
+    avatar_png, wins, restriction, background_png, equipped = await asyncio.gather(
         fetch_avatar_png(user_id),
         fetch_ordered_entry(str(user_id), datastore="Data", scope="Wins"),
         fetch_user_restriction(user_id),
         fetch_profile_background_png(user_id),
+        fetch_equipped_username_effect(user_id),
     )
     fields = profile_card_fields(
         entry, user_id=user_id, username=username, wins=wins,
         avatar_png=avatar_png, background_png=background_png,
     )
 
-    equipped = dig(entry.get("Data") or {}, "UsernameEffects", "Equipped")
-    wanted = effect_name or (equipped if isinstance(equipped, str) else None)
+    wanted = effect_name or equipped
     effect = username_effects.resolve_effect(wanted)
 
     started = time.monotonic()
@@ -6111,9 +6158,10 @@ CACHE_CLEARERS = {
     "badges": _clear_owned_badges_cache,
     "catalog": lambda universe: _reward_catalog_cache.pop(universe, None),
     "linked": lambda universe: _linked_cache.pop(universe, None),
+    "effects": lambda universe: _username_customization_cache.pop(universe, None),
 }
 
-@bot.command(name="clearcache", hidden=True, usage="[maps|badges|catalog|linked]")
+@bot.command(name="clearcache", hidden=True, usage="[maps|badges|catalog|linked|effects]")
 @is_admin()
 async def admin_clearcache(ctx, which: str = None):
     """Drop cached data so the next command fetches it fresh."""

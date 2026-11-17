@@ -1,13 +1,15 @@
 """The game's username effects, ported from the ezVisualz library.
 
-In game, username effects are ezVisualz presets
+In game, username effects ("flairs") are ezVisualz presets
 (https://github.com/arxk/ezVisualz, MIT): a UIGradient on the name's fill
 and/or one on its UIStroke, whose colours scroll (an "offset speed"),
 optionally tilted, spun or wobbled, sometimes with a moving transparency
 band or a pulsing stroke width. Every preset below is a transcription of
 lib/EasyVisuals/Presets/<Name>.luau into data card_render can animate.
 
-What the game passes in -- speed, size, custom colour per effect -- isn't
+Which one a player has equipped is in Main_Data's "Username Customization"
+entry, as the preset's own name (see fetch_equipped_username_effect in
+bot.py). What the game passes in -- speed, size, custom colour -- isn't
 known to the bot yet, so DEFAULT_SPEEDS and DEFAULT_COLORS hold the values
 from the library's own example script (testing/TestTextEffects.client.luau).
 The library's built-in default speed (0.007) barely moves, so it's no use
