@@ -57,7 +57,13 @@ def rgba(hex_color, alpha=255):
 
 @functools.lru_cache(maxsize=None)
 def load_font(face, size):
-    return ImageFont.truetype(os.path.join(ASSETS, "fonts", face), px(size))
+    """A font from assets/fonts. `face` is a file, or (file, named weight)
+    for a variable font, e.g. ("effects/JosefinSans-Variable.ttf", "Bold")."""
+    file, weight = face if isinstance(face, tuple) else (face, None)
+    font = ImageFont.truetype(os.path.join(ASSETS, "fonts", file), px(size))
+    if weight:
+        font.set_variation_by_name(weight)
+    return font
 
 
 @functools.lru_cache(maxsize=None)
@@ -89,10 +95,13 @@ class Text:
         self.height = size * line_height if line_height else content
         # The line box centres the font's content area, as CSS half-leading does.
         self.baseline = (self.height - content) / 2 + ascent / SCALE
+        # How far right of the box's left edge the pen starts, for fonts
+        # whose letters reach left of their origin.
+        self.x_offset = 0
 
     def draw(self, draw, x, y):
         """Draw with the line box's top-left at design point (x, y)."""
-        origin = (px(x), px(y + self.baseline))
+        origin = (px(x + self.x_offset), px(y + self.baseline))
         width = round(self.stroke * SCALE / 2)
         if self.shadow:
             draw.text((origin[0], origin[1] + px(self.shadow)), self.text,
@@ -398,16 +407,64 @@ def draw_stars_strip(canvas, stars, stars_all_time):
     return left
 
 
-def draw_name_banner(canvas, username, max_right, with_text=True):
+# The name banner's text box, in the card's own font at its full size.
+NAME_SIZE = 52
+
+
+def _cap_height(font):
+    """Height of a capital H above the baseline, in design pixels."""
+    return -font.getbbox("H", anchor="ls")[1] / SCALE
+
+
+def fit_name_in_face(text, face, room, style):
+    """The name in another font, sized to sit in the card's name box.
+
+    Fonts differ wildly in proportions, so rather than reuse the card
+    font's size, the face is scaled until its capitals stand as tall as
+    the card font's do, then shrunk until the name fits the width and its
+    ink fits the box's height. The ink is centred in the box, so a font
+    with tall flourishes or drips doesn't sit lopsided. Returns None when
+    even the smallest size is too wide.
+    """
+    target_cap = _cap_height(load_font(DISPLAY, NAME_SIZE))
+    for size in range(int(NAME_SIZE * 1.6), 19, -1):
+        name = Text(text, face, size, line_height=1, **style)
+        if _cap_height(name.font) > target_cap * 1.02:
+            continue
+        left, top, right, bottom = (v / SCALE for v in name.font.getbbox(text, anchor="ls"))
+        ink_height = bottom - top
+        # Italic and streaked faces (Faster One) reach left of the pen; start
+        # the pen that much further in so nothing slides under the avatar.
+        overhang = max(0.0, -left)
+        width = max(name.width, right) + overhang
+        if width > room or ink_height > NAME_SIZE + 4:
+            continue
+        # Lay it out in the card font's box, ink centred vertically.
+        name.width = width
+        name.height = NAME_SIZE
+        name.baseline = (NAME_SIZE - ink_height) / 2 - top
+        name.x_offset = overhang
+        return name
+    return None
+
+
+def draw_name_banner(canvas, username, max_right, with_text=True, face=DISPLAY):
     """The purple name strip. Long names shrink, then lose their tail.
 
-    Returns where it landed, so an animated card can redraw the name alone.
+    `face` swaps the name's font -- a username effect plays in the font the
+    game gives it. Returns where it landed, so an animated card can redraw
+    the name alone.
     """
     outline = rgba("#5E37B8")
     room = max_right - 130 - 74 - 36
     style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=5)
-    name = fit_text(username, DISPLAY, 52, room, min_size=30, **style)
+    if face == DISPLAY:
+        name = fit_text(username, DISPLAY, NAME_SIZE, room, min_size=30, **style)
+    else:
+        no_line_height = {k: v for k, v in style.items() if k != "line_height"}
+        name = fit_name_in_face(username, face, room, no_line_height)
     if name is None:
+        # Too long even small: the card font, cut short.
         text = username
         while text and Text(text + "…", DISPLAY, 30, **style).width > room:
             text = text[:-1]
@@ -543,7 +600,8 @@ def compose_profile_card(*, username, avatar_png=None, tag=None, stars=0,
                          wins=None, win_streak=0, flags_reached=0, kills=0,
                          deaths=0, furthest_round=0, login_streak=0,
                          login_streak_best=0, user_id=None, joined=None,
-                         last_seen=None, background_png=None, with_name=True):
+                         last_seen=None, background_png=None, with_name=True,
+                         name_face=DISPLAY):
     """The card as two layers either side of the name: (below, above, banner).
 
     The avatar tile overlaps the name banner, so an animated name has to go
@@ -556,7 +614,8 @@ def compose_profile_card(*, username, avatar_png=None, tag=None, stars=0,
     below = Image.new("RGBA", size, (0, 0, 0, 0))
     footer_outline = draw_background(below, roblox_name_color(username), background)
     stars_left = draw_stars_strip(below, stars, stars_all_time)
-    banner = draw_name_banner(below, username, stars_left - 16, with_text=with_name)
+    banner = draw_name_banner(below, username, stars_left - 16, with_text=with_name,
+                              face=name_face)
 
     above = Image.new("RGBA", size, (0, 0, 0, 0))
     draw_avatar(above, avatar)
@@ -762,8 +821,13 @@ class NameAnimator:
         self.size = (x1 - x0, y1 - y0)
         self.clip = banner["mask"]
         tx, ty = banner["text_at"]
-        self.origin = (px(tx), px(ty + name.baseline))
+        self.origin = (px(tx + name.x_offset), px(ty + name.baseline))
         self.stroke_width = round(name.stroke * SCALE / 2)
+        # An effect's own outline is as thick as the game makes it (its UIStroke
+        # Thickness, in pixels) -- the card's chunky outline would fill in the
+        # fine detail of faces like Faster One or Monoton.
+        if effect.get("stroke") and effect.get("size"):
+            self.stroke_width = max(1, round(effect["size"] * SCALE))
         # The label's box, which the gradients span.
         self.text_box = (px(tx), px(ty), px(tx + name.width), px(ty + name.height))
         outline = banner["outline"]
@@ -840,7 +904,9 @@ def render_profile_card_animated(effect, **fields):
     it's the only part redrawn.
     """
     with ANIMATION_LOCK:
-        below, above, banner = compose_profile_card(with_name=False, **fields)
+        # The name plays in the font the game gives the effect.
+        below, above, banner = compose_profile_card(
+            with_name=False, name_face=effect.get("font") or DISPLAY, **fields)
         frames_count, delay, cycles = plan_loop(effect)
         animator = NameAnimator(banner, effect, cycles)
 

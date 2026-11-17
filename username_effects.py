@@ -9,12 +9,11 @@ lib/EasyVisuals/Presets/<Name>.luau into data card_render can animate.
 
 Which one a player has equipped is in Main_Data's "Username Customization"
 entry, as the preset's own name (see fetch_equipped_username_effect in
-bot.py). What the game passes in -- speed, size, custom colour -- isn't
-known to the bot yet, so DEFAULT_SPEEDS and DEFAULT_COLORS hold the values
-from the library's own example script (testing/TestTextEffects.client.luau).
-The library's built-in default speed (0.007) barely moves, so it's no use
-here. Replace these, or add to EFFECT_OVERRIDES, once the game's numbers
-are in.
+bot.py). GAME_EFFECTS mirrors the game's own effect catalogue -- the font,
+speed, size and colour each one is created with. Presets the game doesn't
+sell fall back to DEFAULT_SPEEDS and DEFAULT_COLORS, the values from the
+library's example script (testing/TestTextEffects.client.luau); the
+library's built-in default speed (0.007) barely moves.
 
 Units, matching the library:
   speed      gradient offset in sequence-lengths per second (1 = one full
@@ -123,8 +122,43 @@ DEFAULT_COLORS = {
     "WaveStroke": (0, 247, 255),
 }
 
+# Fonts, relative to assets/fonts: a file, or (file, named weight) for a
+# variable font. Roblox's own Gotham SSm and Guru aren't free to bundle, so
+# Electric and Sunset use the closest free faces instead.
+LUCKIEST_GUY = "LuckiestGuy-Regular.ttf"
+BANGERS = "effects/Bangers-Regular.ttf"
+RUBIK_WET_PAINT = "effects/RubikWetPaint-Regular.ttf"
+
+# The game's username effect catalogue, by preset Id: (shop name, font,
+# speed, size, EffectColor). Copied from the game's effects module; keep it
+# in step when effects are added or retuned.
+GAME_EFFECTS = {
+    "OceanicStroke": ("Oceanic Red", BANGERS, 0.2, 2, None),
+    "Gold": ("Gold", "effects/Fondamento-Regular.ttf", 0.4, 2, None),
+    "ChromeStroke": ("Chrome", "effects/BungeeInline-Regular.ttf", 0.35, 3, None),   # asset 12187370000
+    "IceStroke": ("Ice", RUBIK_WET_PAINT, 0.35, 5, None),                           # asset 12187369046
+    "Shine": ("Shine", BANGERS, 0.65, 3, (187, 0, 255)),
+    "GalaxyStroke": ("Galaxy", RUBIK_WET_PAINT, 0.4, 4, None),                      # asset 12187369046
+    "Zebra": ("Zebra", "effects/DenkOne-Regular.ttf", 0.4, 3, None),
+    "DeathStroke": ("Death", "effects/SpecialElite-Regular.ttf", 0.2, 3, None),
+    "GoldStroke": ("Golden", "effects/Monoton-Regular.ttf", 0.55, 3, None),         # asset 12187374098
+    "Bubblegum": ("Bubblegum", "effects/FredokaOne-Regular.ttf", 1, 3, None),
+    "FireStroke": ("Firey", LUCKIEST_GUY, 0.5, 5, None),
+    "WaveStroke": ("Wavey", "effects/PermanentMarker-Regular.ttf", 0.55, 6, (0, 247, 255)),
+    # Gotham SSm in game; Montserrat is its usual free stand-in.
+    "ElectricStroke": ("Electric", ("effects/Montserrat-Variable.ttf", "Regular"), 0.5, 6, None),
+    "LavaStroke": ("Lava", LUCKIEST_GUY, 0.35, 5, None),
+    "GhostStroke": ("Ghost", LUCKIEST_GUY, 0.2, 2, None),
+    "SilverStroke": ("Futuristic", "effects/FasterOne-Regular.ttf", 0.45, 3, None), # asset 12187370928
+    "RainbowStroke": ("Rainbow", LUCKIEST_GUY, 0.5, 6, None),
+    "Matrix": ("Matrix", "effects/Nosifer-Regular.ttf", 0.5, 3, None),              # asset 12187377325
+    "NeonStroke": ("Neon", ("effects/JosefinSans-Variable.ttf", "Bold"), 0.6, 5, None),
+    # Roblox's Guru (Bold) in game; EB Garamond Bold is the nearest free face.
+    "SunsetStroke": ("Sunset", ("effects/EBGaramond-Variable.ttf", "Bold"), 0.45, 5, None),
+}
+
 # Game effect name -> (preset, speed or None, colour or None), for names that
-# don't match a preset on their own or that run at their own speed in game.
+# don't match a preset or a GAME_EFFECTS shop name on their own.
 EFFECT_OVERRIDES = {}
 
 
@@ -241,7 +275,19 @@ def build_preset(name, speed=None, color=None):
         stroke = _gradient("Sunset", angle=_wobble(60, -20, s * 20 * 0.1), speed=-s * 0.6)
     else:
         return None
-    return {"name": name, "fill": fill, "stroke": stroke, "pulse": pulse}
+    return {"name": name, "fill": fill, "stroke": stroke, "pulse": pulse,
+            "font": None, "size": None}
+
+
+def build_game_effect(preset):
+    """A preset as the game sells it: its speed, colour, font and outline size."""
+    shop_name, font, speed, size, color = GAME_EFFECTS[preset]
+    effect = build_preset(preset, speed, color)
+    if effect:
+        effect["font"] = font
+        effect["shop_name"] = shop_name
+        effect["size"] = size
+    return effect
 
 
 PRESET_NAMES = tuple(DEFAULT_SPEEDS)
@@ -252,14 +298,25 @@ def _normalize(text):
 
 
 _BY_NORMALIZED = {_normalize(name): name for name in PRESET_NAMES}
+# The shop names too ("Oceanic Red", "Firey"), in case one turns up instead.
+_BY_NORMALIZED.update({
+    _normalize(shop_name): preset
+    for preset, (shop_name, *_rest) in GAME_EFFECTS.items()
+    if _normalize(shop_name) not in _BY_NORMALIZED
+})
+
+
+def _build(preset):
+    return build_game_effect(preset) if preset in GAME_EFFECTS else build_preset(preset)
 
 
 def resolve_effect(effect_name):
     """A game effect name (or a preset name) -> effect spec, or None.
 
-    Overrides win; otherwise the name is matched to a preset ignoring case,
-    spaces and punctuation, also trying it with "Stroke" on the end and
-    without a trailing "effect"/"name".
+    Overrides win; otherwise the name is matched to a preset, or a game
+    effect's shop name, ignoring case, spaces and punctuation, also trying
+    it with "Stroke" on the end and without a trailing "effect"/"name".
+    Effects the game sells come with its speed, colour and font.
     """
     if not effect_name:
         return None
@@ -275,5 +332,5 @@ def resolve_effect(effect_name):
             break
     for candidate in (key, key + "stroke"):
         if candidate in _BY_NORMALIZED:
-            return build_preset(_BY_NORMALIZED[candidate])
+            return _build(_BY_NORMALIZED[candidate])
     return None
