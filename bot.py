@@ -3860,13 +3860,13 @@ async def build_profile_view(user_id, username, parent=None, guild=None):
     )
 
 async def build_profile_card_view(user_id, username, parent=None, guild=None, *,
-                                  effect_name=None, note=False):
+                                  effect_name=None):
     """The image version of build_profile_view, or None without saved data.
 
     The player's equipped username effect plays on the name when it maps to
     an ezVisualz preset, which makes the card an animated WebP; otherwise
-    it's a PNG. effect_name forces an effect, for previews. note=True adds
-    a line saying which effect was used and how long it took.
+    it's a PNG. effect_name forces an effect, for previews. Under the
+    picture: the player's name, ID and when they were last seen.
     """
     entry = await fetch_entry(str(user_id), datastore="Main_Data")
     if not entry:
@@ -3887,7 +3887,6 @@ async def build_profile_card_view(user_id, username, parent=None, guild=None, *,
     wanted = effect_name or equipped
     effect = username_effects.resolve_effect(wanted)
 
-    started = time.monotonic()
     # Pillow holds the GIL for most of a render, but a thread still keeps
     # the gateway heartbeat from waiting on the whole thing.
     if effect:
@@ -3899,18 +3898,12 @@ async def build_profile_card_view(user_id, username, parent=None, guild=None, *,
         image = await asyncio.to_thread(card_render.render_profile_card, **fields)
         extension = "png"
 
-    line = None
-    if note:
-        if effect:
-            source = f"`{wanted}` → `{effect['name']}`"
-        elif wanted and wanted.lower() == "none":
-            source = "off"
-        elif wanted:
-            source = f"`{wanted}` (no matching preset, so no animation)"
-        else:
-            source = "none equipped"
-        line = (f"-# effect: {source} · {extension} · {len(image) // 1024} KB"
-                f" · {time.monotonic() - started:.1f}s")
+    # Escaped, or an underscore in a name would turn the line italic.
+    parts = [discord.utils.escape_markdown(username), str(user_id)]
+    last_seen = fields.get("last_seen")
+    if last_seen is not None:
+        parts.append(f"last seen: <t:{int(last_seen)}:R>")
+    line = "-# " + " · ".join(parts)
 
     return ProfileCardView(
         image, user_id=user_id, username=username, extension=extension,
@@ -5253,7 +5246,7 @@ async def test_profile_card(ctx, username: str = None, effect: str = None):
         view = await build_profile_card_view(
             user_id, canonical, guild=ctx.guild,
             # "none" can't match a preset, so it shows the still card.
-            effect_name=effect, note=True,
+            effect_name=effect,
         )
         if view is None:
             await ctx.send(f"No game data saved for **{canonical}**.")
