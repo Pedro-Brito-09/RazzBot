@@ -2161,14 +2161,17 @@ def map_placeholder(size):
     return image
 
 
-def draw_badges_header(canvas, username, avatar, text_outline):
-    """The avatar tile, the purple name banner over its edge, the subtitle."""
-    tile = framed_avatar(avatar, 104, 6, 22, "#2A2F4A", "#454D73")
+def draw_badges_header(canvas, username, avatar, text_outline, *,
+                       subtitle="Badges & Achievements", max_right=BADGES_BANNER_MAX_RIGHT,
+                       empty="#2A2F4A", mark_outline="#454D73"):
+    """The avatar tile, the purple name banner over its edge, the subtitle.
+    Shared by the badges and medals cards, whose headers are the same."""
+    tile = framed_avatar(avatar, 104, 6, 22, empty, mark_outline)
     place(canvas, with_drop_shadow(tile, 6), 30, 22, 104, 104, rotate=-4)
 
     outline = rgba("#5E37B8")
     style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=4)
-    room = BADGES_BANNER_MAX_RIGHT - 120 - 2 * 34
+    room = max_right - 120 - 2 * 34
     text = drawable_text(username or "", DISPLAY) or "Unknown"
     name = (fit_text(text, DISPLAY, 46, room, min_size=30, **style)
             or ellipsize(text, DISPLAY, 30, room, **style))
@@ -2178,8 +2181,7 @@ def draw_badges_header(canvas, username, avatar, text_outline):
                  lambda image, draw: name.draw(draw, 34, 10 + (46 - name.height) / 2))
     place(canvas, with_drop_shadow(body, 5), 120, 30, width, height, rotate=-1.5)
 
-    subtitle = Text("Badges & Achievements", HAND, 26)
-    draw_glowing_text(canvas, [(subtitle, 154, 100)], text_outline)
+    draw_glowing_text(canvas, [(Text(subtitle, HAND, 26), 154, 100)], text_outline)
 
 
 def draw_badges_progress(canvas, unlocked, total):
@@ -2247,6 +2249,197 @@ def render_badges_card(**fields):
     drive the count and the bar, `page` / `pages` the footer.
     """
     card = compose_badges_card(**fields)
+    out = io.BytesIO()
+    card.save(out, format="PNG", optimize=False, compress_level=6)
+    return out.getvalue()
+
+
+# ---------------------------------------------------------------- medals card
+
+MEDALS_WIDTH, MEDALS_HEIGHT = 960, 640
+# 5 columns x 2 rows of polaroids; the grid is 900px wide at (30, 172), gaps 20px 30px.
+CUP_COLUMNS, CUP_ROWS = 5, 2
+CUPS_PER_PAGE = CUP_COLUMNS * CUP_ROWS
+CUP_GRID_LEFT, CUP_GRID_TOP, CUP_GRID_WIDTH = 30, 172, 900
+CUP_GAP_X, CUP_GAP_Y = 20, 30
+CUP_WIDTH = (CUP_GRID_WIDTH - CUP_GAP_X * (CUP_COLUMNS - 1)) / CUP_COLUMNS
+# padding 7px 7px 6px around a 100px photo, a 5px gap, then the two lines:
+# 13px at line-height 1.1, and 15px at 1.15 with 2px on top.
+CUP_PHOTO_WIDTH, CUP_PHOTO_HEIGHT = CUP_WIDTH - 14, 100
+CUP_HEIGHT = 7 + CUP_PHOTO_HEIGHT + 5 + 13 * 1.1 + 2 + 15 * 1.15 + 6
+# The .cup:nth-child(5n+k) tilts, column by column.
+CUP_TILTS = (-2, 1.5, -1, 2, -1.5)
+CUP_INK = "#6B45C9"
+# The medal pinned over the polaroid's top-right corner: 52px at
+# right -14px, top -18px, turned 12deg. The polaroid's layer is padded this
+# much on every side so the medal fits on it.
+CUP_MEDAL_SIZE = 52
+CUP_PAD = 34
+# (icon, strip colour, outline colour, tilt), best first: the totals'
+# order, and the medal tiers' (0 is diamond).
+MEDAL_TOTALS = (
+    ("medal-diamond", "#A988D9", "#5E3C93", -1.5),
+    ("medal-gold", "#FFD64F", "#A87A00", 1),
+    ("medal-silver", "#B3B8C2", "#5E6573", -1),
+    ("medal-bronze", "#D98A5B", "#8F4A1F", 1.5),
+)
+SKY_STOPS = ((0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")))
+
+
+@functools.lru_cache(maxsize=1)
+def medals_sky():
+    """The template's scene: the sky fade, a dotted blue pole hanging from
+    the top edge, and the green hill along the bottom. Drawn once."""
+    width, height = px(MEDALS_WIDTH), px(MEDALS_HEIGHT)
+    sky = vertical_gradient(width, height, SKY_STOPS)
+
+    # 100 x 200 at (470, -40), turned 6deg: #2B5FBF with 2px #1C468F dots
+    # on a 12px grid, one in the middle of each square.
+    def dots(draw, k):
+        for cx in range(6, 100, 12):
+            for cy in range(6, 200, 12):
+                draw.ellipse(((cx - 2.3) * k, (cy - 2.3) * k,
+                              (cx + 2.3) * k, (cy + 2.3) * k), fill=255)
+    pole = solid(100, 200, rgba("#2B5FBF"))
+    pole.alpha_composite(clip_to(solid(100, 200, rgba("#1C468F")),
+                                 shape_mask(100, 200, dots)))
+    place(sky, pole, 470, -40, 100, 200, rotate=6)
+
+    # A 1080 x 190 ellipse at left -60, bottom -120: only its top shows.
+    def hill(draw, k):
+        draw.ellipse((0, 0, 1080 * k - 1, 190 * k - 1), fill=255)
+    top = MEDALS_HEIGHT + 120 - 190
+    mound = clip_to(solid(1080, 190, rgba("#4F8E3A")), shape_mask(1080, 190, hill))
+    mound = mound.crop((px(60), 0, px(60) + width, px(MEDALS_HEIGHT - top)))
+    sky.alpha_composite(mound, (0, px(top)))
+    return sky
+
+
+def draw_medal_totals(canvas, counts):
+    """The four tier strips, right-aligned at the top. Returns their left edge."""
+    pills = []
+    for (icon, fill, outline, tilt), count in zip(MEDAL_TOTALS, counts):
+        label = Text(format_count(count), DISPLAY, 26, stroke=6, stroke_color=rgba(outline))
+        pills.append((icon, fill, tilt, label))
+    # The 44px icon has -9px -4px margins, so it takes a 36 x 26 slot and
+    # spills over the strip, whose torn outline cuts it, as clip-path does.
+    inner = max(26, max(label.height + 3 for *_, label in pills))
+    height = 8 + inner + 8
+    widths = [14 + 36 + 7 + label.width + 14 for *_, label in pills]
+    left = MEDALS_WIDTH - 30 - (sum(widths) + 10 * (len(pills) - 1))
+    first = left
+    for (icon, fill, tilt, label), width in zip(pills, widths):
+        def content(image, draw, icon=icon, label=label):
+            paste_icon(image, profile_icon(icon, 44), 14 - 4, 8 + (inner - 26) / 2 - 9)
+            label.draw(draw, 14 + 36 + 7, 8 + (inner - label.height - 3) / 2 + 3)
+        body = strip(width, height, rgba(fill), CLIP_MEDAL, content)
+        place(canvas, with_drop_shadow(body, 4), left, 40, width, height, rotate=tilt)
+        left += width + 10
+    return first
+
+
+@functools.lru_cache(maxsize=1)
+def cup_photo_placeholder():
+    """A map with no thumbnail: the map card's empty-photo sky, map icon centred."""
+    image = map_backdrop(*NO_THUMBNAIL_PHOTO_COLORS, CUP_PHOTO_WIDTH, CUP_PHOTO_HEIGHT)[0].copy()
+    icon = 60
+    paste_icon(image, map_icon("map-blue", icon),
+               (CUP_PHOTO_WIDTH - icon) / 2, (CUP_PHOTO_HEIGHT - icon) / 2)
+    return image
+
+
+@functools.lru_cache(maxsize=4)
+def pinned_medal(tier):
+    icon = profile_icon(MEDAL_TOTALS[tier][0], CUP_MEDAL_SIZE)
+    return icon.rotate(-12, resample=Image.BICUBIC, expand=True)
+
+
+def cup_polaroid(cup):
+    """One white polaroid: the photo, `#cup · date`, the map name."""
+    paper = clip_to(solid(CUP_WIDTH, CUP_HEIGHT, rgba("#FFFDF4")),
+                    rounded_mask(CUP_WIDTH, CUP_HEIGHT, 5))
+    thumbnail = open_image(cup.get("thumbnail_png"))
+    if thumbnail is not None:
+        photo = solid(CUP_PHOTO_WIDTH, CUP_PHOTO_HEIGHT, rgba("#2B3F86"))
+        photo.alpha_composite(cover_crop(thumbnail, photo.width, photo.height))
+    else:
+        photo = cup_photo_placeholder().copy()
+    paper.alpha_composite(clip_to(photo, rounded_mask(CUP_PHOTO_WIDTH, CUP_PHOTO_HEIGHT, 3)),
+                          (px(7), px(7)))
+
+    ink = rgba(CUP_INK)
+    draw = ImageDraw.Draw(paper)
+    left, top = 7 + 3, 7 + CUP_PHOTO_HEIGHT + 5
+    # "#285" in the card font, " · 13/11/2026" in the hand font, on one baseline.
+    number = Text(f"#{cup.get('cup', '?')}", DISPLAY, 13, fill=ink)
+    when = Text(f" · {cup.get('date') or 'unknown date'}", HAND, 13, line_height=1.1, fill=ink)
+    number.draw(draw, left, top + when.baseline - number.baseline)
+    when.draw(draw, left + number.width, top)
+
+    name = drawable_text(cup.get("name") or "", DISPLAY) or "Unknown Map"
+    title = ellipsize(name, DISPLAY, 15, CUP_PHOTO_WIDTH - 6, line_height=1.15,
+                      stroke=5, stroke_color=ink)
+    title.draw(draw, left, top + 13 * 1.1 + 2)
+    return paper
+
+
+def draw_cup(canvas, cup, index, left, top):
+    """A polaroid at (left, top) with its medal pinned on, tilted by column."""
+    layer = with_drop_shadow(cup_polaroid(cup), 6, pad=CUP_PAD)
+    tier = cup.get("tier")
+    if tier in range(len(MEDAL_TOTALS)):
+        medal = pinned_medal(tier)
+        # The medal box's centre: right -14px, top -18px, 52px square.
+        cx = CUP_PAD + CUP_WIDTH + 14 - CUP_MEDAL_SIZE / 2
+        cy = CUP_PAD - 18 + CUP_MEDAL_SIZE / 2
+        layer.alpha_composite(medal, (px(cx) - medal.width // 2, px(cy) - medal.height // 2))
+    place(canvas, layer, left, top, CUP_WIDTH, CUP_HEIGHT,
+          rotate=CUP_TILTS[index % CUP_COLUMNS])
+
+
+def draw_cup_grid(canvas, cups):
+    for index, cup in enumerate(cups[:CUPS_PER_PAGE]):
+        row, column = divmod(index, CUP_COLUMNS)
+        draw_cup(canvas, cup, index,
+                 CUP_GRID_LEFT + column * (CUP_WIDTH + CUP_GAP_X),
+                 CUP_GRID_TOP + row * (CUP_HEIGHT + CUP_GAP_Y))
+
+
+def draw_no_medals(canvas):
+    """The empty state, centred where the grid would be."""
+    note = Text("No Daily Cup medals yet", DISPLAY, 40, line_height=1, stroke=8,
+                stroke_color=rgba("#5E37B8"), shadow=4)
+    note.draw(ImageDraw.Draw(canvas), (MEDALS_WIDTH - note.width) / 2, 300)
+
+
+def compose_medals_card(*, username, avatar_png=None, counts=(0, 0, 0, 0), cups=(),
+                        page=1, pages=1):
+    canvas = medals_sky().copy()
+    totals_left = draw_medal_totals(canvas, counts)
+    draw_badges_header(canvas, username, open_image(avatar_png), rgba("#2160B8"),
+                       subtitle="Daily Cup Medals", max_right=totals_left - 16,
+                       empty="#0F1B33", mark_outline="#2A3B5E")
+    cups = list(cups)
+    if cups:
+        draw_cup_grid(canvas, cups)
+    else:
+        draw_no_medals(canvas)
+    footer = Text(f"page {page} / {pages}", HAND, 21)
+    draw_glowing_text(canvas, [(footer, MEDALS_WIDTH - 36 - footer.width,
+                                MEDALS_HEIGHT - 12 - footer.height)], rgba("#2E5E22"))
+    return clip_to(canvas, rounded_mask(MEDALS_WIDTH, MEDALS_HEIGHT, 24))
+
+
+def render_medals_card(**fields):
+    """One page of a player's Daily Cup medals as PNG bytes.
+
+    `counts` is (diamond, gold, silver, bronze). `cups` is up to
+    CUPS_PER_PAGE dicts, newest first: cup (the cup's number), date (text,
+    e.g. "13/11/2026"), name (the map's), tier (0 diamond .. 3 bronze) and
+    thumbnail_png (bytes, or None for the empty-photo sky). No cups draws
+    the empty state. `page` / `pages` drive the footer.
+    """
+    card = compose_medals_card(**fields)
     out = io.BytesIO()
     card.save(out, format="PNG", optimize=False, compress_level=6)
     return out.getvalue()

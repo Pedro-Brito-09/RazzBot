@@ -3814,8 +3814,10 @@ class MedalListView(CardView):
     async def next_page(self, interaction):
         await self.show_page(interaction, self.page + 1)
 
-async def build_medals_view(user_id, username, parent=None):
-    """A player's medal history, newest cup first, or None when they have none.
+async def fetch_medal_history(user_id):
+    """A player's medals, newest cup first, as dicts of index, tier, date,
+    map_id, map_name and entry (the map's community entry, or None). An
+    empty list when they have none.
 
     Medals are stored as the cup indexes they were won in, so the map and the
     date are resolved back out of the rotation rather than read from the entry.
@@ -3831,7 +3833,7 @@ async def build_medals_view(user_id, username, parent=None):
             if index is not None:
                 earned.append((index, tier))
     if not earned:
-        return None
+        return []
 
     todays_map = await fetch_entry("TodaysMap") or {}
     current_index, _ = await resolve_current_cup(todays_map)
@@ -3851,8 +3853,146 @@ async def build_medals_view(user_id, username, parent=None):
             "date": cup_date_for_index(index, current_index),
             "map_id": map_id,
             "map_name": (maps_by_id.get(map_id) or {}).get("Name") or "Unknown Map",
+            "entry": maps_by_id.get(map_id),
         })
+    return medals
+
+async def build_medals_view(user_id, username, parent=None):
+    """A player's medal history, newest cup first, or None when they have none."""
+    medals = await fetch_medal_history(user_id)
+    if not medals:
+        return None
     return MedalListView(medals, username=username, parent=parent)
+
+MEDALS_IMAGE_FILENAME = "medals.png"
+
+class MedalsImageCardView(CardView):
+    """A player's Daily Cup medals as rendered polaroids, ten cups a page.
+
+    On trial behind !testmedals before it replaces MedalListView. Map
+    thumbnails are fetched a page at a time and kept for the view's life.
+    """
+
+    def __init__(self, medals, *, username, avatar_png=None, parent=None,
+                 timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(parent=parent, timeout=timeout)
+        self.medals = medals
+        self.username = username
+        self.avatar_png = avatar_png
+        self.page = 0
+        self.card_image = None
+        self._thumbnails = {}
+        self._render_lock = asyncio.Lock()
+
+    @property
+    def page_count(self):
+        return max(1, -(-len(self.medals) // card_render.CUPS_PER_PAGE))
+
+    async def load_thumbnails(self, medals):
+        """Download the thumbnails of the page's maps not fetched yet."""
+        entries, seen = [], set()
+        for medal in medals:
+            map_id = medal["map_id"]
+            if medal["entry"] and map_id not in self._thumbnails and map_id not in seen:
+                seen.add(map_id)
+                entries.append(medal["entry"])
+        if not entries:
+            return
+        urls = await fetch_map_thumbnails(entries)
+        ids = [entry.get("Id") for entry in entries]
+        images = await asyncio.gather(*(
+            download_bytes(urls[map_id], f"medal_card_thumbnail({map_id})")
+            if urls.get(map_id) else asyncio.sleep(0)
+            for map_id in ids
+        ))
+        self._thumbnails.update(zip(ids, images))
+
+    async def refresh(self):
+        """Fetch the page's thumbnails, draw the page, lay out the message."""
+        async with self._render_lock:
+            self.page = max(0, min(self.page, self.page_count - 1))
+            per_page = card_render.CUPS_PER_PAGE
+            page_medals = self.medals[self.page * per_page:(self.page + 1) * per_page]
+            await self.load_thumbnails(page_medals)
+            counts = [0] * len(MEDAL_TIERS)
+            for medal in self.medals:
+                counts[medal["tier"]] += 1
+            cups = [{
+                "cup": medal["index"],
+                "date": f"{medal['date']:%d/%m/%Y}" if medal["date"] else "unknown date",
+                "name": medal["map_name"],
+                "tier": medal["tier"],
+                "thumbnail_png": self._thumbnails.get(medal["map_id"]),
+            } for medal in page_medals]
+            self.card_image = await asyncio.to_thread(
+                card_render.render_medals_card,
+                username=self.username, avatar_png=self.avatar_png, counts=tuple(counts),
+                cups=cups, page=self.page + 1, pages=self.page_count,
+            )
+            self.lay_out()
+
+    def lay_out(self):
+        self.clear_items()
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(
+            media=f"attachment://{MEDALS_IMAGE_FILENAME}",
+            description=f"{self.username}'s Daily Cup medals",
+        )
+        self.add_item(gallery)
+
+        note = dev_universe_note()
+        if note:
+            self.add_item(discord.ui.TextDisplay(note))
+
+        row = discord.ui.ActionRow()
+        if self.page_count > 1:
+            previous = discord.ui.Button(
+                label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️",
+                disabled=self.page == 0,
+            )
+            previous.callback = self.previous_page
+            row.add_item(previous)
+            following = discord.ui.Button(
+                label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
+                disabled=self.page >= self.page_count - 1,
+            )
+            following.callback = self.next_page
+            row.add_item(following)
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+        if row.children:
+            self.add_item(row)
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_image), filename=MEDALS_IMAGE_FILENAME)]
+
+    async def show(self, interaction):
+        # A render plus up to ten downloads outlasts the 3s to answer.
+        await interaction.response.defer()
+        await self.refresh()
+        await show_card(interaction, self)
+
+    @keeps_context
+    async def previous_page(self, interaction):
+        self.page -= 1
+        await self.show(interaction)
+
+    @keeps_context
+    async def next_page(self, interaction):
+        self.page += 1
+        await self.show(interaction)
+
+async def build_medals_image_view(user_id, username, parent=None):
+    """The image version of build_medals_view, first page drawn. A player
+    without medals gets the card's empty state."""
+    medals, avatar_png = await asyncio.gather(
+        fetch_medal_history(user_id), fetch_avatar_png(user_id),
+    )
+    view = MedalsImageCardView(medals, username=username, avatar_png=avatar_png,
+                               parent=parent)
+    await view.refresh()
+    return view
 
 class LinkedListView(CardView):
     """Every Discord account linked to a Roblox one, paged."""
@@ -5867,6 +6007,27 @@ async def test_badges_card(ctx, username: str = None):
         if view is None:
             await ctx.send("Couldn't fetch the game's badge list.")
             return
+
+    view.message = await ctx.send(view=view, files=view.card_files())
+
+@bot.command(name="testmedals", hidden=True)
+@commands.is_owner()
+async def test_medals_card(ctx, username: str = None):
+    """Owner-only preview of the image medals card, before /medals uses it.
+
+    `!testmedals [username|me]`: the player's Daily Cup medals as
+    polaroids, ten cups a page, newest first.
+    """
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+
+    async with ctx.typing():
+        lookup = None if username in (None, "me") else username
+        user_id, canonical = await resolve_command_user(ctx, lookup)
+        if user_id is None:
+            return
+        view = await build_medals_image_view(user_id, canonical)
 
     view.message = await ctx.send(view=view, files=view.card_files())
 
