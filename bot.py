@@ -3977,13 +3977,26 @@ class MapView(CardView):
         self.creator_id = creator_id
         self.creator_name = creator_name
 
-        map_id = entry.get("Id")
-        privacy = entry.get("Privacy")
         container = build_map_container(
             entry, headshot=headshot, creator_text=creator_text,
             thumbnail=thumbnail,
         )
+        row = self.map_buttons(
+            play_label=play_label, play_url_template=play_url_template,
+            show_leaderboard=show_leaderboard, show_creator=show_creator,
+        )
+        if row is not None:
+            container.add_item(row)
 
+        self.add_item(container)
+
+    def map_buttons(self, *, play_label="Play in Challenge Mode",
+                    play_url_template=PLAY_URL_TEMPLATE,
+                    show_leaderboard=True, show_creator=True):
+        """The card's action row (Play, Leaderboard, creator), or None if empty."""
+        map_id = self.entry.get("Id")
+        privacy = self.entry.get("Privacy")
+        creator_id, creator_name = self.creator_id, self.creator_name
         row = discord.ui.ActionRow()
         has_actions = False
         if privacy != "Private":
@@ -4016,10 +4029,7 @@ class MapView(CardView):
             row.add_item(creator_button)
             has_actions = True
 
-        if has_actions:
-            container.add_item(row)
-
-        self.add_item(container)
+        return row if has_actions else None
 
     @keeps_context
     async def show_leaderboard(self, interaction):
@@ -4060,6 +4070,87 @@ class MapView(CardView):
 
         view.message = interaction.message
         await show_card(interaction, view)
+
+MAP_CARD_FILENAME = "map.png"
+
+class MapCardView(MapView):
+    """The map card as a rendered image, with MapView's buttons under it.
+
+    On trial behind !testmap before it replaces MapView. The details live
+    in the picture (card_render.render_map_card); the buttons stay real
+    components, and their callbacks are MapView's.
+    """
+
+    def __init__(self, card_image, entry, *, creator_id=None, creator_name=None,
+                 parent=None, note=None, timeout=MAP_VIEW_TIMEOUT, **button_options):
+        # Skip MapView's text layout; only its buttons and callbacks are wanted.
+        CardView.__init__(self, parent=parent, timeout=timeout)
+        self.entry = entry
+        self.creator_id = creator_id
+        self.creator_name = creator_name
+        self.card_image = card_image
+
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(
+            media=f"attachment://{MAP_CARD_FILENAME}",
+            description=entry.get("Name") or "Community map",
+        )
+        self.add_item(gallery)
+        if note:
+            self.add_item(discord.ui.TextDisplay(note))
+
+        row = self.map_buttons(**button_options)
+        if row is not None:
+            self.add_item(row)
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_image), filename=MAP_CARD_FILENAME)]
+
+async def build_map_card_view(entry, parent=None):
+    """The image version of build_map_view."""
+    creator_id = entry.get("Creator")
+
+    async def no_bytes():
+        return None
+
+    creator, thumbnail_url, avatar_png = await asyncio.gather(
+        fetch_username(creator_id) if creator_id else no_bytes(),
+        fetch_map_thumbnail(entry),
+        fetch_avatar_png(creator_id) if creator_id else no_bytes(),
+    )
+    thumbnail_png = (await download_bytes(thumbnail_url, "build_map_card_view")
+                     if thumbnail_url else None)
+
+    map_id = entry.get("Id")
+    image = await asyncio.to_thread(
+        card_render.render_map_card,
+        name=entry.get("Name"),
+        map_id=map_id,
+        creator_name=creator,
+        creator_avatar_png=avatar_png,
+        thumbnail_png=thumbnail_png,
+        mode=entry.get("Playstyle"),
+        plays=entry.get("Plays") or 0,
+        favourites=entry.get("Favorites") or 0,
+        visibility=entry.get("Privacy"),
+        featured=bool(entry.get("Featured")),
+    )
+
+    # The exact name and creator in text: the card's font drops emoji and
+    # most non-Latin letters, and text can be copied. Escaped, or an
+    # underscore would turn the line italic.
+    parts = [discord.utils.escape_markdown(entry.get("Name") or "Unnamed Map")]
+    if creator:
+        parts.append(f"by @{discord.utils.escape_markdown(creator)}")
+    elif creator_id:
+        parts.append(f"by User {creator_id}")
+    parts.append(f"ID {map_id}")
+    note = "-# " + " · ".join(parts)
+
+    return MapCardView(
+        image, entry, creator_id=creator_id, creator_name=creator,
+        parent=parent, note=note,
+    )
 
 class DailyCupMapView(OwnedView, discord.ui.View):
     """The Daily Cup card's single experience Play action."""
@@ -5251,6 +5342,36 @@ async def test_profile_card(ctx, username: str = None, effect: str = None):
         if view is None:
             await ctx.send(f"No game data saved for **{canonical}**.")
             return
+
+    view.message = await ctx.send(view=view, files=view.card_files())
+
+@bot.command(name="testmap", hidden=True)
+@commands.is_owner()
+async def test_map_card(ctx, *, query: str):
+    """Owner-only preview of the image map card, before /map uses it.
+
+    `!testmap <map id or name>`. An ID finds any map, as /map does; a name
+    searches public maps.
+    """
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+
+    async with ctx.typing():
+        maps_by_id = await get_community_maps()
+        if not maps_by_id:
+            await ctx.send("Failed to fetch the community map list.")
+            return
+        cleaned = query.strip()
+        if cleaned.isdigit():
+            entry = maps_by_id.get(int(cleaned))
+        else:
+            matches = search_public_maps(maps_by_id, cleaned, limit=1)
+            entry = matches[0] if matches else None
+        if entry is None:
+            await ctx.send(f"No community map found for `{cleaned}`.")
+            return
+        view = await build_map_card_view(entry)
 
     view.message = await ctx.send(view=view, files=view.card_files())
 

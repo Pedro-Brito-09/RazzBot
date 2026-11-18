@@ -219,6 +219,40 @@ def fit_text(text, face, size, max_width, *, min_size, **style):
     return None
 
 
+def ellipsize(text, face, size, max_width, **style):
+    """The text at `size`, its tail cut off with an ellipsis until it fits."""
+    if Text(text, face, size, **style).width <= max_width:
+        return Text(text, face, size, **style)
+    while text and Text(text + "…", face, size, **style).width > max_width:
+        text = text[:-1]
+    return Text(text.rstrip() + "…", face, size, **style)
+
+
+def fit_or_ellipsize(text, face, size, max_width, *, min_size, **style):
+    """Shrink towards `min_size` to fit; past that, cut the tail short."""
+    return (fit_text(text, face, size, max_width, min_size=min_size, **style)
+            or ellipsize(text, face, min_size, max_width, **style))
+
+
+# A codepoint no font here has, to learn what each face draws for a missing one.
+_MISSING_PROBE = "\U0010FFFD"
+
+
+@functools.lru_cache(maxsize=4096)
+def _has_glyph(face, char):
+    font = load_font(face, 20)
+    missing = font.getmask(_MISSING_PROBE)
+    mask = font.getmask(char)
+    return mask.size != missing.size or bytes(mask) != bytes(missing)
+
+
+def drawable_text(text, face):
+    """The text minus characters the face can't draw (emoji, most scripts),
+    so they don't come out as boxes. Whitespace is collapsed."""
+    kept = "".join(c for c in str(text) if c.isspace() or _has_glyph(face, c))
+    return " ".join(kept.split())
+
+
 # ---------------------------------------------------------------- profile card
 
 CARD_WIDTH, CARD_HEIGHT = 960, 560
@@ -302,6 +336,16 @@ def vertical_gradient(width, height, stops):
     return column.resize((width, height))
 
 
+def cover_crop(image, width, height):
+    """CSS object-fit: cover. Scale to fill (output pixels), crop the overflow evenly."""
+    scale = max(width / image.width, height / image.height)
+    size = (max(width, round(image.width * scale)),
+            max(height, round(image.height * scale)))
+    cover = image.convert("RGBA").resize(size, Image.LANCZOS)
+    left, top = (cover.width - width) // 2, (cover.height - height) // 2
+    return cover.crop((left, top, left + width, top + height))
+
+
 def draw_background(canvas, color, image=None):
     """Fill the card: a map thumbnail, or a gradient of the player's colour.
 
@@ -316,13 +360,7 @@ def draw_background(canvas, color, image=None):
         (1.0, shade(color, 1.35) + (255,)),
     )))
     if image is not None:
-        # Cover: scale to fill, crop the overflow evenly.
-        scale = max(width / image.width, height / image.height)
-        size = (max(width, round(image.width * scale)),
-                max(height, round(image.height * scale)))
-        cover = image.convert("RGBA").resize(size, Image.LANCZOS)
-        left, top = (cover.width - width) // 2, (cover.height - height) // 2
-        canvas.alpha_composite(cover.crop((left, top, left + width, top + height)))
+        canvas.alpha_composite(cover_crop(image, width, height))
         # Darken the bottom edge so the footer reads over any scene.
         canvas.alpha_composite(vertical_gradient(width, height, (
             (0.0, (0, 0, 0, 0)), (0.7, (0, 0, 0, 0)), (1.0, (0, 0, 0, 120)),
@@ -457,10 +495,7 @@ def draw_name_banner(canvas, username, max_right, with_text=True, face=DISPLAY):
         name = fit_name_in_face(username, face, room, no_line_height)
     if name is None:
         # Too long even small: the card font, cut short.
-        text = username
-        while text and Text(text + "…", DISPLAY, 30, **style).width > room:
-            text = text[:-1]
-        name = Text(text.rstrip() + "…", DISPLAY, 30, **style)
+        name = ellipsize(username, DISPLAY, 30, room, **style)
     width = 74 + name.width + 36
     height = 12 + name.height + 6
     body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER,
@@ -526,13 +561,13 @@ def draw_medals(canvas, counts):
         left += width + 10
 
 
-def stat_value_text(value, outline, room):
+def stat_value_text(value, outline, room, size=30, min_size=22):
     """The stat number at the largest size that fits, compacting if needed."""
     style = dict(line_height=1, stroke=7, stroke_color=outline)
     text = value if isinstance(value, str) else format_count(value)
-    fitted = fit_text(text, DISPLAY, 30, room, min_size=22, **style)
+    fitted = fit_text(text, DISPLAY, size, room, min_size=min_size, **style)
     if fitted is None and not isinstance(value, str):
-        fitted = fit_text(compact_count(value), DISPLAY, 30, room, min_size=18, **style)
+        fitted = fit_text(compact_count(value), DISPLAY, size, room, min_size=18, **style)
     return fitted or Text(text, DISPLAY, 18, **style)
 
 
@@ -557,11 +592,11 @@ def draw_stat_grid(canvas, values):
         place(canvas, with_drop_shadow(body, 5), left, top, cell_width, cell_height)
 
 
-def draw_footer(canvas, left_text, right_text, dark):
+def draw_footer(canvas, left_text, right_text, dark, *, size=20, inset=40, bottom=20):
     """White footer text with a hard shadow and a soft glow behind it."""
-    parts = [Text(t, HAND, 20) for t in (left_text, right_text)]
-    top = CARD_HEIGHT - 20 - max(p.height for p in parts)
-    positions = [(40, top), (CARD_WIDTH - 40 - parts[1].width, top)]
+    parts = [Text(t, HAND, size) for t in (left_text, right_text)]
+    top = CARD_HEIGHT - bottom - max(p.height for p in parts)
+    positions = [(inset, top), (CARD_WIDTH - inset - parts[1].width, top)]
 
     glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     glow_draw = ImageDraw.Draw(glow)
@@ -640,6 +675,251 @@ def render_profile_card(**fields):
     below.alpha_composite(above)
     out = io.BytesIO()
     below.save(out, format="PNG", optimize=False, compress_level=6)
+    return out.getvalue()
+
+
+# ---------------------------------------------------------------- map card
+
+# The polaroid: a 606px-wide paper, tilted -3deg, at (38, 50).
+POLAROID_LEFT, POLAROID_TOP, POLAROID_WIDTH = 38, 50, 606
+# padding 16 + 318 photo + 12 gap + 64 caption row + 14 padding.
+POLAROID_HEIGHT = 16 + 318 + 12 + 64 + 14
+PHOTO_WIDTH, PHOTO_HEIGHT = POLAROID_WIDTH - 32, 318
+CAPTION_TOP = 16 + PHOTO_HEIGHT + 12
+# The caption row's padding: 16 paper + 6 row on each side.
+CAPTION_LEFT, CAPTION_RIGHT = 22, POLAROID_WIDTH - 22
+MAP_PURPLE = "#6B45C9"
+# The creator's name gives up its tail past this, leaving the map name room.
+CREATOR_MAX_WIDTH = 160
+CLIP_TAPE = ((3, 0), (97, 0), (100, 25), (96, 50), (100, 75), (97, 100),
+             (3, 100), (0, 75), (4, 50), (0, 25))
+# The stat column: left 682, right 34, from top 40, 26 apart.
+MAP_STRIPS_LEFT, MAP_STRIPS_TOP, MAP_STRIPS_GAP = 682, 40, 26
+MAP_STRIPS_WIDTH = CARD_WIDTH - MAP_STRIPS_LEFT - 34
+
+# Icon per game mode; unknown modes get the party one.
+MAP_MODE_ICONS = {"PARTY": "party"}
+
+
+def map_icon(name, size):
+    return load_icon("map", name, size)
+
+
+def solid(width, height, color):
+    return Image.new("RGBA", (px(width), px(height)), color)
+
+
+@functools.lru_cache(maxsize=1)
+def map_scene():
+    """The sky, dotted banner, hill and flag behind the polaroid. Same on
+    every card, so it's drawn once."""
+    width, height = px(CARD_WIDTH), px(CARD_HEIGHT)
+    scene = vertical_gradient(width, height, (
+        (0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")),
+    ))
+
+    # A 110x340 blue banner with a 12px grid of dots, tilted -6deg.
+    def dots(draw, k):
+        for cx in range(6, 110, 12):
+            for cy in range(6, 340, 12):
+                draw.ellipse(((cx - 2.3) * k, (cy - 2.3) * k,
+                              (cx + 2.3) * k, (cy + 2.3) * k), fill=255)
+    banner = solid(110, 340, rgba("#2B5FBF"))
+    dot_layer = solid(110, 340, rgba("#1C468F"))
+    dot_layer.putalpha(shape_mask(110, 340, dots))
+    banner.alpha_composite(dot_layer)
+    place(scene, banner, 640, -30, 110, 340, rotate=-6)
+
+    # The hill: a 1080x170 ellipse sunk 70px below the card. Only its top
+    # 100px show, so only that slice is drawn.
+    hill_top = CARD_HEIGHT + 70 - 170
+
+    def hill_shape(draw, k):
+        draw.ellipse((-60 * k, 0, 1020 * k, 170 * k), fill=255)
+    hill = solid(CARD_WIDTH, CARD_HEIGHT - hill_top, rgba("#4F8E3A"))
+    hill.putalpha(shape_mask(CARD_WIDTH, CARD_HEIGHT - hill_top, hill_shape))
+    scene.alpha_composite(hill, (0, px(hill_top)))
+
+    block = clip_to(solid(60, 60, rgba("#D8343A")), rounded_mask(60, 60, 10))
+    place(scene, block, 600, CARD_HEIGHT - 30 - 60, 60, 60, rotate=-10)
+    square = ((0, 0), (100, 0), (100, 100), (0, 100))
+    place(scene, strip(7, 100, rgba("#2A2F3C"), square), 880, 470, 7, 100, rotate=10)
+    place(scene, strip(44, 32, rgba("#E8333A"), ((0, 0), (100, 50), (0, 100))),
+          888, 466, 44, 32, rotate=10)
+    return scene
+
+
+def draw_photo(paper, thumbnail):
+    """The map thumbnail filling the photo, or a plain sky with the map icon."""
+    width, height = px(PHOTO_WIDTH), px(PHOTO_HEIGHT)
+    if thumbnail is not None:
+        photo = Image.new("RGBA", (width, height), rgba("#0B0B14"))
+        photo.alpha_composite(cover_crop(thumbnail, width, height))
+    else:
+        photo = vertical_gradient(width, height, (
+            (0.0, rgba("#2F7FE0")), (1.0, rgba("#6DB8FA")),
+        ))
+        photo.alpha_composite(dot_pattern(width, height, rgba("#1C468F", 56)))
+        paste_icon(photo, map_icon("map", 110), (PHOTO_WIDTH - 110) / 2, 84)
+        note = Text("no picture yet", HAND, 26, stroke=6, stroke_color=rgba("#1C468F"))
+        note.draw(ImageDraw.Draw(photo), (PHOTO_WIDTH - note.width) / 2, 204)
+    photo = clip_to(photo, rounded_mask(PHOTO_WIDTH, PHOTO_HEIGHT, 4))
+    paper.alpha_composite(photo, (px(16), px(16)))
+
+
+def round_avatar(avatar):
+    """The creator's 44px headshot in a white 4px border and a 3px purple ring,
+    58px across. Missing: the placeholder colour with a question mark."""
+    ring = clip_to(solid(58, 58, rgba(MAP_PURPLE)), rounded_mask(58, 58, 29))
+    white = clip_to(solid(52, 52, WHITE), rounded_mask(52, 52, 26))
+    ring.alpha_composite(white, (px(3), px(3)))
+    face = solid(44, 44, rgba("#C9A15A"))
+    if avatar is not None:
+        side = min(avatar.size)
+        left, top = (avatar.width - side) // 2, (avatar.height - side) // 2
+        square = avatar.crop((left, top, left + side, top + side))
+        face.alpha_composite(square.resize(face.size, Image.LANCZOS))
+    else:
+        mark = Text("?", DISPLAY, 26, line_height=1, stroke=6,
+                    stroke_color=rgba("#8A6A2E"))
+        mark.draw(ImageDraw.Draw(face), (44 - mark.width) / 2, (44 - mark.height) / 2 + 2)
+    ring.alpha_composite(clip_to(face, rounded_mask(44, 44, 22)), (px(7), px(7)))
+    return ring
+
+
+def draw_caption(paper, map_name, creator_name, avatar):
+    """The row under the photo: map icon and name left, creator right."""
+    draw = ImageDraw.Draw(paper)
+    purple = rgba(MAP_PURPLE)
+    row_mid = CAPTION_TOP + 32
+
+    # Creator first, since the map name gets whatever room it leaves.
+    by = Text("by", HAND, 17, line_height=1, fill=purple)
+    handle = ellipsize(f"@{creator_name}" if creator_name else "unknown",
+                       DISPLAY, 24, CREATOR_MAX_WIDTH, line_height=1, fill=purple)
+    column = max(by.width, handle.width)
+    group_left = CAPTION_RIGHT - (52 + 10 + column)
+    paper.alpha_composite(round_avatar(avatar), (px(group_left - 3), px(row_mid - 26 - 3)))
+    # Luckiest Guy's capitals stand taller than its line box, so the handle
+    # sits 3px lower than the template's padding to clear the "y" of "by".
+    text_left, text_top = group_left + 52 + 10, row_mid - 23.5
+    by.draw(draw, text_left, text_top)
+    handle.draw(draw, text_left, text_top + 17 + 6)
+
+    paste_icon(paper, map_icon("map", 54), CAPTION_LEFT, row_mid - 27)
+    name_left = CAPTION_LEFT + 54 + 14
+    room = group_left - 14 - name_left
+    name = fit_or_ellipsize(map_name, DISPLAY, 58, room, min_size=32, line_height=1,
+                            stroke=9, stroke_color=purple, shadow=5)
+    # Its box is the font size tall plus 6px padding on top, centred in the
+    # 64px row, so a shrunk name stays on the row's middle.
+    name.draw(draw, name_left, CAPTION_TOP + 6 + (58 - name.height) / 2)
+
+
+def draw_polaroid(canvas, map_name, creator_name, avatar, thumbnail):
+    paper = clip_to(solid(POLAROID_WIDTH, POLAROID_HEIGHT, rgba("#FFFDF4")),
+                    rounded_mask(POLAROID_WIDTH, POLAROID_HEIGHT, 6))
+    draw_photo(paper, thumbnail)
+    draw_caption(paper, map_name, creator_name, avatar)
+
+    # Padding for the tape, which overhangs the corners, then the two
+    # strips of tape, then the whole thing tilts as one.
+    pad = 40
+    layer = with_drop_shadow(paper, 9, pad=pad)
+    tape = strip(120, 34, rgba("#FFF1B5", 217), CLIP_TAPE)
+    place(layer, tape, pad - 22, pad - 10, 120, 34, rotate=-32)
+    place(layer, tape, pad + POLAROID_WIDTH + 22 - 120, pad - 10, 120, 34, rotate=30)
+    place(canvas, layer, POLAROID_LEFT - pad, POLAROID_TOP - pad,
+          POLAROID_WIDTH + 2 * pad, POLAROID_HEIGHT + 2 * pad, rotate=-3)
+
+
+def draw_map_strip(canvas, top, icon, value, caption, fill, outline, rotate):
+    """One stat strip of the right-hand column. `value` is a laid-out Text.
+    Returns its height."""
+    dark = rgba(outline)
+    label = Text(caption, HAND, 19, line_height=1.1, stroke=4, stroke_color=dark)
+    inner = max(52, value.height + label.height)
+    height = 10 + inner + 10
+
+    def content(image, draw):
+        paste_icon(image, map_icon(icon, 52), 14, 10 + (inner - 52) / 2)
+        text_top = 10 + (inner - value.height - label.height) / 2
+        value.draw(draw, 14 + 52 + 12, text_top)
+        label.draw(draw, 14 + 52 + 12, text_top + value.height)
+
+    body = strip(MAP_STRIPS_WIDTH, height, rgba(fill), CLIP_STAT, content)
+    place(canvas, with_drop_shadow(body, 4), MAP_STRIPS_LEFT, top,
+          MAP_STRIPS_WIDTH, height, rotate=rotate)
+    return height
+
+
+def map_tag(text, fill, outline):
+    """A small torn tag (the visibility one): padding 6px 20px 3px."""
+    label = Text(text, DISPLAY, 22, stroke=6, stroke_color=rgba(outline))
+    width, height = 20 + label.width + 20, 6 + label.height + 3
+    body = strip(width, height, rgba(fill), CLIP_MEDAL,
+                 lambda image, draw: label.draw(draw, 20, 6))
+    return body, width, height
+
+
+def draw_map_strips(canvas, mode, plays, favourites, visibility, featured):
+    room = MAP_STRIPS_WIDTH - 14 - 52 - 12 - 18
+    top = MAP_STRIPS_TOP
+
+    mode_text = drawable_text(mode or "", DISPLAY).upper() or "UNKNOWN"
+    mode_value = fit_or_ellipsize(mode_text, DISPLAY, 32, room, min_size=22,
+                                  line_height=1, stroke=7, stroke_color=rgba("#5E37B8"))
+    strips = (
+        (MAP_MODE_ICONS.get(mode_text, "party"), mode_value, "game mode",
+         "#A57CF7", "#5E37B8", 2),
+        ("play", stat_value_text(plays, rgba("#3F8F1E"), room, size=34, min_size=30),
+         "play" if plays == 1 else "plays", "#8BE04E", "#3F8F1E", -1.5),
+        ("star", stat_value_text(favourites, rgba("#A87A00"), room, size=34, min_size=30),
+         "favourite" if favourites == 1 else "favourites", "#FFD64F", "#A87A00", 1.5),
+    )
+    for icon, value, caption, fill, outline, rotate in strips:
+        top += draw_map_strip(canvas, top, icon, value, caption, fill, outline,
+                              rotate) + MAP_STRIPS_GAP
+
+    # Visibility, then Featured beside it (or under it, if they won't fit).
+    tags = []
+    if visibility:
+        tags.append(map_tag(str(visibility).upper(), "#7FE8C2", "#239372") + (-2,))
+    if featured:
+        tags.append(map_tag("FEATURED", "#FFD64F", "#A87A00") + (2,))
+    left = MAP_STRIPS_LEFT
+    for body, width, height, rotate in tags:
+        if left > MAP_STRIPS_LEFT and left + width > CARD_WIDTH - 20:
+            left, top = MAP_STRIPS_LEFT, top + height + 12
+        place(canvas, with_drop_shadow(body, 4), left, top, width, height, rotate=rotate)
+        left += width + 10
+
+
+def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=None,
+                    thumbnail_png=None, mode=None, plays=0, favourites=0,
+                    visibility=None, featured=False):
+    """A community map's card as PNG bytes.
+
+    `visibility` is Public / Unlisted / Private, or None to leave the tag
+    off. Missing avatar or thumbnail bytes get placeholders.
+    """
+    plays, favourites = max(0, plays or 0), max(0, favourites or 0)
+    shown_name = drawable_text(name or "", DISPLAY)
+    if not shown_name:
+        shown_name = f"Map {map_id}" if map_id is not None else "Unnamed Map"
+    creator = drawable_text(creator_name or "", DISPLAY) or None
+
+    canvas = map_scene().copy()
+    draw_polaroid(canvas, shown_name, creator, open_image(creator_avatar_png),
+                  open_image(thumbnail_png))
+    draw_map_strips(canvas, mode, plays, favourites, visibility, featured)
+    if map_id is not None:
+        draw_footer(canvas, f"map ID {map_id}", "", rgba("#2E5E22"),
+                    size=22, inset=48, bottom=22)
+
+    card = clip_to(canvas, rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24))
+    out = io.BytesIO()
+    card.save(out, format="PNG", optimize=False, compress_level=6)
     return out.getvalue()
 
 
