@@ -3471,6 +3471,8 @@ async def badge_card_items(user_id):
          "earned": badge["id"] in owned_ids, "circle": True}
         for badge in badges
     ] + maps
+    # Earned first, locked after; each keeps its order within its group.
+    items.sort(key=lambda item: not item["earned"])
     colors = card_render.BADGE_COLORS
     for index, item in enumerate(items):
         item["color"] = colors[index % len(colors)]
