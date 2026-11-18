@@ -144,14 +144,14 @@ def clip_to(image, mask):
     return image
 
 
-def with_drop_shadow(body, offset, pad=12):
+def with_drop_shadow(body, offset, pad=12, color=SHADOW):
     """Pad the body and put the design's hard shadow `offset` px below it."""
     pad_px = px(pad)
     layer = Image.new("RGBA", (body.width + 2 * pad_px, body.height + 2 * pad_px),
                       (0, 0, 0, 0))
     if offset:
-        shadow = Image.new("RGBA", body.size, SHADOW[:3] + (0,))
-        shadow.putalpha(body.getchannel("A").point(lambda a: a * SHADOW[3] // 255))
+        shadow = Image.new("RGBA", body.size, color[:3] + (0,))
+        shadow.putalpha(body.getchannel("A").point(lambda a: a * color[3] // 255))
         layer.alpha_composite(shadow, (pad_px, pad_px + px(offset)))
     layer.alpha_composite(body, (pad_px, pad_px))
     return layer
@@ -166,7 +166,13 @@ def place(canvas, layer, left, top, width, height, rotate=0):
     if rotate:
         layer = layer.rotate(-rotate, resample=Image.BICUBIC, expand=True)
     cx, cy = px(left + width / 2), px(top + height / 2)
-    canvas.alpha_composite(layer, (cx - layer.width // 2, cy - layer.height // 2))
+    x, y = cx - layer.width // 2, cy - layer.height // 2
+    # Shapes hanging off the card's top or left edge: cut off what's outside,
+    # since older Pillow refuses a negative destination.
+    if x < 0 or y < 0:
+        layer = layer.crop((max(0, -x), max(0, -y), layer.width, layer.height))
+        x, y = max(0, x), max(0, y)
+    canvas.alpha_composite(layer, (x, y))
 
 
 def strip(width, height, color, clip, draw_content=None):
@@ -387,26 +393,37 @@ def dot_pattern(width, height, fill):
     return layer
 
 
-def draw_avatar(canvas, avatar):
-    """The white-framed avatar tile, tilted, with a placeholder if missing."""
-    outer, border, radius = 154, 7, 24
-    tile = Image.new("RGBA", (px(outer), px(outer)), WHITE)
-    tile = clip_to(tile, rounded_mask(outer, outer, radius))
+def framed_avatar(avatar, outer, border, radius, empty, mark_outline):
+    """A square avatar in a rounded white frame, `outer` px across.
+
+    `empty` fills the frame behind the picture (and shows through a
+    transparent one); a missing avatar gets a question mark outlined in
+    `mark_outline`.
+    """
+    tile = clip_to(solid(outer, outer, WHITE), rounded_mask(outer, outer, radius))
     inner_size = outer - 2 * border
-    inner = Image.new("RGBA", (px(inner_size), px(inner_size)), rgba("#0F1B33"))
+    inner = solid(inner_size, inner_size, rgba(empty))
     if avatar is not None:
         side = min(avatar.size)
         left, top = (avatar.width - side) // 2, (avatar.height - side) // 2
         face = avatar.crop((left, top, left + side, top + side))
         inner.alpha_composite(face.resize(inner.size, Image.LANCZOS))
     else:
-        mark = Text("?", DISPLAY, 72, line_height=1, stroke=8,
-                    stroke_color=rgba("#2A3B5E"))
+        # The profile's 72px mark in its 140px frame, kept in proportion.
+        size = round(inner_size * 72 / 140)
+        mark = Text("?", DISPLAY, size, line_height=1, stroke=size / 9,
+                    stroke_color=rgba(mark_outline))
         mark.draw(ImageDraw.Draw(inner), (inner_size - mark.width) / 2,
-                  (inner_size - mark.height) / 2 + 4)
+                  (inner_size - mark.height) / 2 + size / 18)
     inner = clip_to(inner, rounded_mask(inner_size, inner_size, radius - border))
     tile.alpha_composite(inner, (px(border), px(border)))
-    place(canvas, with_drop_shadow(tile, 7), 40, 64, outer, outer, rotate=-5)
+    return tile
+
+
+def draw_avatar(canvas, avatar):
+    """The white-framed avatar tile, tilted, with a placeholder if missing."""
+    tile = framed_avatar(avatar, 154, 7, 24, "#0F1B33", "#2A3B5E")
+    place(canvas, with_drop_shadow(tile, 7), 40, 64, 154, 154, rotate=-5)
 
 
 def draw_stars_strip(canvas, stars, stars_all_time):
@@ -592,16 +609,32 @@ def draw_footer(canvas, left_text, right_text, dark, *, size=20, inset=40, botto
     """White footer text with a hard shadow and a soft glow behind it."""
     parts = [Text(t, HAND, size) for t in (left_text, right_text)]
     top = CARD_HEIGHT - bottom - max(p.height for p in parts)
-    positions = [(inset, top), (CARD_WIDTH - inset - parts[1].width, top)]
+    draw_glowing_text(canvas, [(parts[0], inset, top),
+                               (parts[1], CARD_WIDTH - inset - parts[1].width, top)], dark)
 
-    glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+
+def draw_glowing_text(canvas, placed, dark):
+    """White text over a hard shadow 2px down and a soft glow, both `dark`:
+    the design's text-shadow: 0 2px 0 dark, 0 0 6px dark. `placed` is a list
+    of (Text, x, y) in design pixels."""
+    # The glow is blurred over just the text's area, not the whole card.
+    margin = px(12)
+    boxes = [part.font.getbbox(part.text, anchor="ls") for part, _, _ in placed if part.text]
+    if not boxes:
+        return
+    origins = [(px(x), px(y + part.baseline)) for part, x, y in placed if part.text]
+    left = max(0, min(ox + b[0] for (ox, _), b in zip(origins, boxes)) - margin)
+    top = max(0, min(oy + b[1] for (_, oy), b in zip(origins, boxes)) - margin)
+    right = max(ox + b[2] for (ox, _), b in zip(origins, boxes)) + margin
+    bottom = max(oy + b[3] for (_, oy), b in zip(origins, boxes)) + margin
+    glow = Image.new("RGBA", (right - left, bottom - top), (0, 0, 0, 0))
     glow_draw = ImageDraw.Draw(glow)
-    for part, (x, y) in zip(parts, positions):
-        glow_draw.text((px(x), px(y + part.baseline)), part.text, font=part.font,
-                       fill=dark, anchor="ls")
-    canvas.alpha_composite(glow.filter(ImageFilter.GaussianBlur(px(3))))
+    for part, x, y in placed:
+        glow_draw.text((px(x) - left, px(y + part.baseline) - top), part.text,
+                       font=part.font, fill=dark, anchor="ls")
+    canvas.alpha_composite(glow.filter(ImageFilter.GaussianBlur(px(3))), (left, top))
     draw = ImageDraw.Draw(canvas)
-    for part, (x, y) in zip(parts, positions):
+    for part, x, y in placed:
         draw.text((px(x), px(y + part.baseline + 2)), part.text, font=part.font,
                   fill=dark, anchor="ls")
         part.draw(draw, x, y)
@@ -955,16 +988,20 @@ def draw_polaroid(canvas, map_name, creator_name, avatar, thumbnail, handle_face
     return handle
 
 
-def paper_to_canvas(x, y):
-    """Where a point on the polaroid's paper lands on the card, in design px.
-
-    The paper turns POLAROID_TILT degrees (CSS: clockwise) about its centre.
-    """
-    cx, cy = POLAROID_WIDTH / 2, POLAROID_HEIGHT / 2
-    theta = math.radians(POLAROID_TILT)
+def turn_point(x, y, left, top, width, height, degrees):
+    """Where point (x, y) of a box at (left, top) lands once the box turns
+    `degrees` (CSS: clockwise) about its centre, in design px."""
+    cx, cy = width / 2, height / 2
+    theta = math.radians(degrees)
     dx, dy = x - cx, y - cy
-    return (POLAROID_LEFT + cx + dx * math.cos(theta) - dy * math.sin(theta),
-            POLAROID_TOP + cy + dx * math.sin(theta) + dy * math.cos(theta))
+    return (left + cx + dx * math.cos(theta) - dy * math.sin(theta),
+            top + cy + dx * math.sin(theta) + dy * math.cos(theta))
+
+
+def paper_to_canvas(x, y):
+    """Where a point on the polaroid's paper lands on the card, in design px."""
+    return turn_point(x, y, POLAROID_LEFT, POLAROID_TOP, POLAROID_WIDTH, POLAROID_HEIGHT,
+                      POLAROID_TILT)
 
 
 def draw_map_strip(canvas, top, icon, value, caption, fill, outline, rotate):
@@ -1076,6 +1113,401 @@ def render_map_card(**fields):
     Missing avatar or thumbnail bytes get placeholders.
     """
     card, _ = compose_map_card(**fields)
+    out = io.BytesIO()
+    card.save(out, format="PNG", optimize=False, compress_level=6)
+    return out.getvalue()
+
+
+# ---------------------------------------------------------------- leaderboard card
+
+LEADERBOARD_WIDTH, LEADERBOARD_HEIGHT = 960, 640
+# The time medals, best first, so a tier is its index (get_medal_emoji's order).
+MEDAL_ICONS = ("medal-diamond", "medal-gold", "medal-silver", "medal-bronze")
+PAPER = "#FFF1B5"
+TIME_PURPLE = "#3D2490"
+NAME_INK = "#2A2F4A"
+# rgba(20,20,60,0.2), the lighter shadow under the time pills and sheet flags.
+LIGHT_SHADOW = (20, 20, 60, 51)
+CLIP_BLOCK = ((0, 3), (25, 0), (50, 2.5), (75, 0), (100, 3), (100, 100), (0, 100))
+CLIP_SHEET = ((0, 1), (22, 0), (48, 1.2), (76, 0), (100, 0.8), (99.2, 34), (100, 66),
+              (99.4, 99), (72, 100), (44, 98.8), (18, 100), (0, 99.2), (0.8, 64), (0, 30))
+
+# The podium by place (1st, 2nd, 3rd): the block's left, top and width, its
+# fill and outline, then the avatar tile's left, top, size, tilt and the
+# colour behind the picture. The blocks are 320px tall and run off the card.
+PODIUM = (
+    (174, 370, 156, "#FFD64F", "#A87A00", (192, 246, 120, 3, "#2A2F4A")),
+    (22, 420, 146, "#6CC4F4", "#2A78B8", (43, 312, 104, -4, "#9ED3FF")),
+    (336, 450, 146, "#FFA851", "#C4610F", (357, 342, 104, 4, "#C9A6FF")),
+)
+BLOCK_HEIGHT = 320
+# The ranks 4-10 sheet: left 498, top 122, 438 wide, padding 14px 22px 16px,
+# rows 46px tall under a 2px dashed rule.
+SHEET_LEFT, SHEET_TOP, SHEET_WIDTH, SHEET_PAD = 498, 122, 438, 22
+SHEET_ROW = 46
+SHEET_ROWS = 7
+# The title banner shrinks from 44px to 28px, then loses its tail, to keep
+# its right edge here: over the dotted strip, clear of the sheet's column.
+TITLE_MAX_RIGHT = 600
+
+
+def flag_path(code):
+    """The bundled flag for an ISO 3166 alpha-2 code, or None."""
+    code = str(code or "").strip().lower()
+    if len(code) != 2 or not code.isascii() or not code.isalpha():
+        return None
+    path = os.path.join(ASSETS, "flags", f"{code}.png")
+    return path if os.path.exists(path) else None
+
+
+@functools.lru_cache(maxsize=128)
+def flag_tile(code, width, height):
+    """The flag cover-cropped to width x height inside a 2px white border with
+    3px corners, or None for a player with no (known) country."""
+    path = flag_path(code)
+    if path is None:
+        return None
+    with Image.open(path) as image:
+        flag = image.convert("RGBA")
+    outer_w, outer_h = width + 4, height + 4
+    frame = clip_to(solid(outer_w, outer_h, WHITE), rounded_mask(outer_w, outer_h, 3))
+    inner = clip_to(cover_crop(flag, px(width), px(height)), rounded_mask(width, height, 1))
+    frame.alpha_composite(inner, (px(2), px(2)))
+    return frame
+
+
+def dotted_slab(width, height, fill, dot, spacing=12, radius=2.3):
+    """A slab with a grid of dots, one centred in each spacing-sized tile:
+    background-image: radial-gradient(dot 2px, transparent 2.6px)."""
+    def paint(draw, k):
+        for cx in range(spacing // 2, width + spacing, spacing):
+            for cy in range(spacing // 2, height + spacing, spacing):
+                draw.ellipse(((cx - radius) * k, (cy - radius) * k,
+                              (cx + radius) * k, (cy + radius) * k), fill=255)
+    slab = solid(width, height, rgba(fill))
+    dots = solid(width, height, rgba(dot))
+    dots.putalpha(shape_mask(width, height, paint))
+    slab.alpha_composite(dots)
+    return slab
+
+
+@functools.lru_cache(maxsize=1)
+def leaderboard_backdrop():
+    """The sky, the dotted strip, the hill and the grey block. The same on
+    every card, so it's drawn once; copy it before drawing on it."""
+    width, height = px(LEADERBOARD_WIDTH), px(LEADERBOARD_HEIGHT)
+    canvas = vertical_gradient(width, height, (
+        (0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")),
+    ))
+    place(canvas, dotted_slab(100, 300, "#2B5FBF", "#1C468F"), 430, -30, 100, 300,
+          rotate=-6)
+
+    def ellipse(draw, k):
+        draw.ellipse((0, 0, 1080 * k - 1, 190 * k - 1), fill=255)
+    hill = clip_to(solid(1080, 190, rgba("#4F8E3A")), shape_mask(1080, 190, ellipse))
+    place(canvas, hill, -60, LEADERBOARD_HEIGHT + 80 - 190, 1080, 190)
+    block = clip_to(solid(54, 54, rgba("#5A6070")), rounded_mask(54, 54, 8))
+    place(canvas, block, 470, 180, 54, 54, rotate=14)
+    return canvas
+
+
+def player_name(name, size, min_size, room, **style):
+    """A player's name in the card font: shrunk to `min_size` to fit, then cut."""
+    text = drawable_text(name or "", DISPLAY) or "Unknown"
+    return (fit_text(text, DISPLAY, size, room, min_size=min_size, **style)
+            or ellipsize(text, DISPLAY, min_size, room, **style))
+
+
+def effect_name_text(player, size, min_size, room, style):
+    """The name laid out for its username effect: in the effect's font,
+    sized like the card font's (fit_name_in_face), or the card font if the
+    effect has none or its font can't fit. Drawn later, by AnimatedName."""
+    text = drawable_text(player.get("name") or "", DISPLAY) or "Unknown"
+    face = player["effect"].get("font") or DISPLAY
+    name = None
+    if face != DISPLAY:
+        name = fit_name_in_face(text, face, room, style, size=size, min_size=min_size)
+    return name or player_name(text, size, min_size, room, **style)
+
+
+def medal_tier(player):
+    tier = player.get("tier")
+    return tier if isinstance(tier, int) and 0 <= tier < len(MEDAL_ICONS) else None
+
+
+def draw_title_banner(canvas, title):
+    outline = rgba("#5E37B8")
+    style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=4)
+    room = TITLE_MAX_RIGHT - 24 - (18 + 54 + 12 + 36)
+    text = drawable_text(title or "", DISPLAY) or "Leaderboard"
+    name = (fit_text(text, DISPLAY, 44, room, min_size=28, **style)
+            or ellipsize(text, DISPLAY, 28, room, **style))
+    # padding 10px 36px 6px 18px around a 54px trophy and the 44px text with
+    # 6px on top; a shrunk title stays centred in the full-size slot.
+    inner = 54
+    width = 18 + 54 + 12 + name.width + 36
+    height = 10 + inner + 6
+
+    def content(image, draw):
+        paste_icon(image, profile_icon("trophy", 54), 18, 10)
+        name.draw(draw, 18 + 54 + 12, 10 + (inner - name.height - 6) / 2 + 6)
+
+    body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER, content)
+    place(canvas, with_drop_shadow(body, 5), 24, 26, width, height, rotate=-1.5)
+
+
+def time_pill(time_text, tier):
+    """The cream time tag: padding 6px 12px 4px 10px, an optional 34px medal
+    with -8px/-2px margins (so it spills out and is clipped), 4px gap."""
+    label = shrink_to_fit(time_text, DISPLAY, 18, 112, min_size=12,
+                          fill=rgba(TIME_PURPLE))
+    inner = max(18 if tier is not None else 0, label.height + 3)
+    width = 10 + (30 + 4 if tier is not None else 0) + label.width + 12
+    height = 6 + inner + 4
+
+    def content(image, draw):
+        x = 10
+        if tier is not None:
+            place(image, profile_icon(MEDAL_ICONS[tier], 34), x - 2,
+                  6 + (inner - 18) / 2 - 8, 34, 34)
+            x += 30 + 4
+        label.draw(draw, x, 6 + (inner - label.height - 3) / 2 + 3)
+
+    return strip(width, height, rgba(PAPER), CLIP_MEDAL, content), width, height
+
+
+def draw_podium_spot(canvas, index, player, animated=None):
+    """One podium place: the avatar tile above, the block with rank, flag,
+    name and time below. `index` is 0 for first.
+
+    With `animated` (a list), a player with an "effect" has their name left
+    off and an AnimatedName spec for it appended instead.
+    """
+    left, top, width, fill, outline, avatar_box = PODIUM[index]
+    a_left, a_top, a_size, tilt, empty = avatar_box
+    dark = rgba(outline)
+
+    tile = with_drop_shadow(
+        framed_avatar(open_image(player.get("avatar_png")), a_size, 6, 22, empty, outline), 6)
+    if index == 0:
+        # The crown sits on the tile's top-left corner and tilts with it.
+        pad = 40
+        side = a_size + 2 * pad
+        layer = Image.new("RGBA", (px(side), px(side)), (0, 0, 0, 0))
+        place(layer, tile, pad, pad, a_size, a_size)
+        place(layer, profile_icon("crown", 56), pad - 22, pad - 30, 56, 56, rotate=-22)
+        place(canvas, layer, a_left - pad, a_top - pad, side, side, rotate=tilt)
+    else:
+        place(canvas, tile, a_left, a_top, a_size, a_size, rotate=tilt)
+
+    rank = Text(str(player.get("rank", index + 1)), DISPLAY, 60, line_height=1,
+                stroke=10, stroke_color=dark, shadow=5)
+    flag = flag_tile(player.get("country"), 28, 19)
+    room = width - 16 - (32 + 6 if flag else 0)
+    style = dict(stroke=5, stroke_color=dark)
+    effect = player.get("effect") if animated is not None else None
+    if effect:
+        name = effect_name_text(player, 16, 8, room, style)
+    else:
+        name = player_name(player.get("name"), 16, 12, room, **style)
+    row_height = max(23 if flag else 0, name.height + 3)
+    row_width = (32 + 6 if flag else 0) + name.width
+    pill, pill_width, pill_height = time_pill(player.get("time") or "--", medal_tier(player))
+    name_at = []
+
+    def content(image, draw):
+        # A column centred under padding 12px 8px 0, 6px apart.
+        rank.draw(draw, (width - rank.width) / 2, 12)
+        y = 12 + rank.height + 6
+        x = (width - row_width) / 2
+        if flag:
+            place(image, with_drop_shadow(flag, 2), x, y + (row_height - 23) / 2, 32, 23)
+            x += 32 + 6
+        name_at.append((x, y + (row_height - name.height - 3) / 2 + 3))
+        if not effect:
+            name.draw(draw, *name_at[0])
+        y += row_height + 6
+        place(image, with_drop_shadow(pill, 3, color=LIGHT_SHADOW),
+              (width - pill_width) / 2, y, pill_width, pill_height)
+
+    body = strip(width, BLOCK_HEIGHT, rgba(fill), CLIP_BLOCK, content)
+    place(canvas, with_drop_shadow(body, 6), left, top, width, BLOCK_HEIGHT)
+    if effect:
+        x, y = name_at[0]
+        animated.append(dict(name=name, at=(left + x, top + y), effect=effect, outline=dark,
+                             stroke_scale=16 / NAME_SIZE, margin=HANDLE_MARGIN))
+
+
+def dashed_rule(draw, left, right, y, color, dash=6, gap=4):
+    """A 2px dashed border-top."""
+    x = left
+    while x < right:
+        end = min(x + dash, right)
+        draw.rectangle((px(x), px(y), px(end) - 1, px(y + 2) - 1), fill=color)
+        x += dash + gap
+
+
+def draw_sheet_row(image, draw, player, top, animated=None):
+    """One row of the sheet: rank, flag, name, medal, time, 10px apart.
+    `animated` as for draw_podium_spot, but with the name's top-left on
+    the sheet: the caller knows how the sheet turns."""
+    left, right = SHEET_PAD, SHEET_WIDTH - SHEET_PAD
+    middle = top + SHEET_ROW / 2
+
+    def centred(text):
+        # Luckiest Guy rows carry 3px of padding on top.
+        return middle - (text.height + 3) / 2 + 3
+
+    rank = shrink_to_fit(f"#{player.get('rank', '')}", DISPLAY, 20, 38 + 6, min_size=14,
+                         fill=rgba(MAP_PURPLE))
+    rank.draw(draw, left, centred(rank))
+    x = left + 38 + 10
+
+    time = shrink_to_fit(player.get("time") or "--", DISPLAY, 19, 94, min_size=12,
+                         fill=rgba(TIME_PURPLE))
+    time.draw(draw, right - time.width, centred(time))
+    name_right = right - 94 - 10
+
+    tier = medal_tier(player)
+    if tier is not None:
+        place(image, profile_icon(MEDAL_ICONS[tier], 34), name_right - 34, middle - 17, 34, 34)
+        name_right -= 34 + 10
+
+    flag = flag_tile(player.get("country"), 30, 20)
+    if flag:
+        place(image, with_drop_shadow(flag, 2, color=LIGHT_SHADOW), x, middle - 12, 34, 24)
+        x += 34 + 10
+
+    effect = player.get("effect") if animated is not None else None
+    if effect:
+        # The plain name is dark ink with no outline, which an effect's
+        # white base would lose on the cream paper: give it an ink outline,
+        # as the map card's handle has.
+        ink = rgba(NAME_INK)
+        name = effect_name_text(player, 17, 8, name_right - x, dict(stroke=4, stroke_color=ink))
+        animated.append(dict(name=name, at=(x, centred(name)), effect=effect, outline=ink,
+                             stroke_scale=17 / NAME_SIZE, margin=SHEET_NAME_MARGIN))
+        return
+    name = player_name(player.get("name"), 17, 14, name_right - x, fill=rgba(NAME_INK))
+    name.draw(draw, x, centred(name))
+
+
+# Room round an animated sheet name: small enough that neighbouring rows'
+# patches (48px apart) never overlap, since each is pasted over the frame.
+SHEET_NAME_MARGIN = 8
+
+
+def draw_sheet(canvas, title, players, empty_note, animated=None):
+    """The cream sheet of ranks 4-10, its height following its rows. With no
+    rows it shows `empty_note` in a row of its own. `animated` as for
+    draw_podium_spot."""
+    purple = rgba(MAP_PURPLE)
+    rule = rgba("#E9D27E")
+    heading = shrink_to_fit(title or "", HAND, 26, SHEET_WIDTH - 2 * SHEET_PAD, min_size=16,
+                            line_height=1, fill=purple)
+    rows = max(1, len(players))
+    height = 14 + 26 + 6 + rows * (2 + SHEET_ROW) + 16
+    on_sheet = [] if animated is not None else None
+
+    def content(image, draw):
+        heading.draw(draw, (SHEET_WIDTH - heading.width) / 2, 14 + (26 - heading.height) / 2)
+        y = 14 + 26 + 6
+        for player in players:
+            dashed_rule(draw, SHEET_PAD, SHEET_WIDTH - SHEET_PAD, y, rule)
+            draw_sheet_row(image, draw, player, y + 2, on_sheet)
+            y += 2 + SHEET_ROW
+        if not players:
+            dashed_rule(draw, SHEET_PAD, SHEET_WIDTH - SHEET_PAD, y, rule)
+            note = Text(empty_note, HAND, 24, fill=purple)
+            note.draw(draw, (SHEET_WIDTH - note.width) / 2, y + 2 + (SHEET_ROW - note.height) / 2)
+
+    body = strip(SHEET_WIDTH, height, rgba(PAPER), CLIP_SHEET, content)
+    place(canvas, with_drop_shadow(body, 6), SHEET_LEFT, SHEET_TOP, SHEET_WIDTH, height,
+          rotate=SHEET_TILT)
+    for spec in on_sheet or ():
+        spec.update(rotate=SHEET_TILT, to_canvas=lambda x, y: turn_point(
+            x, y, SHEET_LEFT, SHEET_TOP, SHEET_WIDTH, height, SHEET_TILT))
+        animated.append(spec)
+
+
+SHEET_TILT = 1.2
+
+
+def compose_leaderboard_card(*, title, subtitle="", sheet_title="", footer="", players=(),
+                             animate=False):
+    """The card as an RGBA image, and with `animate` the AnimatedName specs
+    for every player with an "effect" (whose names are left off)."""
+    players = list(players)[:3 + SHEET_ROWS]
+    animated = [] if animate else None
+    canvas = leaderboard_backdrop().copy()
+    draw_title_banner(canvas, title)
+    if subtitle:
+        text = shrink_to_fit(subtitle, HAND, 26, SHEET_LEFT - 40 - 10, min_size=16)
+        draw_glowing_text(canvas, [(text, 40, 112)], rgba("#2160B8"))
+
+    # Second, first, third: each avatar overlaps the block to its left.
+    for index in (1, 0, 2):
+        if index < len(players):
+            draw_podium_spot(canvas, index, players[index], animated)
+    draw_sheet(canvas, sheet_title, players[3:],
+               "no times yet" if not players else "nobody else yet", animated)
+
+    if footer:
+        text = shrink_to_fit(footer, HAND, 21, LEADERBOARD_WIDTH - SHEET_LEFT, min_size=14)
+        draw_glowing_text(canvas, [(text, LEADERBOARD_WIDTH - 40 - text.width,
+                                    LEADERBOARD_HEIGHT - 20 - text.height)], rgba("#2E5E22"))
+
+    card = clip_to(canvas, rounded_mask(LEADERBOARD_WIDTH, LEADERBOARD_HEIGHT, 24))
+    return card, animated or []
+
+
+def render_leaderboard_card_animated(**fields):
+    """The leaderboard with every player's username effect playing on their
+    name, as animated WebP bytes. Each player is a dict as for
+    render_leaderboard_card, plus "effect" (a username_effects effect) for
+    those who have one. All the effects share one loop.
+
+    Half size, like the other animated cards: names spread over the whole
+    card make every frame's changed area most of it, and libwebp takes ~4x
+    as long to encode one at full size, for a picture Discord shows at
+    about 600px wide anyway. Frames are drawn as the encoder takes them
+    (encode_lazy_animation), so only one is held.
+    """
+    with ANIMATION_LOCK:
+        card, specs = compose_leaderboard_card(animate=True, **fields)
+        frames_count, delay, cycles = plan_shared_loop([spec["effect"] for spec in specs])
+        names = [
+            AnimatedName(card, spec["name"], spec["at"], spec["effect"], spec_cycles,
+                         outline=spec["outline"], stroke_scale=spec["stroke_scale"],
+                         to_canvas=spec.get("to_canvas", lambda x, y: (x, y)),
+                         rotate=spec.get("rotate", 0), margin=spec["margin"],
+                         keep_outline=True)
+            for spec, spec_cycles in zip(specs, cycles)
+        ]
+        still = card.resize((card.width // 2, card.height // 2), Image.LANCZOS)
+        del card
+
+        def draw_frame(index, image):
+            # Each patch covers its whole region, so the last frame's names
+            # are simply drawn over.
+            for name in names:
+                image.paste(name.patch(index / frames_count), name.at)
+
+        return encode_lazy_animation(still, frames_count, draw_frame, delay)
+
+
+def render_leaderboard_card(**fields):
+    """A map or Daily Cup leaderboard as PNG bytes.
+
+    `players` is the board's top entries in the order to show them (ties
+    keep it), each a dict: rank, name, time (already formatted), and
+    optionally country (ISO alpha-2), tier (0 diamond .. 3 bronze, or None
+    for no medal) and avatar_png (used for the top 3). The first three
+    stand on the podium; the next seven go on the sheet, which says so
+    when there's nobody past third. Username effects are ignored here; see
+    render_leaderboard_card_animated.
+    """
+    card, _ = compose_leaderboard_card(**fields)
     out = io.BytesIO()
     card.save(out, format="PNG", optimize=False, compress_level=6)
     return out.getvalue()
@@ -1196,7 +1628,22 @@ def plan_loop(effect):
     held still if it would barely move), picking the frame count and delay
     that change the effect's speeds the least.
     """
-    rates = _loop_rates(effect)
+    return _plan_rates(_loop_rates(effect))
+
+
+def plan_shared_loop(effects):
+    """plan_loop for several effects playing in one picture: one frame count
+    and delay for all, and each effect's own cycle counts, in order."""
+    rates = [((index,) + key, rate)
+             for index, effect in enumerate(effects) for key, rate in _loop_rates(effect)]
+    frames, delay, cycles = _plan_rates(rates)
+    per_effect = [{} for _ in effects]
+    for (index, *key), count in cycles.items():
+        per_effect[index][tuple(key)] = count
+    return frames, delay, per_effect
+
+
+def _plan_rates(rates):
     # A motion that can't get far even in the longest loop is held still;
     # every other one has to move, whatever loop length is picked.
     longest = max(LOOP_FRAMES) * max(LOOP_DELAYS_MS) / 1000
@@ -1255,10 +1702,13 @@ class NameAnimator:
     """Draws the name banner's text for one frame of a username effect.
 
     `stroke_scale` thins the effect's own outline for a smaller name than
-    the profile's (the map card's creator handle).
+    the profile's (the map card's creator handle). `keep_outline` keeps the
+    card's own outline at full width under an effect's thinner one, so a
+    small name still reads when the effect's colours are close to what's
+    behind it (gold on the orange podium block).
     """
 
-    def __init__(self, banner, effect, cycles, stroke_scale=1.0):
+    def __init__(self, banner, effect, cycles, stroke_scale=1.0, keep_outline=False):
         self.effect = effect
         self.cycles = cycles
         name = banner["name"]
@@ -1278,13 +1728,21 @@ class NameAnimator:
         self.text_box = (px(tx), px(ty), px(tx + name.width), px(ty + name.height))
         outline = banner["outline"]
 
+        outline_width = self.stroke_width
+        if keep_outline:
+            # The effect's stroke takes the inner half of the card's outline
+            # at most, so a ring of the dark outline always shows outside it.
+            outline_width = max(outline_width, round(name.stroke * SCALE / 2))
+            self.stroke_width = max(1, min(self.stroke_width, outline_width // 2))
         self.fill_mask = self._mask(0)
         self.full_mask = self._mask(self.stroke_width)
+        outline_mask = (self.full_mask if outline_width == self.stroke_width
+                        else self._mask(outline_width))
         # Under every effect: the card's own shadow and purple outline, so
         # transparent parts of an effect fall back to the normal look.
         base = Image.new("RGBA", self.size, (0, 0, 0, 0))
-        base.paste(outline, (0, 0), self._mask(self.stroke_width, dy=px(name.shadow)))
-        base.paste(outline, (0, 0), self.full_mask)
+        base.paste(outline, (0, 0), self._mask(outline_width, dy=px(name.shadow)))
+        base.paste(outline, (0, 0), outline_mask)
         if not effect.get("fill"):
             base.paste(WHITE, (0, 0), self.fill_mask)
         self.base = base
@@ -1394,6 +1852,99 @@ def render_profile_card_animated(effect, **fields):
 HANDLE_MARGIN = 14
 
 
+class AnimatedName:
+    """A name playing its username effect on a still card, one small patch
+    per frame.
+
+    The name is drawn upright on a patch with `margin` design px of room
+    round it, turned with whatever it sits on (`rotate` degrees about
+    `to_canvas`'s box) and laid over the card's own pixels there. `at` is
+    the name box's top-left in that box's coordinates; `to_canvas` maps a
+    point of the box to the card.
+    """
+
+    def __init__(self, card, name, at, effect, cycles, *, outline, stroke_scale,
+                 to_canvas=lambda x, y: (x, y), rotate=0, margin=HANDLE_MARGIN,
+                 keep_outline=False, shrink=2):
+        """`shrink` is how much smaller than the card the frames are (2 for
+        the half-size animations, 1 for full size)."""
+        size = (px(name.width + 2 * margin), px(name.height + 2 * margin))
+        size = (size[0] + size[0] % 2, size[1] + size[1] % 2)
+        self.animator = NameAnimator({
+            "name": name,
+            "box": (0, 0) + size,
+            "mask": Image.new("L", size, 255),
+            "text_at": (margin, margin),
+            "outline": outline,
+        }, effect, cycles, stroke_scale=stroke_scale, keep_outline=keep_outline)
+        self.rotate = rotate
+        self.shrink = shrink
+
+        # Where the patch's centre lands once its box has turned.
+        x, y = at
+        centre = to_canvas(x - margin + size[0] / SCALE / 2, y - margin + size[1] / SCALE / 2)
+        turned = Image.new("L", size).rotate(-rotate, expand=True).size if rotate else size
+        left = px(centre[0]) - turned[0] // 2
+        top = px(centre[1]) - turned[1] // 2
+        region = _even_box((left, top, left + turned[0], top + turned[1]), card.size)
+        self.card_region = card.crop(region)
+        self.offset = (left - region[0], top - region[1])
+        # Where the (shrunk) patch goes on the (shrunk) frame.
+        self.at = (region[0] // shrink, region[1] // shrink)
+        self.patch_size = ((region[2] - region[0]) // shrink, (region[3] - region[1]) // shrink)
+
+    def patch(self, phase):
+        layer = self.animator.frame(phase)
+        if self.rotate:
+            layer = layer.rotate(-self.rotate, resample=Image.BICUBIC, expand=True)
+        patch = self.card_region.copy()
+        patch.alpha_composite(layer, self.offset)
+        if self.shrink == 1:
+            return patch
+        return patch.resize(self.patch_size, Image.LANCZOS)
+
+
+def encode_lazy_animation(first, count, draw_frame, delay):
+    """Animated WebP bytes from `count` frames drawn as the encoder asks for
+    them, so only one is ever held: `draw_frame(index, image)` paints frame
+    `index` over `image`, which starts as `first` (and keeps the previous
+    frame's pixels).
+
+    Pillow's WebP writer walks a multi-frame image with seek(); a plain
+    image given n_frames and a seek() that redraws it in place passes for
+    one, without touching Pillow's internals.
+    """
+    image = first.copy()
+
+    def seek(index):
+        draw_frame(index, image)
+
+    image.n_frames = count
+    image.seek = seek
+    out = io.BytesIO()
+    image.save(out, format="WEBP", save_all=True, duration=delay, loop=0,
+               quality=WEBP_QUALITY, method=WEBP_METHOD,
+               kmin=0, kmax=0)  # see render_profile_card_animated
+    return out.getvalue()
+
+
+def encode_name_animation(card, names, frames_count, delay):
+    """The card at half size with each AnimatedName playing, as WebP bytes.
+    The names' patches must not overlap: each is pasted over the frame."""
+    still = card.resize((card.width // 2, card.height // 2), Image.LANCZOS)
+    frames = []
+    for index in range(frames_count):
+        frame = still.copy()
+        for name in names:
+            frame.paste(name.patch(index / frames_count), name.at)
+        frames.append(frame)
+    out = io.BytesIO()
+    frames[0].save(out, format="WEBP", save_all=True, append_images=frames[1:],
+                   duration=delay, loop=0, quality=WEBP_QUALITY, method=WEBP_METHOD,
+                   kmin=0, kmax=0)  # see render_profile_card_animated
+    return out.getvalue()
+
+
 def render_map_card_animated(effect, **fields):
     """The map card with the creator's username effect playing on their
     handle, as animated WebP bytes (half resolution, like the profile's).
@@ -1403,48 +1954,10 @@ def render_map_card_animated(effect, **fields):
     still card; nothing else on the card changes.
     """
     with ANIMATION_LOCK:
-        card, (handle, (hx, hy)) = compose_map_card(
+        card, (handle, at) = compose_map_card(
             handle_face=effect.get("font") or DISPLAY, **fields)
         frames_count, delay, cycles = plan_loop(effect)
-
-        margin = HANDLE_MARGIN
-        size = (px(handle.width + 2 * margin), px(handle.height + 2 * margin))
-        size = (size[0] + size[0] % 2, size[1] + size[1] % 2)
-        animator = NameAnimator({
-            "name": handle,
-            "box": (0, 0) + size,
-            "mask": Image.new("L", size, 255),
-            "text_at": (margin, margin),
-            "outline": rgba(MAP_PURPLE),
-        }, effect, cycles, stroke_scale=CREATOR_HANDLE_SIZE / NAME_SIZE)
-
-        # Where the patch's centre lands once the paper has turned.
-        centre = paper_to_canvas(hx - margin + size[0] / SCALE / 2,
-                                 hy - margin + size[1] / SCALE / 2)
-        turned = Image.new("L", size).rotate(-POLAROID_TILT, expand=True).size
-        left = px(centre[0]) - turned[0] // 2
-        top = px(centre[1]) - turned[1] // 2
-        region = _even_box((left, top, left + turned[0], top + turned[1]), card.size)
-
-        half_size = (card.width // 2, card.height // 2)
-        still = card.resize(half_size, Image.LANCZOS)
-        card_region = card.crop(region)
-        del card
-
-        at = (region[0] // 2, region[1] // 2)
-        patch_size = ((region[2] - region[0]) // 2, (region[3] - region[1]) // 2)
-        frames = []
-        for index in range(frames_count):
-            layer = animator.frame(index / frames_count).rotate(
-                -POLAROID_TILT, resample=Image.BICUBIC, expand=True)
-            patch = card_region.copy()
-            patch.alpha_composite(layer, (left - region[0], top - region[1]))
-            frame = still.copy()
-            frame.paste(patch.resize(patch_size, Image.LANCZOS), at)
-            frames.append(frame)
-
-        out = io.BytesIO()
-        frames[0].save(out, format="WEBP", save_all=True, append_images=frames[1:],
-                       duration=delay, loop=0, quality=WEBP_QUALITY, method=WEBP_METHOD,
-                       kmin=0, kmax=0)  # see render_profile_card_animated
-        return out.getvalue()
+        name = AnimatedName(card, handle, at, effect, cycles, outline=rgba(MAP_PURPLE),
+                            stroke_scale=CREATOR_HANDLE_SIZE / NAME_SIZE,
+                            to_canvas=paper_to_canvas, rotate=POLAROID_TILT)
+        return encode_name_animation(card, [name], frames_count, delay)

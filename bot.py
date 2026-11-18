@@ -2432,8 +2432,14 @@ def get_medal_emoji(pos):
 
 def get_cup_medal_emoji(rank, total):
     """Match the game's 1-based GetMedal(Rank, Total) calculation."""
+    tier = cup_medal_tier(rank, total)
+    return "" if tier is None else get_medal_emoji(tier)
+
+def cup_medal_tier(rank, total):
+    """The game's GetMedal(Rank, Total) as a MEDAL_TIERS index (0 is
+    Diamond), or None for no medal. Rank is 1-based."""
     if total <= 0:
-        return ""
+        return None
 
     diamond_slots = 1
     gold_slots = 1
@@ -2449,23 +2455,14 @@ def get_cup_medal_emoji(rank, total):
         silver_slots = max(silver_slots, total * 50 // 100)
         bronze_slots = max(bronze_slots, total * 90 // 100)
 
-    cumulative = diamond_slots
-    if rank <= cumulative:
-        return get_medal_emoji(0)
-
-    cumulative += gold_slots
-    if rank <= cumulative:
-        return get_medal_emoji(1)
-
-    cumulative += silver_slots
-    if rank <= cumulative:
-        return get_medal_emoji(2)
-
-    cumulative += bronze_slots
-    if rank <= cumulative:
-        return get_medal_emoji(3)
-
-    return ""
+    cumulative = 0
+    for tier, slots in enumerate(
+        (diamond_slots, gold_slots, silver_slots, bronze_slots)
+    ):
+        cumulative += slots
+        if rank <= cumulative:
+            return tier
+    return None
 
 async def fetch_user_id(username):
     """Resolve a Roblox username to (id, canonical_name), or (None, None).
@@ -2735,9 +2732,14 @@ def truncate_name(name, limit=MAX_LEADERBOARD_NAME):
     return name[:limit - 1].rstrip("\\") + "…"
 
 async def collect_leaderboard_rows(
-    leaderboard, limit, *, value_formatter=format_time
+    leaderboard, limit, *, value_formatter=format_time,
+    name_limit=MAX_LEADERBOARD_NAME,
 ):
-    """Resolve a leaderboard into plain row dicts, ready for either renderer."""
+    """Resolve a leaderboard into plain row dicts, ready for either renderer.
+
+    name_limit=None keeps names whole, for the image card, which fits them
+    itself.
+    """
     rows = []
     total = len(leaderboard)
     shown = leaderboard[:limit]
@@ -2754,12 +2756,14 @@ async def collect_leaderboard_rows(
         name = entry.get("Name")
         if not name and user_id is not None:
             name = names.get(normalize_user_id(user_id))
+        resolved = bool(name)
         if not name:
             # A failed username lookup shouldn't drop the whole row.
             name = f"User {user_id}" if user_id is not None else "Unknown"
         # Trimmed first, then escaped, so the limit counts visible characters
         # rather than the backslashes escaping adds.
-        name = truncate_name(name)
+        name = (truncate_name(name, name_limit) if name_limit
+                else " ".join(str(name).split()))
 
         country = entry.get("Country")
         country = country.strip().upper()[:2] if isinstance(country, str) else ""
@@ -2769,9 +2773,12 @@ async def collect_leaderboard_rows(
             "pos": pos,
             "user_id": user_id,
             "name": name,
+            # False for the "User 123" stand-in when the lookup failed.
+            "name_resolved": resolved,
             "country": country,
             "value": value_formatter(value) if isinstance(value, (int, float)) else "--",
             "medal": resolve_medal(pos, total),
+            "medal_tier": cup_medal_tier(pos + 1, total),
         })
     return rows
 
@@ -4110,6 +4117,26 @@ class MapCardView(MapView):
     def card_files(self):
         return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
 
+    @keeps_context
+    async def show_leaderboard(self, interaction):
+        # Unlike MapView's embed, the image card is Components V2 too, so it
+        # can take the map card's place, with Back to return to it.
+        await interaction.response.defer()
+
+        map_id = self.entry.get("Id")
+        view = await build_map_leaderboard_card_view(
+            map_id, self.entry.get("Name"), parent=self
+        )
+        if view is None:
+            key = MAP_LEADERBOARD_KEY.format(id=map_id)
+            await interaction.followup.send(
+                f"No leaderboard found for `{key}`.", ephemeral=True
+            )
+            return
+
+        view.message = interaction.message
+        await show_card(interaction, view)
+
 async def build_map_card_view(entry, parent=None):
     """The image version of build_map_view.
 
@@ -4274,6 +4301,166 @@ async def build_map_leaderboard_embed(map_id, map_name):
         title=f"🏆 {map_name or 'Unnamed Map'}",
         subtitle=f"Map #{map_id}",
     )
+
+# Extension added per card: png, or webp when username effects play.
+LEADERBOARD_CARD_FILENAME = "leaderboard"
+# The podium's avatars, by user ID: (expiry, PNG bytes or None). The same
+# few players top a board each time it's opened, so their pictures are kept
+# briefly rather than fetched again for every view.
+LEADERBOARD_AVATAR_TTL = 600
+LEADERBOARD_AVATAR_CACHE_SIZE = 60
+_leaderboard_avatars = {}
+
+async def fetch_leaderboard_avatar(user_id):
+    """fetch_avatar_png, remembered for a few minutes. None for no ID."""
+    user_id = normalize_user_id(user_id)
+    if user_id is None:
+        return None
+    now = time.monotonic()
+    cached = _leaderboard_avatars.get(user_id)
+    if cached and cached[0] > now:
+        return cached[1]
+    avatar = await fetch_avatar_png(user_id)
+    if len(_leaderboard_avatars) >= LEADERBOARD_AVATAR_CACHE_SIZE:
+        # Drop whatever expires first to make room.
+        del _leaderboard_avatars[min(_leaderboard_avatars,
+                                     key=lambda k: _leaderboard_avatars[k][0])]
+    _leaderboard_avatars[user_id] = (now + LEADERBOARD_AVATAR_TTL, avatar)
+    return avatar
+
+class LeaderboardCardView(CardView):
+    """A map or Daily Cup leaderboard as a rendered image.
+
+    On trial behind !testleaderboard before it replaces the embeds. A
+    Components V2 message, so unlike the embed it can replace the map card
+    in place, with a Back button to return to it.
+    """
+
+    def __init__(self, card_image, *, description, extension="png", note=None,
+                 parent=None, timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(parent=parent, timeout=timeout)
+        self.card_image = card_image
+        # png, or webp when someone's username effect plays.
+        self.filename = f"{LEADERBOARD_CARD_FILENAME}.{extension}"
+
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(
+            media=f"attachment://{self.filename}",
+            description=description,
+        )
+        self.add_item(gallery)
+        if note:
+            self.add_item(discord.ui.TextDisplay(note))
+
+        back = self.make_back_button()
+        if back is not None:
+            row = discord.ui.ActionRow()
+            row.add_item(back)
+            self.add_item(row)
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
+
+async def build_leaderboard_card_view(leaderboard, *, title, subtitle, footer,
+                                      shown_title, medals, parent=None):
+    """Render a list-shaped board (map or cup) as a LeaderboardCardView, or
+    None when it has no rows.
+
+    `shown_title` is the exact title in plain text, for the line under the
+    picture: the card's font drops emoji and most non-Latin letters.
+    """
+    rows = await collect_leaderboard_rows(
+        leaderboard, MAX_LEADERBOARD_ROWS, name_limit=None
+    )
+    if not rows:
+        return None
+
+    async def equipped_effect(row):
+        # Only on a real name: "User 123" isn't anyone's handle.
+        if not row["name_resolved"] or normalize_user_id(row["user_id"]) is None:
+            return None
+        return username_effects.resolve_effect(
+            await fetch_equipped_username_effect(normalize_user_id(row["user_id"]))
+        )
+
+    # The flair table is one cached download, so ten lookups cost one fetch.
+    avatars, effects = await asyncio.gather(
+        asyncio.gather(*(fetch_leaderboard_avatar(row["user_id"]) for row in rows[:3])),
+        asyncio.gather(*(equipped_effect(row) for row in rows)),
+    )
+    players = [
+        {
+            "rank": row["pos"] + 1,
+            "name": row["name"],
+            "time": row["value"],
+            "country": row["country"] or None,
+            "tier": row["medal_tier"] if medals else None,
+            "avatar_png": avatars[index] if index < len(avatars) else None,
+            "effect": effects[index],
+        }
+        for index, row in enumerate(rows)
+    ]
+    total = len(leaderboard)
+    if total > len(rows):
+        sheet_title = f"Top {len(rows)} of {format_number(total)}"
+    else:
+        sheet_title = f"{total} {'time' if total == 1 else 'times'}"
+
+    fields = dict(title=title, subtitle=subtitle, sheet_title=sheet_title,
+                  footer=footer, players=players)
+    if any(effects):
+        image = await asyncio.to_thread(card_render.render_leaderboard_card_animated, **fields)
+        extension = "webp"
+    else:
+        image = await asyncio.to_thread(card_render.render_leaderboard_card, **fields)
+        extension = "png"
+    note = (f"-# {discord.utils.escape_markdown(shown_title)} · "
+            f"as of <t:{int(time.time())}:R>")
+    return LeaderboardCardView(
+        image, description=f"{shown_title} leaderboard", extension=extension,
+        note=note, parent=parent,
+    )
+
+def card_timestamp():
+    """Now, for a card's footer. In UTC: a picture can't show local time."""
+    now = datetime.now(timezone.utc)
+    return f"{now.day} {now:%b %Y, %H:%M} UTC"
+
+async def build_map_leaderboard_card_view(map_id, map_name, parent=None):
+    """The image version of build_map_leaderboard_embed, or None without a board."""
+    leaderboard = await fetch_board(MAP_LEADERBOARD_KEY.format(id=map_id))
+    if leaderboard is None:
+        return None
+    name = map_name or "Unnamed Map"
+    return await build_leaderboard_card_view(
+        leaderboard,
+        title=name,
+        subtitle=f"Map #{map_id} · Leaderboard",
+        footer=card_timestamp(),
+        shown_title=f"{name} · Map #{map_id}",
+        medals=False,
+        parent=parent,
+    )
+
+async def build_cup_leaderboard_card_view(index, date_text, *, todays_map=None):
+    """The image version of send_cup_leaderboard's embed: (view, error text)."""
+    leaderboard, map_id = await asyncio.gather(
+        fetch_board(f"DailyCup_{index}"),
+        get_cup_map_id(index, todays_map or {}),
+    )
+    if not leaderboard:
+        return None, f"No leaderboard found for `DailyCup_{index}` ({date_text})."
+    view = await build_leaderboard_card_view(
+        leaderboard,
+        title=f"Daily Cup #{index}",
+        subtitle=f"Leaderboard · {date_text}",
+        footer=f"Map ID {map_id}" if map_id is not None else "",
+        shown_title=f"Daily Cup #{index} · {date_text}",
+        medals=True,
+    )
+    if view is None:
+        return None, "The leaderboard came back empty."
+    return view, None
 
 async def build_map_card(entry, **view_options):
     """Resolve a map creator and build the same card used by /map."""
@@ -5391,6 +5578,77 @@ async def test_map_card(ctx, *, query: str):
             await ctx.send(f"No community map found for `{cleaned}`.")
             return
         view = await build_map_card_view(entry)
+
+    view.message = await ctx.send(view=view, files=view.card_files())
+
+@bot.command(name="testleaderboard", hidden=True)
+@commands.is_owner()
+async def test_leaderboard_card(ctx, target: str, when: str = None):
+    """Owner-only preview of the image leaderboard, before /leaderboard and
+    /cup use it.
+
+    `!testleaderboard <map id>` for a map's board, or
+    `!testleaderboard cup [index|DD/MM/YYYY]` for a Daily Cup (today's by
+    default). The global boards (wins, medals, creators, achievements) have
+    no image design yet.
+    """
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+
+    selected = target.strip().lower()
+    async with ctx.typing():
+        if selected == "cup":
+            todays_map = await fetch_entry("TodaysMap") or {}
+            current_index = coerce_cup_index(todays_map.get("Index"))
+            if when is None:
+                if current_index is None:
+                    await ctx.send("No daily cup index set.")
+                    return
+                index, date_text = current_index, get_todays_date()
+            elif when.strip().isdigit():
+                index = int(when.strip())
+                day = cup_date_for_index(index, current_index)
+                date_text = f"{day:%d/%m/%Y}" if day else f"Index {index}"
+            else:
+                day = parse_cup_date(when)
+                if day is None or current_index is None:
+                    await ctx.send("Give a cup index or a `DD/MM/YYYY` date.")
+                    return
+                index = current_index - (cup_day_today() - day).days
+                if index < 0 or index > current_index:
+                    await ctx.send(f"No cup on `{day:%d/%m/%Y}`.")
+                    return
+                date_text = f"{day:%d/%m/%Y}"
+            view, error = await build_cup_leaderboard_card_view(
+                index, date_text, todays_map=todays_map
+            )
+            if view is None:
+                await ctx.send(error)
+                return
+        elif selected.isdigit():
+            map_id = int(selected)
+            maps_by_id = await get_community_maps()
+            if not maps_by_id:
+                await ctx.send("Failed to fetch the community map list.")
+                return
+            entry = maps_by_id.get(map_id)
+            if entry is None:
+                await ctx.send(f"No community map with ID `{map_id}`.")
+                return
+            view = await build_map_leaderboard_card_view(map_id, entry.get("Name"))
+            if view is None:
+                await ctx.send(
+                    f"No leaderboard found for `{MAP_LEADERBOARD_KEY.format(id=map_id)}`."
+                )
+                return
+        else:
+            await ctx.send(
+                "Usage: `!testleaderboard <map id>` or "
+                "`!testleaderboard cup [index|DD/MM/YYYY]`. The global boards "
+                "don't have an image design yet."
+            )
+            return
 
     view.message = await ctx.send(view=view, files=view.card_files())
 
