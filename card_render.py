@@ -553,6 +553,10 @@ def draw_tags(canvas, tags):
         left += width + 10
 
 
+# The medal icon inside each medal pill, in design pixels.
+MEDAL_ICON_SIZE = 32
+
+
 def draw_medals(canvas, counts):
     pills = []
     for (icon, fill, outline), count in zip(PROFILE_MEDALS, counts):
@@ -565,9 +569,10 @@ def draw_medals(canvas, counts):
     left = CARD_WIDTH - 40 - (sum(widths) + 10 * (len(pills) - 1))
     for (icon, fill, label), width in zip(pills, widths):
         def content(image, draw, icon=icon, label=label):
-            # A 42px medal with -9px/-4px margins: it spills over the strip's
-            # edges and gets clipped by them, as in the design.
-            paste_icon(image, profile_icon(icon, 42), 14 - 4, 8 + (inner - 24) / 2 - 9)
+            # Smaller than the design's 42px (which spilled past the pill and
+            # touched its torn edges), centred in its 34px slot.
+            paste_icon(image, profile_icon(icon, MEDAL_ICON_SIZE),
+                       14 + (34 - MEDAL_ICON_SIZE) / 2, (height - MEDAL_ICON_SIZE) / 2)
             label.draw(draw, 14 + 34 + 7, 8 + (inner - label.height - 3) / 2 + 3)
         body = strip(width, height, rgba(fill), CLIP_MEDAL, content)
         place(canvas, with_drop_shadow(body, 4), left, 190, width, height)
