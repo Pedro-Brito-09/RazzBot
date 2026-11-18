@@ -441,8 +441,8 @@ def _cap_height(font):
     return -font.getbbox("H", anchor="ls")[1] / SCALE
 
 
-def fit_name_in_face(text, face, room, style):
-    """The name in another font, sized to sit in the card's name box.
+def fit_name_in_face(text, face, room, style, *, size=NAME_SIZE, min_size=20):
+    """The name in another font, sized to sit in a `size`-tall name box.
 
     Fonts differ wildly in proportions, so rather than reuse the card
     font's size, the face is scaled until its capitals stand as tall as
@@ -451,8 +451,9 @@ def fit_name_in_face(text, face, room, style):
     with tall flourishes or drips doesn't sit lopsided. Returns None when
     even the smallest size is too wide.
     """
-    target_cap = _cap_height(load_font(DISPLAY, NAME_SIZE))
-    for size in range(int(NAME_SIZE * 1.6), 19, -1):
+    box = size
+    target_cap = _cap_height(load_font(DISPLAY, box))
+    for size in range(int(box * 1.6), min_size - 1, -1):
         name = Text(text, face, size, line_height=1, **style)
         if _cap_height(name.font) > target_cap * 1.02:
             continue
@@ -462,12 +463,12 @@ def fit_name_in_face(text, face, room, style):
         # the pen that much further in so nothing slides under the avatar.
         overhang = max(0.0, -left)
         width = max(name.width, right) + overhang
-        if width > room or ink_height > NAME_SIZE + 4:
+        if width > room or ink_height > box + 4:
             continue
         # Lay it out in the card font's box, ink centred vertically.
         name.width = width
-        name.height = NAME_SIZE
-        name.baseline = (NAME_SIZE - ink_height) / 2 - top
+        name.height = box
+        name.baseline = (box - ink_height) / 2 - top
         name.x_offset = overhang
         return name
     return None
@@ -687,6 +688,7 @@ MAP_PURPLE = "#6B45C9"
 # The creator's handle shrinks to stay within this, leaving the map name room.
 CREATOR_MAX_WIDTH = 200
 CREATOR_MIN_WIDTH = 130
+CREATOR_HANDLE_SIZE = 24
 CLIP_TAPE = ((3, 0), (97, 0), (100, 25), (96, 50), (100, 75), (97, 100),
              (3, 100), (0, 75), (4, 50), (0, 25))
 # The stat column: left 682, right 34, from top 40, 26 apart.
@@ -801,8 +803,33 @@ def round_avatar(avatar):
     return ring
 
 
-def draw_caption(paper, map_name, creator_name, avatar):
-    """The row under the photo: map icon and name left, creator right."""
+def creator_handle(text, room, face=None):
+    """The creator's handle as Text, shrunk to `room`, never cut.
+
+    With `face` (a username effect's font) it's laid out for the animation:
+    white with the map name's purple outline, which the effect paints over,
+    so a pale effect still reads on the white paper.
+    """
+    purple = rgba(MAP_PURPLE)
+    if face is None:
+        return shrink_to_fit(text, DISPLAY, CREATOR_HANDLE_SIZE, room,
+                             line_height=1, fill=purple)
+    style = map_name_style(CREATOR_HANDLE_SIZE, purple)
+    handle = None
+    if face != DISPLAY:
+        no_line_height = {k: v for k, v in style.items() if k != "line_height"}
+        handle = fit_name_in_face(text, face, room, no_line_height,
+                                  size=CREATOR_HANDLE_SIZE, min_size=8)
+    # The effect's font can't fit it (or is the card's own): the card font.
+    return handle or shrink_to_fit(text, DISPLAY, CREATOR_HANDLE_SIZE, room, **style)
+
+
+def draw_caption(paper, map_name, creator_name, avatar, handle_face=None):
+    """The row under the photo: map icon and name left, creator right.
+
+    With `handle_face` the handle is laid out in that font but not drawn.
+    Returns the handle and where its box's top-left sits on the paper.
+    """
     draw = ImageDraw.Draw(paper)
     purple = rgba(MAP_PURPLE)
     row_mid = CAPTION_TOP + 32
@@ -815,8 +842,8 @@ def draw_caption(paper, map_name, creator_name, avatar):
     # name smaller than 24px, the handle shrinks into less so the name,
     # the card's title, keeps more.
     for creator_room in (CREATOR_MAX_WIDTH, CREATOR_MIN_WIDTH):
-        handle = shrink_to_fit(f"@{creator_name}" if creator_name else "unknown",
-                               DISPLAY, 24, creator_room, line_height=1, fill=purple)
+        handle = creator_handle(f"@{creator_name}" if creator_name else "unknown",
+                                creator_room, handle_face)
         column = max(by.width, handle.width)
         group_left = CAPTION_RIGHT - (52 + 10 + column)
         lines = fit_map_name(map_name, group_left - 14 - name_left, purple)
@@ -828,7 +855,9 @@ def draw_caption(paper, map_name, creator_name, avatar):
     text_left = group_left + 52 + 10
     text_top = row_mid - (17 + 6 + handle.height) / 2
     by.draw(draw, text_left, text_top)
-    handle.draw(draw, text_left, text_top + 17 + 6)
+    handle_at = (text_left, text_top + 17 + 6)
+    if handle_face is None:
+        handle.draw(draw, *handle_at)
 
     # In the name's purple, so the icon and the name outline match.
     paste_icon(paper, map_icon("map-purple", 54), CAPTION_LEFT, row_mid - 27)
@@ -840,6 +869,7 @@ def draw_caption(paper, map_name, creator_name, avatar):
     for line in lines:
         line.draw(draw, name_left, top)
         top += line.height + gap
+    return handle, handle_at
 
 
 def shrink_to_fit(text, face, size, max_width, *, min_size=8, **style):
@@ -903,11 +933,15 @@ def fit_map_name(name, room, outline):
             or attempt(lines, [4], force=True))
 
 
-def draw_polaroid(canvas, map_name, creator_name, avatar, thumbnail):
+POLAROID_TILT = -3
+
+
+def draw_polaroid(canvas, map_name, creator_name, avatar, thumbnail, handle_face=None):
+    """Returns draw_caption's (handle, top-left on the paper)."""
     paper = clip_to(solid(POLAROID_WIDTH, POLAROID_HEIGHT, rgba("#FFFDF4")),
                     rounded_mask(POLAROID_WIDTH, POLAROID_HEIGHT, 6))
     draw_photo(paper, thumbnail)
-    draw_caption(paper, map_name, creator_name, avatar)
+    handle = draw_caption(paper, map_name, creator_name, avatar, handle_face)
 
     # Padding for the tape, which overhangs the corners, then the two
     # strips of tape, then the whole thing tilts as one.
@@ -917,7 +951,20 @@ def draw_polaroid(canvas, map_name, creator_name, avatar, thumbnail):
     place(layer, tape, pad - 22, pad - 10, 120, 34, rotate=-32)
     place(layer, tape, pad + POLAROID_WIDTH + 22 - 120, pad - 10, 120, 34, rotate=30)
     place(canvas, layer, POLAROID_LEFT - pad, POLAROID_TOP - pad,
-          POLAROID_WIDTH + 2 * pad, POLAROID_HEIGHT + 2 * pad, rotate=-3)
+          POLAROID_WIDTH + 2 * pad, POLAROID_HEIGHT + 2 * pad, rotate=POLAROID_TILT)
+    return handle
+
+
+def paper_to_canvas(x, y):
+    """Where a point on the polaroid's paper lands on the card, in design px.
+
+    The paper turns POLAROID_TILT degrees (CSS: clockwise) about its centre.
+    """
+    cx, cy = POLAROID_WIDTH / 2, POLAROID_HEIGHT / 2
+    theta = math.radians(POLAROID_TILT)
+    dx, dy = x - cx, y - cy
+    return (POLAROID_LEFT + cx + dx * math.cos(theta) - dy * math.sin(theta),
+            POLAROID_TOP + cy + dx * math.sin(theta) + dy * math.cos(theta))
 
 
 def draw_map_strip(canvas, top, icon, value, caption, fill, outline, rotate):
@@ -989,15 +1036,12 @@ def draw_map_strips(canvas, mode, plays, completions, favourites, visibility, fe
         left += width + 10
 
 
-def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=None,
-                    thumbnail_png=None, mode=None, plays=0, favourites=0,
-                    visibility=None, featured=False, completions=0):
-    """A community map's card as PNG bytes.
+def compose_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=None,
+                     thumbnail_png=None, mode=None, plays=0, favourites=0,
+                     visibility=None, featured=False, completions=0, handle_face=None):
+    """The map card image and draw_caption's (handle, top-left on the paper).
 
-    `visibility` is Public / Unlisted / Private, or None to leave the tag
-    off. The background fades top to bottom between the thumbnail's two
-    most common colours; without a thumbnail, between two sky blues.
-    Missing avatar or thumbnail bytes get placeholders.
+    With `handle_face` the creator's handle is left off, for the animation.
     """
     plays, favourites = max(0, plays or 0), max(0, favourites or 0)
     completions = max(0, completions or 0)
@@ -1013,14 +1057,25 @@ def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=
                     reverse=True)
     backdrop, footer_outline = map_backdrop(*colors)
     canvas = backdrop.copy()
-    draw_polaroid(canvas, shown_name, creator, open_image(creator_avatar_png),
-                  thumbnail)
+    handle = draw_polaroid(canvas, shown_name, creator, open_image(creator_avatar_png),
+                           thumbnail, handle_face)
     draw_map_strips(canvas, mode, plays, completions, favourites, visibility, featured)
     if map_id is not None:
         draw_footer(canvas, f"map ID {map_id}", "", footer_outline,
                     size=22, inset=48, bottom=22)
 
-    card = clip_to(canvas, rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24))
+    return clip_to(canvas, rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24)), handle
+
+
+def render_map_card(**fields):
+    """A community map's card as PNG bytes.
+
+    `visibility` is Public / Unlisted / Private, or None to leave the tag
+    off. The background fades top to bottom between the thumbnail's two
+    most common colours; without a thumbnail, between two sky blues.
+    Missing avatar or thumbnail bytes get placeholders.
+    """
+    card, _ = compose_map_card(**fields)
     out = io.BytesIO()
     card.save(out, format="PNG", optimize=False, compress_level=6)
     return out.getvalue()
@@ -1197,9 +1252,13 @@ def _stroke_factor(effect, cycles, phase):
 
 
 class NameAnimator:
-    """Draws the name banner's text for one frame of a username effect."""
+    """Draws the name banner's text for one frame of a username effect.
 
-    def __init__(self, banner, effect, cycles):
+    `stroke_scale` thins the effect's own outline for a smaller name than
+    the profile's (the map card's creator handle).
+    """
+
+    def __init__(self, banner, effect, cycles, stroke_scale=1.0):
         self.effect = effect
         self.cycles = cycles
         name = banner["name"]
@@ -1214,7 +1273,7 @@ class NameAnimator:
         # Thickness, in pixels) -- the card's chunky outline would fill in the
         # fine detail of faces like Faster One or Monoton.
         if effect.get("stroke") and effect.get("size"):
-            self.stroke_width = max(1, round(effect["size"] * SCALE))
+            self.stroke_width = max(1, round(effect["size"] * SCALE * stroke_scale))
         # The label's box, which the gradients span.
         self.text_box = (px(tx), px(ty), px(tx + name.width), px(ty + name.height))
         outline = banner["outline"]
@@ -1327,4 +1386,65 @@ def render_profile_card_animated(effect, **fields):
                        # The defaults re-encode the whole card every few
                        # frames -- 6x slower and 3-4x bigger, for nothing.
                        kmin=0, kmax=0)
+        return out.getvalue()
+
+
+# Room around the creator's handle for its outline, shadow and any flourish
+# of an effect's font, in design px.
+HANDLE_MARGIN = 14
+
+
+def render_map_card_animated(effect, **fields):
+    """The map card with the creator's username effect playing on their
+    handle, as animated WebP bytes (half resolution, like the profile's).
+
+    The handle sits on the tilted polaroid, so each frame draws it upright
+    on a small patch, turns the patch with the paper and lays it on the
+    still card; nothing else on the card changes.
+    """
+    with ANIMATION_LOCK:
+        card, (handle, (hx, hy)) = compose_map_card(
+            handle_face=effect.get("font") or DISPLAY, **fields)
+        frames_count, delay, cycles = plan_loop(effect)
+
+        margin = HANDLE_MARGIN
+        size = (px(handle.width + 2 * margin), px(handle.height + 2 * margin))
+        size = (size[0] + size[0] % 2, size[1] + size[1] % 2)
+        animator = NameAnimator({
+            "name": handle,
+            "box": (0, 0) + size,
+            "mask": Image.new("L", size, 255),
+            "text_at": (margin, margin),
+            "outline": rgba(MAP_PURPLE),
+        }, effect, cycles, stroke_scale=CREATOR_HANDLE_SIZE / NAME_SIZE)
+
+        # Where the patch's centre lands once the paper has turned.
+        centre = paper_to_canvas(hx - margin + size[0] / SCALE / 2,
+                                 hy - margin + size[1] / SCALE / 2)
+        turned = Image.new("L", size).rotate(-POLAROID_TILT, expand=True).size
+        left = px(centre[0]) - turned[0] // 2
+        top = px(centre[1]) - turned[1] // 2
+        region = _even_box((left, top, left + turned[0], top + turned[1]), card.size)
+
+        half_size = (card.width // 2, card.height // 2)
+        still = card.resize(half_size, Image.LANCZOS)
+        card_region = card.crop(region)
+        del card
+
+        at = (region[0] // 2, region[1] // 2)
+        patch_size = ((region[2] - region[0]) // 2, (region[3] - region[1]) // 2)
+        frames = []
+        for index in range(frames_count):
+            layer = animator.frame(index / frames_count).rotate(
+                -POLAROID_TILT, resample=Image.BICUBIC, expand=True)
+            patch = card_region.copy()
+            patch.alpha_composite(layer, (left - region[0], top - region[1]))
+            frame = still.copy()
+            frame.paste(patch.resize(patch_size, Image.LANCZOS), at)
+            frames.append(frame)
+
+        out = io.BytesIO()
+        frames[0].save(out, format="WEBP", save_all=True, append_images=frames[1:],
+                       duration=delay, loop=0, quality=WEBP_QUALITY, method=WEBP_METHOD,
+                       kmin=0, kmax=0)  # see render_profile_card_animated
         return out.getvalue()

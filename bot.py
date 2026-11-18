@@ -4071,7 +4071,9 @@ class MapView(CardView):
         view.message = interaction.message
         await show_card(interaction, view)
 
-MAP_CARD_FILENAME = "map.png"
+# Extension added per card: png, or webp when the creator's username
+# effect plays on their handle.
+MAP_CARD_FILENAME = "map"
 
 class MapCardView(MapView):
     """The map card as a rendered image, with MapView's buttons under it.
@@ -4082,17 +4084,19 @@ class MapCardView(MapView):
     """
 
     def __init__(self, card_image, entry, *, creator_id=None, creator_name=None,
-                 parent=None, note=None, timeout=MAP_VIEW_TIMEOUT, **button_options):
+                 extension="png", parent=None, note=None, timeout=MAP_VIEW_TIMEOUT,
+                 **button_options):
         # Skip MapView's text layout; only its buttons and callbacks are wanted.
         CardView.__init__(self, parent=parent, timeout=timeout)
         self.entry = entry
         self.creator_id = creator_id
         self.creator_name = creator_name
         self.card_image = card_image
+        self.filename = f"{MAP_CARD_FILENAME}.{extension}"
 
         gallery = discord.ui.MediaGallery()
         gallery.add_item(
-            media=f"attachment://{MAP_CARD_FILENAME}",
+            media=f"attachment://{self.filename}",
             description=entry.get("Name") or "Community map",
         )
         self.add_item(gallery)
@@ -4104,26 +4108,32 @@ class MapCardView(MapView):
             self.add_item(row)
 
     def card_files(self):
-        return [discord.File(io.BytesIO(self.card_image), filename=MAP_CARD_FILENAME)]
+        return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
 
 async def build_map_card_view(entry, parent=None):
-    """The image version of build_map_view."""
+    """The image version of build_map_view.
+
+    The creator's equipped username effect plays on their handle, as on
+    their profile card, which makes the card an animated WebP.
+    """
     creator_id = entry.get("Creator")
 
     async def no_bytes():
         return None
 
     map_id = entry.get("Id")
-    creator, thumbnail_url, avatar_png, board = await asyncio.gather(
+    creator, thumbnail_url, avatar_png, board, equipped = await asyncio.gather(
         fetch_username(creator_id) if creator_id else no_bytes(),
         fetch_map_thumbnail(entry),
         fetch_avatar_png(creator_id) if creator_id else no_bytes(),
         fetch_board(MAP_LEADERBOARD_KEY.format(id=map_id)),
+        fetch_equipped_username_effect(creator_id) if creator_id else no_bytes(),
     )
     thumbnail_png = (await download_bytes(thumbnail_url, "build_map_card_view")
                      if thumbnail_url else None)
-    image = await asyncio.to_thread(
-        card_render.render_map_card,
+    # Only on a real handle: "unknown" isn't anyone's name.
+    effect = username_effects.resolve_effect(equipped) if creator else None
+    fields = dict(
         name=entry.get("Name"),
         map_id=map_id,
         creator_name=creator,
@@ -4138,6 +4148,12 @@ async def build_map_card_view(entry, parent=None):
         # nobody has finished has no board at all.
         completions=len(board) if board else 0,
     )
+    if effect:
+        image = await asyncio.to_thread(card_render.render_map_card_animated, effect, **fields)
+        extension = "webp"
+    else:
+        image = await asyncio.to_thread(card_render.render_map_card, **fields)
+        extension = "png"
 
     # The exact name and creator in text: the card's font drops emoji and
     # most non-Latin letters, and text can be copied. Escaped, or an
@@ -4152,7 +4168,7 @@ async def build_map_card_view(entry, parent=None):
 
     return MapCardView(
         image, entry, creator_id=creator_id, creator_name=creator,
-        parent=parent, note=note,
+        extension=extension, parent=parent, note=note,
     )
 
 class DailyCupMapView(OwnedView, discord.ui.View):
