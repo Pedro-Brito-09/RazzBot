@@ -3415,8 +3415,6 @@ async def build_badges_view(user_id, username, parent=None):
         badges, owned_ids, icons, username=username, parent=parent
     )
 
-BADGES_IMAGE_FILENAME = "badges.png"
-
 async def map_achievement_items(user_id):
     """The home server's map achievements as badge card items: one per
     role whose rule is completing a map, earned when the player is on that
@@ -3508,13 +3506,17 @@ class BadgesImageCardView(CardView):
     """
 
     def __init__(self, items, *, username, avatar_png=None, background_png=None,
-                 parent=None, timeout=MAP_VIEW_TIMEOUT):
+                 effect=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(parent=parent, timeout=timeout)
         self.items = items
         self.username = username
         self.avatar_png = avatar_png
         # The profile's chosen map, so the card shares its background.
         self.background_png = background_png
+        # The player's username effect plays on the name, as on the profile
+        # card, which makes every page an animated WebP.
+        self.effect = effect
+        self.filename = f"badges.{'webp' if effect else 'png'}"
         self.page = 0
         self.card_image = None
         self._render_lock = asyncio.Lock()
@@ -3530,20 +3532,25 @@ class BadgesImageCardView(CardView):
             per_page = card_render.BADGES_PER_PAGE
             page_items = self.items[self.page * per_page:(self.page + 1) * per_page]
             await load_badge_card_icons(page_items)
-            self.card_image = await asyncio.to_thread(
-                card_render.render_badges_card,
+            fields = dict(
                 username=self.username, avatar_png=self.avatar_png,
                 background_png=self.background_png, items=[dict(item) for item in page_items],
                 unlocked=sum(1 for item in self.items if item["earned"]),
                 total=len(self.items), page=self.page + 1, pages=self.page_count,
             )
+            if self.effect:
+                self.card_image = await asyncio.to_thread(
+                    card_render.render_badges_card_animated, self.effect, **fields)
+            else:
+                self.card_image = await asyncio.to_thread(
+                    card_render.render_badges_card, **fields)
             self.lay_out()
 
     def lay_out(self):
         self.clear_items()
         gallery = discord.ui.MediaGallery()
         gallery.add_item(
-            media=f"attachment://{BADGES_IMAGE_FILENAME}",
+            media=f"attachment://{self.filename}",
             description=f"{self.username}'s badges and achievements",
         )
         self.add_item(gallery)
@@ -3571,7 +3578,7 @@ class BadgesImageCardView(CardView):
         self.add_item(row)
 
     def card_files(self):
-        return [discord.File(io.BytesIO(self.card_image), filename=BADGES_IMAGE_FILENAME)]
+        return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
 
     async def show(self, interaction):
         # A render plus up to 24 downloads outlasts the 3s to answer.
@@ -3589,17 +3596,20 @@ class BadgesImageCardView(CardView):
         self.page += 1
         await self.show(interaction)
 
-async def build_badges_image_view(user_id, username, parent=None):
+async def build_badges_image_view(user_id, username, parent=None, *, effect_name=None):
     """The image version of build_badges_view, first page drawn, or None
-    without the game's badge list."""
-    items, avatar_png, background_png = await asyncio.gather(
+    without the game's badge list. Their equipped username effect plays on
+    the name; effect_name forces one, for previews."""
+    items, avatar_png, background_png, equipped = await asyncio.gather(
         badge_card_items(user_id), fetch_avatar_png(user_id),
-        fetch_profile_background_png(user_id),
+        fetch_profile_background_png(user_id), fetch_equipped_username_effect(user_id),
     )
     if items is None:
         return None
+    effect = username_effects.resolve_effect(effect_name or equipped)
     view = BadgesImageCardView(items, username=username, avatar_png=avatar_png,
-                               background_png=background_png, parent=parent)
+                               background_png=background_png, effect=effect,
+                               parent=parent)
     await view.refresh()
     return view
 
@@ -5998,14 +6008,18 @@ async def test_profile_card(ctx, username: str = None, effect: str = None):
 
 @bot.command(name="testbadges", hidden=True)
 @commands.is_owner()
-async def test_badges_card(ctx, username: str = None):
+async def test_badges_card(ctx, username: str = None, effect: str = None):
     """Owner-only preview of the image badges card, before /badges uses it.
 
-    `!testbadges [username|me]`: the game's badges and the home server's
-    map achievements in one grid, 24 a page.
+    `!testbadges [username|me] [effect|none]`: the game's badges and the
+    home server's map achievements in one grid, 24 a page. The name plays
+    their equipped username effect unless one is named, as !testprofile.
     """
     if card_render is None:
         await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
+        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
         return
 
     async with ctx.typing():
@@ -6013,7 +6027,8 @@ async def test_badges_card(ctx, username: str = None):
         user_id, canonical = await resolve_command_user(ctx, lookup)
         if user_id is None:
             return
-        view = await build_badges_image_view(user_id, canonical)
+        # "none" can't match a preset, so it shows the still card.
+        view = await build_badges_image_view(user_id, canonical, effect_name=effect)
         if view is None:
             await ctx.send("Couldn't fetch the game's badge list.")
             return

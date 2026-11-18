@@ -2245,17 +2245,36 @@ def draw_badges_progress(canvas, unlocked, total):
 
 
 def compose_badges_card(*, username, avatar_png=None, background_png=None, items=(),
-                        unlocked=0, total=0, page=1, pages=1):
+                        unlocked=0, total=0, page=1, pages=1, with_name=True,
+                        name_face=DISPLAY):
+    """The card, and (name, at, to_canvas) for animating the name."""
     avatar = open_image(avatar_png)
     canvas, text_outline = player_backdrop(username, avatar, open_image(background_png),
                                            BADGES_WIDTH, BADGES_HEIGHT)
-    draw_badges_header(canvas, username, avatar, text_outline)
+    # The avatar overlaps the banner's end, as on the profile card.
+    placed_name = draw_badges_header(canvas, username, avatar, text_outline,
+                                     avatar_on_top=True, with_name=with_name,
+                                     face=name_face)
     draw_badges_progress(canvas, unlocked, total)
     draw_badge_grid(canvas, list(items)[:BADGES_PER_PAGE])
     footer = Text(f"page {page} / {pages}", HAND, 21)
     draw_glowing_text(canvas, [(footer, BADGES_WIDTH - 36 - footer.width,
                                 BADGES_HEIGHT - 12 - footer.height)], text_outline)
-    return clip_to(canvas, rounded_mask(BADGES_WIDTH, BADGES_HEIGHT, 24))
+    return clip_to(canvas, rounded_mask(BADGES_WIDTH, BADGES_HEIGHT, 24)), placed_name
+
+
+def render_badges_card_animated(effect, **fields):
+    """The badges card with the player's username effect playing on the
+    name banner, as animated WebP bytes (half resolution, like the
+    profile's), drawn the way the medals card's is."""
+    with ANIMATION_LOCK:
+        card, (name, at, to_canvas) = compose_badges_card(
+            with_name=False, name_face=effect.get("font") or DISPLAY, **fields)
+        frames_count, delay, cycles = plan_loop(effect)
+        animated = AnimatedName(card, name, at, effect, cycles, outline=rgba("#5E37B8"),
+                                stroke_scale=46 / NAME_SIZE, to_canvas=to_canvas,
+                                rotate=-1.5)
+        return encode_name_animation(card, [animated], frames_count, delay)
 
 
 def render_badges_card(**fields):
@@ -2268,9 +2287,10 @@ def render_badges_card(**fields):
     placeholder; a map without one gets the map card's empty-photo sky).
     `background_png` is the profile's chosen map thumbnail; the backdrop
     follows the profile card's (player_backdrop). `unlocked` / `total`
-    drive the count and the bar, `page` / `pages` the footer.
+    drive the count and the bar, `page` / `pages` the footer. Username
+    effects are ignored here; see render_badges_card_animated.
     """
-    card = compose_badges_card(**fields)
+    card, _ = compose_badges_card(**fields)
     out = io.BytesIO()
     card.save(out, format="PNG", optimize=False, compress_level=6)
     return out.getvalue()
