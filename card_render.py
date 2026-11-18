@@ -709,44 +709,12 @@ def solid(width, height, color):
     return Image.new("RGBA", (px(width), px(height)), color)
 
 
-@functools.lru_cache(maxsize=1)
-def map_scene():
-    """The sky, dotted banner, hill and flag behind the polaroid. Same on
-    every card, so it's drawn once."""
-    width, height = px(CARD_WIDTH), px(CARD_HEIGHT)
-    scene = vertical_gradient(width, height, (
-        (0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")),
-    ))
-
-    # A 110x340 blue banner with a 12px grid of dots, tilted -6deg.
-    def dots(draw, k):
-        for cx in range(6, 110, 12):
-            for cy in range(6, 340, 12):
-                draw.ellipse(((cx - 2.3) * k, (cy - 2.3) * k,
-                              (cx + 2.3) * k, (cy + 2.3) * k), fill=255)
-    banner = solid(110, 340, rgba("#2B5FBF"))
-    dot_layer = solid(110, 340, rgba("#1C468F"))
-    dot_layer.putalpha(shape_mask(110, 340, dots))
-    banner.alpha_composite(dot_layer)
-    place(scene, banner, 640, -30, 110, 340, rotate=-6)
-
-    # The hill: a 1080x170 ellipse sunk 70px below the card. Only its top
-    # 100px show, so only that slice is drawn.
-    hill_top = CARD_HEIGHT + 70 - 170
-
-    def hill_shape(draw, k):
-        draw.ellipse((-60 * k, 0, 1020 * k, 170 * k), fill=255)
-    hill = solid(CARD_WIDTH, CARD_HEIGHT - hill_top, rgba("#4F8E3A"))
-    hill.putalpha(shape_mask(CARD_WIDTH, CARD_HEIGHT - hill_top, hill_shape))
-    scene.alpha_composite(hill, (0, px(hill_top)))
-
-    block = clip_to(solid(60, 60, rgba("#D8343A")), rounded_mask(60, 60, 10))
-    place(scene, block, 600, CARD_HEIGHT - 30 - 60, 60, 60, rotate=-10)
-    square = ((0, 0), (100, 0), (100, 100), (0, 100))
-    place(scene, strip(7, 100, rgba("#2A2F3C"), square), 880, 470, 7, 100, rotate=10)
-    place(scene, strip(44, 32, rgba("#E8333A"), ((0, 0), (100, 50), (0, 100))),
-          888, 466, 44, 32, rotate=10)
-    return scene
+# Without a thumbnail: the design's sky blues, for the card's backdrop and,
+# a little deeper, the empty photo.
+NO_THUMBNAIL_COLORS = ((47, 127, 224), (180, 222, 255))
+NO_THUMBNAIL_PHOTO_COLORS = ((47, 127, 224), (109, 184, 250))
+# The map icon's own outline, so the placeholder text matches it.
+MAP_ICON_OUTLINE = "#0D6B5F"
 
 
 # Colours closer than this (RGB distance) count as one when picking the
@@ -784,10 +752,10 @@ def dominant_colors(image):
 
 
 @functools.lru_cache(maxsize=16)
-def map_backdrop(primary, secondary):
-    """The map's own colours: primary fading down to secondary, under the
-    staggered dot pattern. Returns (backdrop, footer outline colour)."""
-    width, height = px(CARD_WIDTH), px(CARD_HEIGHT)
+def map_backdrop(primary, secondary, width=CARD_WIDTH, height=CARD_HEIGHT):
+    """Primary fading down to secondary under the staggered dot pattern,
+    `width` x `height` design pixels. Returns (backdrop, footer outline)."""
+    width, height = px(width), px(height)
     backdrop = vertical_gradient(width, height, (
         (0.0, primary[:3] + (255,)), (1.0, secondary[:3] + (255,)),
     ))
@@ -801,18 +769,16 @@ def map_backdrop(primary, secondary):
 
 
 def draw_photo(paper, thumbnail):
-    """The map thumbnail filling the photo, or a plain sky with the map icon."""
+    """The map thumbnail filling the photo, or a dotted sky with the map icon."""
     width, height = px(PHOTO_WIDTH), px(PHOTO_HEIGHT)
     if thumbnail is not None:
         photo = Image.new("RGBA", (width, height), rgba("#0B0B14"))
         photo.alpha_composite(cover_crop(thumbnail, width, height))
     else:
-        photo = vertical_gradient(width, height, (
-            (0.0, rgba("#2F7FE0")), (1.0, rgba("#6DB8FA")),
-        ))
-        photo.alpha_composite(dot_pattern(width, height, rgba("#1C468F", 56)))
+        photo = map_backdrop(*NO_THUMBNAIL_PHOTO_COLORS, PHOTO_WIDTH, PHOTO_HEIGHT)[0].copy()
         paste_icon(photo, map_icon("map", 110), (PHOTO_WIDTH - 110) / 2, 84)
-        note = Text("no picture yet", HAND, 26, stroke=6, stroke_color=rgba("#1C468F"))
+        note = Text("no picture yet", HAND, 26, stroke=6,
+                    stroke_color=rgba(MAP_ICON_OUTLINE))
         note.draw(ImageDraw.Draw(photo), (PHOTO_WIDTH - note.width) / 2, 204)
     photo = clip_to(photo, rounded_mask(PHOTO_WIDTH, PHOTO_HEIGHT, 4))
     paper.alpha_composite(photo, (px(16), px(16)))
@@ -953,7 +919,7 @@ def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=
 
     `visibility` is Public / Unlisted / Private, or None to leave the tag
     off. The background fades top to bottom between the thumbnail's two
-    most common colours; without a thumbnail it's the sky-and-hill scene.
+    most common colours; without a thumbnail, between two sky blues.
     Missing avatar or thumbnail bytes get placeholders.
     """
     plays, favourites = max(0, plays or 0), max(0, favourites or 0)
@@ -963,10 +929,8 @@ def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=
     creator = drawable_text(creator_name or "", DISPLAY) or None
 
     thumbnail = open_image(thumbnail_png)
-    if thumbnail is not None:
-        backdrop, footer_outline = map_backdrop(*dominant_colors(thumbnail))
-    else:
-        backdrop, footer_outline = map_scene(), rgba("#2E5E22")
+    colors = dominant_colors(thumbnail) if thumbnail is not None else NO_THUMBNAIL_COLORS
+    backdrop, footer_outline = map_backdrop(*colors)
     canvas = backdrop.copy()
     draw_polaroid(canvas, shown_name, creator, open_image(creator_avatar_png),
                   thumbnail)
