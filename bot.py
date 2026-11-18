@@ -3503,9 +3503,8 @@ async def load_badge_card_icons(items):
 class BadgesImageCardView(CardView):
     """Badges and map achievements as one rendered grid, a page at a time.
 
-    On trial behind !testbadges before it replaces BadgesCardView. Missing
-    narrows the grid to what's still locked; the count and bar always
-    cover everything.
+    On trial behind !testbadges before it replaces BadgesCardView. Earned
+    items come first, so the locked ones fill the last pages.
     """
 
     def __init__(self, items, *, username, avatar_png=None, background_png=None,
@@ -3516,25 +3515,20 @@ class BadgesImageCardView(CardView):
         self.avatar_png = avatar_png
         # The profile's chosen map, so the card shares its background.
         self.background_png = background_png
-        self.missing = False
         self.page = 0
         self.card_image = None
         self._render_lock = asyncio.Lock()
 
     @property
-    def shown(self):
-        return [item for item in self.items if not item["earned"]] if self.missing else self.items
-
-    @property
     def page_count(self):
-        return max(1, -(-len(self.shown) // card_render.BADGES_PER_PAGE))
+        return max(1, -(-len(self.items) // card_render.BADGES_PER_PAGE))
 
     async def refresh(self):
         """Fetch the page's art, draw the page, and lay out the message."""
         async with self._render_lock:
             self.page = max(0, min(self.page, self.page_count - 1))
             per_page = card_render.BADGES_PER_PAGE
-            page_items = self.shown[self.page * per_page:(self.page + 1) * per_page]
+            page_items = self.items[self.page * per_page:(self.page + 1) * per_page]
             await load_badge_card_icons(page_items)
             self.card_image = await asyncio.to_thread(
                 card_render.render_badges_card,
@@ -3554,14 +3548,9 @@ class BadgesImageCardView(CardView):
         )
         self.add_item(gallery)
 
-        notes = []
-        if self.missing and not self.shown:
-            notes.append("-# Nothing missing: every badge and achievement is earned.")
         note = dev_universe_note()
         if note:
-            notes.append(note)
-        if notes:
-            self.add_item(discord.ui.TextDisplay("\n".join(notes)))
+            self.add_item(discord.ui.TextDisplay(note))
 
         row = discord.ui.ActionRow()
         previous = discord.ui.Button(
@@ -3576,13 +3565,6 @@ class BadgesImageCardView(CardView):
         )
         following.callback = self.next_page
         row.add_item(following)
-        toggle = discord.ui.Button(
-            label="All" if self.missing else "Missing",
-            style=discord.ButtonStyle.success if self.missing else discord.ButtonStyle.danger,
-            emoji="✔️" if self.missing else "✖️",
-        )
-        toggle.callback = self.toggle_missing
-        row.add_item(toggle)
         back = self.make_back_button()
         if back is not None:
             row.add_item(back)
@@ -3605,12 +3587,6 @@ class BadgesImageCardView(CardView):
     @keeps_context
     async def next_page(self, interaction):
         self.page += 1
-        await self.show(interaction)
-
-    @keeps_context
-    async def toggle_missing(self, interaction):
-        self.missing = not self.missing
-        self.page = 0
         await self.show(interaction)
 
 async def build_badges_image_view(user_id, username, parent=None):
