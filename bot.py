@@ -4547,17 +4547,33 @@ class LeaderboardCardView(CardView):
     def card_files(self):
         return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
 
+async def leaderboard_entry_avatar(entry):
+    """A board entry's podium picture: its Roblox headshot, or for an
+    achievements row with no linked account, the member's Discord avatar."""
+    avatar = await fetch_leaderboard_avatar(entry.get("UserId"))
+    member = entry.get("Member")
+    if avatar is None and member is not None:
+        try:
+            avatar = await member.display_avatar.replace(size=256, format="png").read()
+        except (discord.HTTPException, ValueError):
+            avatar = None
+    return avatar
+
 async def build_leaderboard_card_view(leaderboard, *, title, subtitle, footer,
                                       shown_title, medals, thumbnail_png=None,
-                                      parent=None):
-    """Render a list-shaped board (map or cup) as a LeaderboardCardView, or
-    None when it has no rows.
+                                      value_formatter=format_time,
+                                      sheet_title=None, parent=None):
+    """Render any leaderboard-shaped list (map, cup, global or achievements)
+    as a LeaderboardCardView, or None when it has no rows.
 
     `shown_title` is the exact title in plain text, for the line under the
     picture: the card's font drops emoji and most non-Latin letters.
+    `value_formatter` turns each entry's Value into its tag's text, and
+    `sheet_title` replaces the sheet's "Top 10 of N" / "N times".
     """
     rows = await collect_leaderboard_rows(
-        leaderboard, MAX_LEADERBOARD_ROWS, name_limit=None
+        leaderboard, MAX_LEADERBOARD_ROWS, value_formatter=value_formatter,
+        name_limit=None,
     )
     if not rows:
         return None
@@ -4572,7 +4588,9 @@ async def build_leaderboard_card_view(leaderboard, *, title, subtitle, footer,
 
     # The flair table is one cached download, so ten lookups cost one fetch.
     avatars, effects = await asyncio.gather(
-        asyncio.gather(*(fetch_leaderboard_avatar(row["user_id"]) for row in rows[:3])),
+        # A row's "pos" indexes the board: collect_leaderboard_rows walks it in order.
+        asyncio.gather(*(leaderboard_entry_avatar(leaderboard[row["pos"]])
+                         for row in rows[:3])),
         asyncio.gather(*(equipped_effect(row) for row in rows)),
     )
     players = [
@@ -4588,9 +4606,9 @@ async def build_leaderboard_card_view(leaderboard, *, title, subtitle, footer,
         for index, row in enumerate(rows)
     ]
     total = len(leaderboard)
-    if total > len(rows):
+    if sheet_title is None and total > len(rows):
         sheet_title = f"Top {len(rows)} of {format_number(total)}"
-    else:
+    elif sheet_title is None:
         sheet_title = f"{total} {'time' if total == 1 else 'times'}"
 
     fields = dict(title=title, subtitle=subtitle, sheet_title=sheet_title,
@@ -4665,6 +4683,76 @@ async def build_cup_leaderboard_card_view(index, date_text, *, todays_map=None):
     )
     if view is None:
         return None, "The leaderboard came back empty."
+    return view, None
+
+async def build_global_leaderboard_card_view(selected):
+    """The image version of a global board (wins, medals, creators):
+    (view, error text). An ordered datastore hands back only its top
+    entries, so the sheet says "Top 10" with no total."""
+    scope, title, value_name = GLOBAL_LEADERBOARDS[selected]
+    leaderboard = await fetch_ordered_leaderboard(
+        datastore="Data", scope=scope, limit=MAX_LEADERBOARD_ROWS
+    )
+    view = None
+    if leaderboard:
+        view = await build_leaderboard_card_view(
+            leaderboard,
+            title=f"{title} Leaderboard",
+            subtitle=f"All time · {value_name}",
+            footer=card_timestamp(),
+            shown_title=f"{title} Leaderboard",
+            medals=False,
+            value_formatter=format_number,
+            sheet_title=f"Top {min(len(leaderboard), MAX_LEADERBOARD_ROWS)}",
+        )
+    if view is None:
+        return None, f"No entries found for the **{title}** leaderboard."
+    return view, None
+
+async def build_achievement_leaderboard_card_view(guild):
+    """The image version of the achievements board: (view, error text).
+
+    Its rows are Discord members, so each shows their display name. A
+    member who linked a Roblox account gets that account's headshot and
+    username effect; anyone else, their Discord avatar.
+    """
+    if not in_home_guild(guild):
+        return None, "The achievements leaderboard only exists in the home server."
+    rules = visible_achievement_rules(await fetch_role_rules(guild.id))
+    rows = achievement_leaderboard_rows(guild, rules)
+    if not rows:
+        return None, "Nobody has earned an achievement role yet."
+
+    # One read of the Linked table covers every row on the card.
+    linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
+    linked = linked if isinstance(linked, dict) else {}
+    entries = []
+    for row in rows:
+        member = row["Member"]
+        try:
+            roblox_id = int(linked.get(str(member.id)))
+        except (TypeError, ValueError):
+            roblox_id = None
+        entries.append({"Name": member.display_name, "UserId": roblox_id,
+                        "Value": row["Value"], "Member": member})
+
+    total = len(entries)
+    if total > MAX_LEADERBOARD_ROWS:
+        sheet_title = f"Top {MAX_LEADERBOARD_ROWS} of {format_number(total)} members"
+    else:
+        sheet_title = f"{total} member{'' if total == 1 else 's'}"
+    view = await build_leaderboard_card_view(
+        entries,
+        title="Achievements Leaderboard",
+        subtitle=guild.name,
+        footer=card_timestamp(),
+        shown_title=f"Achievements Leaderboard · {guild.name}",
+        medals=False,
+        value_formatter=format_number,
+        sheet_title=sheet_title,
+    )
+    if view is None:
+        return None, "Nobody has earned an achievement role yet."
     return view, None
 
 async def build_map_card(entry, **view_options):
@@ -5536,6 +5624,8 @@ def achievement_leaderboard_rows(guild, rules):
                 "Name": f"<@{member.id}>",
                 "Value": earned,
                 "Sort": member.display_name.lower(),
+                # For the image card, which shows the name and avatar.
+                "Member": member,
             })
     rows.sort(key=lambda row: (-row["Value"], row["Sort"]))
     return rows
@@ -5818,8 +5908,7 @@ async def test_leaderboard_card(ctx, target: str, when: str = None):
 
     `!testleaderboard <map id>` for a map's board, or
     `!testleaderboard cup [index|DD/MM/YYYY]` for a Daily Cup (today's by
-    default). The global boards (wins, medals, creators, achievements) have
-    no image design yet.
+    default), or `!testleaderboard wins|medals|creators|achievements`.
     """
     if card_render is None:
         await ctx.send("Image cards need Pillow — run `!restart` to install it.")
@@ -5855,6 +5944,16 @@ async def test_leaderboard_card(ctx, target: str, when: str = None):
             if view is None:
                 await ctx.send(error)
                 return
+        elif selected in GLOBAL_LEADERBOARDS:
+            view, error = await build_global_leaderboard_card_view(selected)
+            if view is None:
+                await ctx.send(error)
+                return
+        elif selected == "achievements":
+            view, error = await build_achievement_leaderboard_card_view(ctx.guild)
+            if view is None:
+                await ctx.send(error)
+                return
         elif selected.isdigit():
             map_id = int(selected)
             maps_by_id = await get_community_maps()
@@ -5873,9 +5972,9 @@ async def test_leaderboard_card(ctx, target: str, when: str = None):
                 return
         else:
             await ctx.send(
-                "Usage: `!testleaderboard <map id>` or "
-                "`!testleaderboard cup [index|DD/MM/YYYY]`. The global boards "
-                "don't have an image design yet."
+                "Usage: `!testleaderboard <map id>`, "
+                "`!testleaderboard cup [index|DD/MM/YYYY]`, or "
+                "`!testleaderboard wins|medals|creators|achievements`."
             )
             return
 
