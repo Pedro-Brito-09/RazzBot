@@ -2592,3 +2592,263 @@ def render_maps_card(**fields):
     otherwise `avatar_png` / `background_png` give the profile's look.
     """
     return png_bytes(compose_maps_card(**fields)[0])
+
+
+# ---------------------------------------------------------------- versus card
+
+VERSUS_WIDTH, VERSUS_HEIGHT = 960, 640
+# (icon, label), in the rows' order: what /compare lines up.
+VERSUS_STATS = (
+    ("trophy", "Wins"),
+    ("fire", "Win streak"),
+    ("star", "Stars"),
+    ("trend", "All-time stars"),
+    ("medal-diamond", "Diamond medals"),
+    ("medal-gold", "Gold medals"),
+    ("medal-silver", "Silver medals"),
+    ("medal-bronze", "Bronze medals"),
+)
+# Each player's paper: 392px wide, 30px down, 34px in from its side, tilted
+# away from the middle. padding 18px 20px 20px; an 84px avatar row with 8px
+# under it; 40px rows 6px apart.
+PAPER_WIDTH, PAPER_TOP, PAPER_INSET, PAPER_TILT = 392, 30, 34, 2.5
+PAPER_PAD_X, PAPER_PAD_TOP, PAPER_PAD_BOTTOM = 20, 18, 20
+PAPER_INNER = PAPER_WIDTH - 2 * PAPER_PAD_X
+VERSUS_AVATAR = 84
+VERSUS_ROW, VERSUS_GAP = 40, 6
+VERSUS_ROWS_TOP = PAPER_PAD_TOP + VERSUS_AVATAR + 8 + VERSUS_GAP
+PAPER_HEIGHT = (VERSUS_ROWS_TOP + len(VERSUS_STATS) * VERSUS_ROW
+                + (len(VERSUS_STATS) - 1) * VERSUS_GAP + PAPER_PAD_BOTTOM)
+CLIP_PAPER = ((0, 1), (25, 0), (50, 1.2), (75, 0), (100, 1), (99.2, 50), (100, 99),
+              (75, 100), (50, 98.8), (25, 100), (0, 99), (0.8, 50))
+# The ragged line the right player's half starts at, as clip-path
+# percentages of the card (the polygon closes along the right edge).
+CLIP_RIGHT_HALF = ((52, 0), (100, 0), (100, 100), (48, 100), (49.5, 82), (47.5, 64),
+                   (50.5, 46), (48.5, 28), (51, 12))
+# Each half's backdrop is drawn this wide from its own edge of the card, so
+# a map thumbnail is centred on the player's side; it reaches past the line.
+HALF_WIDTH = 508
+VERSUS_NAME_SIZE, VERSUS_NAME_MIN = 30, 24
+# (paper fill, outline) for the left and right player.
+VERSUS_SIDES = (("#6CC4F4", "#2A78B8"), ("#FF7A6B", "#C23A2E"))
+VS_PURPLE, VS_INK = "#A57CF7", "#5E37B8"
+
+
+def versus_paper_left(side):
+    return PAPER_INSET if side == 0 else VERSUS_WIDTH - PAPER_INSET - PAPER_WIDTH
+
+
+def versus_value_text(value, outline, room):
+    """A stat's number at 21px, shortened (1.2M) and then shrunk if it
+    doesn't fit `room`. None (a stat that couldn't be read) is "?"."""
+    style = dict(stroke=6, stroke_color=outline)
+    if value is None:
+        return Text("?", DISPLAY, 21, **style)
+    text = format_count(value)
+    if Text(text, DISPLAY, 21, **style).width > room:
+        text = compact_count(value)
+    return (fit_text(text, DISPLAY, 21, room, min_size=15, **style)
+            or Text(text, DISPLAY, 15, **style))
+
+
+def versus_name(username, outline, effect):
+    """The name for the paper: 30px, shrunk to 24px and then cut with "…" to
+    stay on the paper; in the effect's font when it has one."""
+    room = PAPER_INNER - VERSUS_AVATAR - 14
+    style = dict(stroke=7, stroke_color=outline, shadow=4)
+    text = drawable_text(username or "", DISPLAY) or "Unknown"
+    face = (effect or {}).get("font") or DISPLAY
+    if face != DISPLAY:
+        name = fit_name_in_face(text, face, room, style, size=VERSUS_NAME_SIZE,
+                                min_size=VERSUS_NAME_MIN - 4)
+        if name is not None:
+            return name
+    return (fit_text(text, DISPLAY, VERSUS_NAME_SIZE, room, min_size=VERSUS_NAME_MIN,
+                     line_height=1, **style)
+            or ellipsize(text, DISPLAY, VERSUS_NAME_MIN, room, line_height=1, **style))
+
+
+def versus_paper(side, player, values, wins, score, name):
+    """One player's paper: avatar, name (unless it animates), score, rows.
+    Returns the paper and the name box's top-left on it."""
+    fill, outline_hex = VERSUS_SIDES[side]
+    outline = rgba(outline_hex)
+    avatar = framed_avatar(open_image(player.get("avatar_png")), VERSUS_AVATAR, 6, 20,
+                           "#2A2F4A", "#454D73")
+    won = Text(f"{score} stat{'' if score == 1 else 's'} won", HAND, 20,
+               stroke=4, stroke_color=outline)
+    # The name and the score as a column centred on the avatar.
+    column_top = PAPER_PAD_TOP + (VERSUS_AVATAR - VERSUS_NAME_SIZE - won.height) / 2
+    text_left = PAPER_PAD_X + VERSUS_AVATAR + 14
+    name_at = (text_left, column_top + (VERSUS_NAME_SIZE - name.height) / 2)
+    crown = profile_icon("crown", 28)
+
+    def content(image, draw):
+        place(image, with_drop_shadow(avatar, 5, color=LIGHT_SHADOW),
+              PAPER_PAD_X, PAPER_PAD_TOP, VERSUS_AVATAR, VERSUS_AVATAR)
+        if not player.get("effect"):
+            name.draw(draw, *name_at)
+        won.draw(draw, text_left, column_top + VERSUS_NAME_SIZE)
+        for index, ((icon, label), value, best) in enumerate(zip(VERSUS_STATS, values, wins)):
+            top = VERSUS_ROWS_TOP + index * (VERSUS_ROW + VERSUS_GAP)
+            row = clip_to(solid(PAPER_INNER, VERSUS_ROW, (255, 255, 255, 82 if best else 20)),
+                          rounded_mask(PAPER_INNER, VERSUS_ROW, 8))
+            image.alpha_composite(row, (px(PAPER_PAD_X), px(top)))
+            left = PAPER_PAD_X + 8
+            paste_icon(image, profile_icon(icon, 32), left, top + (VERSUS_ROW - 32) / 2)
+            caption = Text(label, HAND, 18, stroke=4, stroke_color=outline)
+            caption.draw(draw, left + 40, top + (VERSUS_ROW - caption.height) / 2)
+            # padding-right 12px; the crown's -4px margin pulls it 4px past that.
+            right = PAPER_PAD_X + PAPER_INNER - 12
+            if best:
+                paste_icon(image, crown, right + 4 - 28, top + (VERSUS_ROW - 28) / 2)
+                right += 4 - 28 - 8
+            number = versus_value_text(value, outline, right - (left + 40 + caption.width + 8))
+            # padding-top 3px, centred along with it.
+            number.draw(draw, right - number.width,
+                        top + (VERSUS_ROW - number.height - 3) / 2 + 3)
+
+    return strip(PAPER_WIDTH, PAPER_HEIGHT, rgba(fill), CLIP_PAPER, content), name_at
+
+
+def draw_versus_backdrop(canvas, players):
+    """Each player's profile background on their half, split along the
+    ragged line, with the grass hill along the bottom."""
+    for side, player in enumerate(players):
+        half, _ = player_backdrop(player.get("username"), open_image(player.get("avatar_png")),
+                                  open_image(player.get("background_png")),
+                                  HALF_WIDTH, VERSUS_HEIGHT)
+        if side == 0:
+            canvas.alpha_composite(half)
+            continue
+        layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        layer.alpha_composite(half, (px(VERSUS_WIDTH - HALF_WIDTH), 0))
+        canvas.alpha_composite(clip_to(layer, polygon_mask(VERSUS_WIDTH, VERSUS_HEIGHT,
+                                                           CLIP_RIGHT_HALF)))
+
+    # The hill: a 1080 x 190 ellipse at left -60px, bottom -120px.
+    top = VERSUS_HEIGHT + 120 - 190
+
+    def paint(draw, k):
+        draw.ellipse((-60 * k, 0, 1020 * k, 190 * k), fill=255)
+    hill = solid(VERSUS_WIDTH, VERSUS_HEIGHT - top, rgba("#4F8E3A"))
+    canvas.alpha_composite(clip_to(hill, shape_mask(VERSUS_WIDTH, VERSUS_HEIGHT - top, paint)),
+                           (0, px(top)))
+
+
+def draw_vs_sticker(canvas):
+    """The VS disc between the papers: a 104px purple circle in a 7px white
+    border, a 4px purple ring round that, a 7px drop shadow, turned -8deg."""
+    pad = 12
+    size = 104 + 2 * pad
+    layer = Image.new("RGBA", (px(size), px(size)), (0, 0, 0, 0))
+
+    def disc(diameter, color, dy=0):
+        def paint(draw, k):
+            draw.ellipse((0, 0, diameter * k - 1, diameter * k - 1), fill=255)
+        offset = (size - diameter) / 2
+        body = clip_to(solid(diameter, diameter, color), shape_mask(diameter, diameter, paint))
+        layer.alpha_composite(body, (px(offset), px(offset + dy)))
+
+    # The box shadows: the ring under the drop shadow, both under the disc.
+    disc(112, rgba(VS_INK))
+    disc(104, SHADOW, dy=7)
+    disc(104, WHITE)
+    disc(90, rgba(VS_PURPLE))
+    vs = Text("VS", DISPLAY, 40, stroke=8, stroke_color=rgba(VS_INK))
+    vs.draw(ImageDraw.Draw(layer), (size - vs.width) / 2, (size - vs.height - 6) / 2 + 6)
+    place(canvas, layer, VERSUS_WIDTH / 2 - size / 2, 250 - pad, size, size, rotate=-8)
+
+
+def draw_versus_footer(canvas, text):
+    """The summary on a purple strip over the grass, centred, -1deg."""
+    label = ellipsize(text, DISPLAY, 22, VERSUS_WIDTH - 200,
+                      stroke=6, stroke_color=rgba(VS_INK))
+    width, height = 26 + label.width + 26, 6 + label.height + 3
+    body = strip(width, height, rgba(VS_PURPLE), CLIP_MEDAL,
+                 lambda image, draw: label.draw(draw, 26, 6))
+    place(canvas, with_drop_shadow(body, 4), (VERSUS_WIDTH - width) / 2,
+          VERSUS_HEIGHT - 14 - height, width, height, rotate=-1)
+
+
+def versus_results(left_values, right_values):
+    """Per row, (left wins, right wins), on the raw numbers: a tie, or a
+    value that couldn't be read (None), crowns nobody."""
+    return [(False, False) if a is None or b is None else (a > b, b > a)
+            for a, b in zip(left_values, right_values)]
+
+
+def versus_summary(players, scores):
+    names = [drawable_text(p.get("username") or "", DISPLAY) or "Unknown" for p in players]
+    if scores[0] == scores[1]:
+        return f"Tied {scores[0]}–{scores[1]}"
+    lead = 0 if scores[0] > scores[1] else 1
+    return f"{names[lead]} leads {scores[lead]}–{scores[1 - lead]}"
+
+
+def _versus_to_canvas(left_edge, tilt, x, y):
+    return turn_point(x, y, left_edge, PAPER_TOP, PAPER_WIDTH, PAPER_HEIGHT, tilt)
+
+
+def compose_versus_card(*, left, right):
+    """The card, and an AnimatedName spec for each player with an effect
+    (whose name is left off the card)."""
+    players = (left, right)
+    count = len(VERSUS_STATS)
+    values = [(tuple(p.get("stats") or ()) + (None,) * count)[:count] for p in players]
+    results = versus_results(*values)
+    scores = [sum(r[side] for r in results) for side in (0, 1)]
+
+    canvas = Image.new("RGBA", (px(VERSUS_WIDTH), px(VERSUS_HEIGHT)), (0, 0, 0, 0))
+    draw_versus_backdrop(canvas, players)
+    specs = []
+    for side, player in enumerate(players):
+        outline = rgba(VERSUS_SIDES[side][1])
+        effect = player.get("effect")
+        name = versus_name(player.get("username"), outline, effect)
+        paper, name_at = versus_paper(side, player, values[side],
+                                      [r[side] for r in results], scores[side], name)
+        left_edge = versus_paper_left(side)
+        tilt = -PAPER_TILT if side == 0 else PAPER_TILT
+        place(canvas, with_drop_shadow(paper, 7), left_edge, PAPER_TOP,
+              PAPER_WIDTH, PAPER_HEIGHT, rotate=tilt)
+        if effect:
+            specs.append(dict(
+                name=name, at=name_at, effect=effect, outline=outline, rotate=tilt,
+                to_canvas=functools.partial(_versus_to_canvas, left_edge, tilt)))
+    draw_vs_sticker(canvas)
+    draw_versus_footer(canvas, versus_summary(players, scores))
+    return clip_to(canvas, rounded_mask(VERSUS_WIDTH, VERSUS_HEIGHT, 24)), specs
+
+
+def render_versus_card(*, left, right):
+    """Two players' stats side by side, as (image bytes, extension).
+
+    `left` and `right` are dicts: username, avatar_png, background_png (the
+    profile's chosen map thumbnail; each half follows that player's profile
+    backdrop, player_backdrop), stats (the VERSUS_STATS values in order,
+    None for one that couldn't be read) and effect (a username_effects
+    effect, or None). Rows are won on the raw numbers. With an effect on
+    either name the card is a half-size animated WebP, as the leaderboard's
+    is; otherwise a PNG.
+    """
+    if not (left.get("effect") or right.get("effect")):
+        return png_bytes(compose_versus_card(left=left, right=right)[0]), "png"
+    with ANIMATION_LOCK:
+        card, specs = compose_versus_card(left=left, right=right)
+        frames_count, delay, cycles = plan_shared_loop([spec["effect"] for spec in specs])
+        names = [
+            AnimatedName(card, spec["name"], spec["at"], spec["effect"], spec_cycles,
+                         outline=spec["outline"], stroke_scale=VERSUS_NAME_SIZE / NAME_SIZE,
+                         to_canvas=spec["to_canvas"], rotate=spec["rotate"],
+                         keep_outline=True)
+            for spec, spec_cycles in zip(specs, cycles)
+        ]
+        still = card.resize((card.width // 2, card.height // 2), Image.LANCZOS)
+        del card
+
+        def draw_frame(index, image):
+            for name in names:
+                image.paste(name.patch(index / frames_count), name.at)
+
+        return encode_lazy_animation(still, frames_count, draw_frame, delay), "webp"

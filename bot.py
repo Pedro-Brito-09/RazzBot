@@ -6629,6 +6629,98 @@ async def compare_command(ctx, player1: str, player2: str = None):
         heading=f"⚔️ {first} vs {second}",
     ))
 
+class CompareCardView(CardView):
+    """Two players' stats side by side as a rendered versus card.
+
+    On trial behind !testcompare before it replaces /compare's text card.
+    """
+
+    def __init__(self, card_image, *, extension, first, second, parent=None,
+                 timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(parent=parent, timeout=timeout)
+        self.card_image = card_image
+        # png, or webp when a username effect plays.
+        self.filename = f"versus.{extension}"
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(media=f"attachment://{self.filename}",
+                         description=f"{first} vs {second}")
+        self.add_item(gallery)
+        back = self.make_back_button()
+        if back is not None:
+            row = discord.ui.ActionRow()
+            row.add_item(back)
+            self.add_item(row)
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
+
+async def compare_card_player(user_id, username, stats, effect_name=None):
+    """render_versus_card's dict for one player: their compare stats in
+    card order, and the profile card's avatar, background and effect."""
+    avatar_png, background_png, equipped = await asyncio.gather(
+        fetch_avatar_png(user_id), fetch_profile_background_png(user_id),
+        fetch_equipped_username_effect(user_id),
+    )
+    return dict(
+        username=username, avatar_png=avatar_png, background_png=background_png,
+        # fetch_compare_stats lists them in the card's row order.
+        stats=tuple(stats.values()),
+        effect=username_effects.resolve_effect(effect_name or equipped),
+    )
+
+async def build_compare_card_view(first_id, first, second_id, second, *, effect_name=None):
+    """The versus card for two players, or the names without saved data."""
+    first_stats, second_stats = await asyncio.gather(
+        fetch_compare_stats(first_id), fetch_compare_stats(second_id),
+    )
+    missing = [name for name, stats in ((first, first_stats), (second, second_stats))
+               if stats is None]
+    if missing:
+        return None, missing
+    left, right = await asyncio.gather(
+        compare_card_player(first_id, first, first_stats, effect_name),
+        compare_card_player(second_id, second, second_stats, effect_name),
+    )
+    image, extension = await asyncio.to_thread(card_render.render_versus_card,
+                                               left=left, right=right)
+    return CompareCardView(image, extension=extension, first=first, second=second), []
+
+@bot.command(name="testcompare", hidden=True)
+@commands.is_owner()
+async def test_compare_card(ctx, player1: str, player2: str = None, effect: str = None):
+    """Owner-only preview of the image versus card, before /compare uses it.
+
+    `!testcompare <player1> [player2|me] [effect|none]`. As /compare, a
+    missing second player is your linked account. Each name plays its
+    equipped username effect unless one is named for both, as !testprofile.
+    """
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
+        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
+        return
+
+    async with ctx.typing():
+        first_id, first = await resolve_command_user(ctx, None if player1 == "me" else player1)
+        if first_id is None:
+            return
+        second_id, second = await resolve_command_user(
+            ctx, None if player2 in (None, "me") else player2)
+        if second_id is None:
+            return
+        if first_id == second_id:
+            await ctx.send("Pick two different players to compare.")
+            return
+        # "none" can't match a preset, so it shows the still card.
+        view, missing = await build_compare_card_view(first_id, first, second_id, second,
+                                                      effect_name=effect)
+        if view is None:
+            await ctx.send(f"No game data saved for **{'** or **'.join(missing)}**.")
+            return
+
+    view.message = await ctx.send(view=view, files=view.card_files())
+
 def describe_command(command, prefix):
     usage = f"{prefix}{command.qualified_name}"
     # usage="" hides arguments the slash form doesn't take, for commands whose
