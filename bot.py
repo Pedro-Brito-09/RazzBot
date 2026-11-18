@@ -3881,12 +3881,14 @@ class MedalsImageCardView(CardView):
     thumbnails are fetched a page at a time and kept for the view's life.
     """
 
-    def __init__(self, medals, *, username, avatar_png=None, effect=None, parent=None,
-                 timeout=MAP_VIEW_TIMEOUT):
+    def __init__(self, medals, *, username, avatar_png=None, background_png=None,
+                 effect=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(parent=parent, timeout=timeout)
         self.medals = medals
         self.username = username
         self.avatar_png = avatar_png
+        # The profile's chosen map, so the card shares its background.
+        self.background_png = background_png
         # The player's username effect plays on the name, as on the profile
         # card, which makes every page an animated WebP.
         self.effect = effect
@@ -3937,7 +3939,8 @@ class MedalsImageCardView(CardView):
                 "thumbnail_png": self._thumbnails.get(medal["map_id"]),
             } for medal in page_medals]
             fields = dict(
-                username=self.username, avatar_png=self.avatar_png, counts=tuple(counts),
+                username=self.username, avatar_png=self.avatar_png,
+                background_png=self.background_png, counts=tuple(counts),
                 cups=cups, page=self.page + 1, pages=self.page_count,
             )
             if self.effect:
@@ -4004,13 +4007,13 @@ async def build_medals_image_view(user_id, username, parent=None, *, effect_name
     """The image version of build_medals_view, first page drawn. A player
     without medals gets the card's empty state. Their equipped username
     effect plays on the name; effect_name forces one, for previews."""
-    medals, avatar_png, equipped = await asyncio.gather(
+    medals, avatar_png, background_png, equipped = await asyncio.gather(
         fetch_medal_history(user_id), fetch_avatar_png(user_id),
-        fetch_equipped_username_effect(user_id),
+        fetch_profile_background_png(user_id), fetch_equipped_username_effect(user_id),
     )
     effect = username_effects.resolve_effect(effect_name or equipped)
     view = MedalsImageCardView(medals, username=username, avatar_png=avatar_png,
-                               effect=effect, parent=parent)
+                               background_png=background_png, effect=effect, parent=parent)
     await view.refresh()
     return view
 

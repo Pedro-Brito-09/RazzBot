@@ -2325,36 +2325,6 @@ MEDAL_TOTALS = (
     ("medal-silver", "#B3B8C2", "#5E6573", -1),
     ("medal-bronze", "#D98A5B", "#8F4A1F", 1.5),
 )
-SKY_STOPS = ((0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")))
-
-
-@functools.lru_cache(maxsize=1)
-def medals_sky():
-    """The template's scene: the sky fade, a dotted blue pole hanging from
-    the top edge, and the green hill along the bottom. Drawn once."""
-    width, height = px(MEDALS_WIDTH), px(MEDALS_HEIGHT)
-    sky = vertical_gradient(width, height, SKY_STOPS)
-
-    # 100 x 200 at (470, -40), turned 6deg: #2B5FBF with 2px #1C468F dots
-    # on a 12px grid, one in the middle of each square.
-    def dots(draw, k):
-        for cx in range(6, 100, 12):
-            for cy in range(6, 200, 12):
-                draw.ellipse(((cx - 2.3) * k, (cy - 2.3) * k,
-                              (cx + 2.3) * k, (cy + 2.3) * k), fill=255)
-    pole = solid(100, 200, rgba("#2B5FBF"))
-    pole.alpha_composite(clip_to(solid(100, 200, rgba("#1C468F")),
-                                 shape_mask(100, 200, dots)))
-    place(sky, pole, 470, -40, 100, 200, rotate=6)
-
-    # A 1080 x 190 ellipse at left -60, bottom -120: only its top shows.
-    def hill(draw, k):
-        draw.ellipse((0, 0, 1080 * k - 1, 190 * k - 1), fill=255)
-    top = MEDALS_HEIGHT + 120 - 190
-    mound = clip_to(solid(1080, 190, rgba("#4F8E3A")), shape_mask(1080, 190, hill))
-    mound = mound.crop((px(60), 0, px(60) + width, px(MEDALS_HEIGHT - top)))
-    sky.alpha_composite(mound, (0, px(top)))
-    return sky
 
 
 def draw_medal_totals(canvas, counts):
@@ -2455,13 +2425,17 @@ def draw_no_medals(canvas):
 
 
 def compose_medals_card(*, username, avatar_png=None, counts=(0, 0, 0, 0), cups=(),
-                        page=1, pages=1, with_name=True, name_face=DISPLAY):
+                        page=1, pages=1, background_png=None, with_name=True,
+                        name_face=DISPLAY):
     """The card, and (name, at, to_canvas) for animating the name."""
-    canvas = medals_sky().copy()
+    avatar = open_image(avatar_png)
+    # The profile card's background (player_backdrop), as the badges card has.
+    canvas, text_outline = player_backdrop(username, avatar, open_image(background_png),
+                                           MEDALS_WIDTH, MEDALS_HEIGHT)
     totals_left = draw_medal_totals(canvas, counts)
     # The avatar overlaps the banner's end, as on the profile card.
     placed_name = draw_badges_header(
-        canvas, username, open_image(avatar_png), rgba("#2160B8"),
+        canvas, username, avatar, text_outline,
         subtitle="Daily Cup Medals", max_right=totals_left - 16,
         empty="#0F1B33", mark_outline="#2A3B5E", avatar_on_top=True,
         with_name=with_name, face=name_face)
@@ -2472,7 +2446,7 @@ def compose_medals_card(*, username, avatar_png=None, counts=(0, 0, 0, 0), cups=
         draw_no_medals(canvas)
     footer = Text(f"page {page} / {pages}", HAND, 21)
     draw_glowing_text(canvas, [(footer, MEDALS_WIDTH - 36 - footer.width,
-                                MEDALS_HEIGHT - 12 - footer.height)], rgba("#2E5E22"))
+                                MEDALS_HEIGHT - 12 - footer.height)], text_outline)
     return clip_to(canvas, rounded_mask(MEDALS_WIDTH, MEDALS_HEIGHT, 24)), placed_name
 
 
@@ -2502,7 +2476,9 @@ def render_medals_card(**fields):
     CUPS_PER_PAGE dicts, newest first: cup (the cup's number), date (text,
     e.g. "13/11/2026"), name (the map's), tier (0 diamond .. 3 bronze) and
     thumbnail_png (bytes, or None for the empty-photo sky). No cups draws
-    the empty state. `page` / `pages` drive the footer.
+    the empty state. `page` / `pages` drive the footer. `background_png`
+    is the profile's chosen map thumbnail; the backdrop follows the
+    profile card's (player_backdrop).
     """
     card, _ = compose_medals_card(**fields)
     out = io.BytesIO()
