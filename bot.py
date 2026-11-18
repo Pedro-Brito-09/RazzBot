@@ -3457,7 +3457,7 @@ async def map_achievement_items(user_id):
 
 async def badge_card_items(user_id):
     """Every game badge (round), then the map achievements (square), each
-    marked earned or not, with its outline colour. None without the game's
+    marked earned or not, with a colour for its placeholder art. None without the game's
     badge list."""
     badges = await fetch_universe_badges()
     if not badges:

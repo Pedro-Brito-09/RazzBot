@@ -2003,7 +2003,6 @@ CLIP_BAR = ((1.5, 0), (98.5, 0), (100, 25), (98.8, 50), (100, 75), (98.5, 100),
 CLIP_BAR_FILL = ((0, 0), (97, 0), (100, 25), (97.5, 50), (100, 75), (97, 100), (0, 100))
 # The name banner keeps clear of the progress column (right 30, 300 wide).
 BADGES_BANNER_MAX_RIGHT = 620
-LOCKED_OUTLINE = (255, 255, 255, 230)
 
 
 @functools.lru_cache(maxsize=16)
@@ -2091,10 +2090,11 @@ def draw_badge_item(canvas, item, left, top):
     circle = bool(item.get("circle"))
     color = rgba(item.get("color") or BADGE_COLORS[0])
     tile_left = left + (BADGE_CELL - BADGE_TILE) / 2
-    outline = badge_outline("circle" if circle else "rect", not earned,
-                            color if earned else LOCKED_OUTLINE)
+    # Always white: solid when earned, dashed when locked.
+    outline = badge_outline("circle" if circle else "rect", not earned, WHITE)
     canvas.alpha_composite(outline, (px(tile_left), px(top)))
-    size, inset = (72, 8) if earned else (60, 14)
+    # Earned or not, the icon covers the ring's inner half.
+    size, inset = 72, 8
     icon = open_image(item.get("icon_png"))
     art = (badge_icon(icon, size, circle, not earned) if icon is not None
            else badge_placeholder(size, circle, color, not earned))
@@ -2238,8 +2238,9 @@ def render_badges_card(**fields):
 
     `items` is up to BADGES_PER_PAGE dicts in the order to show them:
     name, earned, circle (True for round badge art, False for a square map
-    thumbnail), color (the earned outline, hex) and icon_png (bytes, or
-    None for a placeholder). `unlocked` / `total` drive the count and the
+    thumbnail), color (hex, the placeholder's fill when the art is missing;
+    the outline is always white) and icon_png (bytes, or None for that
+    placeholder). `unlocked` / `total` drive the count and the
     bar, `page` / `pages` the footer.
     """
     card = compose_badges_card(**fields)
