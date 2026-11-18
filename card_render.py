@@ -84,6 +84,7 @@ class Text:
     def __init__(self, text, face, size, *, line_height=None, fill=WHITE,
                  stroke=0, stroke_color=None, shadow=0):
         self.text = text
+        self.size = size
         self.font = load_font(face, size)
         self.fill = fill
         self.stroke = stroke
@@ -226,12 +227,6 @@ def ellipsize(text, face, size, max_width, **style):
     while text and Text(text + "…", face, size, **style).width > max_width:
         text = text[:-1]
     return Text(text.rstrip() + "…", face, size, **style)
-
-
-def fit_or_ellipsize(text, face, size, max_width, *, min_size, **style):
-    """Shrink towards `min_size` to fit; past that, cut the tail short."""
-    return (fit_text(text, face, size, max_width, min_size=min_size, **style)
-            or ellipsize(text, face, min_size, max_width, **style))
 
 
 # A codepoint no font here has, to learn what each face draws for a missing one.
@@ -689,8 +684,9 @@ CAPTION_TOP = 16 + PHOTO_HEIGHT + 12
 # The caption row's padding: 16 paper + 6 row on each side.
 CAPTION_LEFT, CAPTION_RIGHT = 22, POLAROID_WIDTH - 22
 MAP_PURPLE = "#6B45C9"
-# The creator's name gives up its tail past this, leaving the map name room.
-CREATOR_MAX_WIDTH = 160
+# The creator's handle shrinks to stay within this, leaving the map name room.
+CREATOR_MAX_WIDTH = 200
+CREATOR_MIN_WIDTH = 130
 CLIP_TAPE = ((3, 0), (97, 0), (100, 25), (96, 50), (100, 75), (97, 100),
              (3, 100), (0, 75), (4, 50), (0, 25))
 # The stat column: left 682, right 34, from top 40, 26 apart.
@@ -810,28 +806,100 @@ def draw_caption(paper, map_name, creator_name, avatar):
     purple = rgba(MAP_PURPLE)
     row_mid = CAPTION_TOP + 32
 
-    # Creator first, since the map name gets whatever room it leaves.
+    # Creator first, since the map name gets whatever room it leaves. A
+    # long handle shrinks rather than losing its tail.
     by = Text("by", HAND, 17, line_height=1, fill=purple)
-    handle = ellipsize(f"@{creator_name}" if creator_name else "unknown",
-                       DISPLAY, 24, CREATOR_MAX_WIDTH, line_height=1, fill=purple)
-    column = max(by.width, handle.width)
-    group_left = CAPTION_RIGHT - (52 + 10 + column)
+    name_left = CAPTION_LEFT + 54 + 14
+    # The handle gets up to CREATOR_MAX_WIDTH; if that would leave the map
+    # name smaller than 24px, the handle shrinks into less so the name,
+    # the card's title, keeps more.
+    for creator_room in (CREATOR_MAX_WIDTH, CREATOR_MIN_WIDTH):
+        handle = shrink_to_fit(f"@{creator_name}" if creator_name else "unknown",
+                               DISPLAY, 24, creator_room, line_height=1, fill=purple)
+        column = max(by.width, handle.width)
+        group_left = CAPTION_RIGHT - (52 + 10 + column)
+        lines = fit_map_name(map_name, group_left - 14 - name_left, purple)
+        if lines[0].size >= 24:
+            break
     paper.alpha_composite(round_avatar(avatar), (px(group_left - 3), px(row_mid - 26 - 3)))
     # Luckiest Guy's capitals stand taller than its line box, so the handle
     # sits 3px lower than the template's padding to clear the "y" of "by".
-    text_left, text_top = group_left + 52 + 10, row_mid - 23.5
+    text_left = group_left + 52 + 10
+    text_top = row_mid - (17 + 6 + handle.height) / 2
     by.draw(draw, text_left, text_top)
     handle.draw(draw, text_left, text_top + 17 + 6)
 
     # In the name's purple, so the icon and the name outline match.
     paste_icon(paper, map_icon("map-purple", 54), CAPTION_LEFT, row_mid - 27)
-    name_left = CAPTION_LEFT + 54 + 14
-    room = group_left - 14 - name_left
-    name = fit_or_ellipsize(map_name, DISPLAY, 58, room, min_size=32, line_height=1,
-                            stroke=9, stroke_color=purple, shadow=5)
-    # Its box is the font size tall plus 6px padding on top, centred in the
-    # 64px row, so a shrunk name stays on the row's middle.
-    name.draw(draw, name_left, CAPTION_TOP + 6 + (58 - name.height) / 2)
+    # A one-line box is the font size tall plus 6px padding on top, centred
+    # in the 64px row, so the text's middle sits 35px down; wrapped lines
+    # share that middle.
+    gap = {1: 0, 2: 2}.get(len(lines), 1)
+    top = CAPTION_TOP + 35 - (sum(line.height for line in lines) + gap) / 2
+    for line in lines:
+        line.draw(draw, name_left, top)
+        top += line.height + gap
+
+
+def shrink_to_fit(text, face, size, max_width, *, min_size=8, **style):
+    """The text at the largest size that fits, never cut short."""
+    return (fit_text(text, face, size, max_width, min_size=min_size, **style)
+            or Text(text, face, min_size, **style))
+
+
+def map_name_style(size, outline):
+    """The name's outline and shadow, kept in proportion as it shrinks."""
+    k = size / 58
+    return dict(line_height=1, stroke=max(2.5, 9 * k), stroke_color=outline,
+                shadow=max(1.5, 5 * k))
+
+
+# (lines, largest size, smallest size), tried in order: the name stays as
+# big as it can, and only wraps once one line would get too small.
+MAP_NAME_LAYOUTS = ((1, 58, 30), (2, 30, 20), (3, 21, 14))
+
+
+def _splits(words, lines):
+    """Every way to break the words into `lines` consecutive lines."""
+    if lines == 1:
+        yield [" ".join(words)]
+        return
+    for i in range(1, len(words) - lines + 2):
+        for rest in _splits(words[i:], lines - 1):
+            yield [" ".join(words[:i])] + rest
+
+
+def _widest(parts, size):
+    font = load_font(DISPLAY, size)
+    return max(font.getlength(part) for part in parts) / SCALE
+
+
+def fit_map_name(name, room, outline):
+    """The map name as one to three lines of Text that fit `room`, never cut.
+
+    Each layout in MAP_NAME_LAYOUTS is tried from its largest size down,
+    breaking at the words that keep the widest line narrowest. A name that
+    fits none of them takes as many lines as it has words (up to three) at
+    whatever size it needs.
+    """
+    words = name.split()
+
+    def attempt(lines, sizes, force=False):
+        for size in sizes:
+            best = min(_splits(words, lines), key=lambda parts: _widest(parts, size))
+            if force or _widest(best, size) <= room:
+                style = map_name_style(size, outline)
+                return [Text(part, DISPLAY, size, **style) for part in best]
+        return None
+
+    for lines, largest, smallest in MAP_NAME_LAYOUTS:
+        if len(words) >= lines:
+            fitted = attempt(lines, range(largest, smallest - 1, -1))
+            if fitted:
+                return fitted
+    lines = max(1, min(3, len(words)))
+    return (attempt(lines, range(29 if lines == 1 else 13, 4, -1))
+            or attempt(lines, [4], force=True))
 
 
 def draw_polaroid(canvas, map_name, creator_name, avatar, thumbnail):
@@ -885,8 +953,8 @@ def draw_map_strips(canvas, mode, plays, favourites, visibility, featured):
     top = MAP_STRIPS_TOP
 
     mode_text = drawable_text(mode or "", DISPLAY).upper() or "UNKNOWN"
-    mode_value = fit_or_ellipsize(mode_text, DISPLAY, 32, room, min_size=22,
-                                  line_height=1, stroke=7, stroke_color=rgba("#5E37B8"))
+    mode_value = shrink_to_fit(mode_text, DISPLAY, 32, room, min_size=12,
+                               line_height=1, stroke=7, stroke_color=rgba("#5E37B8"))
     strips = (
         (MAP_MODE_ICONS.get(mode_text, "party"), mode_value, "game mode",
          "#A57CF7", "#5E37B8", 2),
