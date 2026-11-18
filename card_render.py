@@ -931,6 +931,9 @@ def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=
 
     thumbnail = open_image(thumbnail_png)
     colors = dominant_colors(thumbnail) if thumbnail is not None else NO_THUMBNAIL_COLORS
+    # Always lightest at the top, darkest at the bottom (Rec. 601 luma).
+    colors = sorted(colors, key=lambda c: 299 * c[0] + 587 * c[1] + 114 * c[2],
+                    reverse=True)
     backdrop, footer_outline = map_backdrop(*colors)
     canvas = backdrop.copy()
     draw_polaroid(canvas, shown_name, creator, open_image(creator_avatar_png),
