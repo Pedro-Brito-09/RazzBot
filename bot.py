@@ -3506,12 +3506,14 @@ class BadgesImageCardView(CardView):
     cover everything.
     """
 
-    def __init__(self, items, *, username, avatar_png=None, parent=None,
-                 timeout=MAP_VIEW_TIMEOUT):
+    def __init__(self, items, *, username, avatar_png=None, background_png=None,
+                 parent=None, timeout=MAP_VIEW_TIMEOUT):
         super().__init__(parent=parent, timeout=timeout)
         self.items = items
         self.username = username
         self.avatar_png = avatar_png
+        # The profile's chosen map, so the card shares its background.
+        self.background_png = background_png
         self.missing = False
         self.page = 0
         self.card_image = None
@@ -3535,7 +3537,7 @@ class BadgesImageCardView(CardView):
             self.card_image = await asyncio.to_thread(
                 card_render.render_badges_card,
                 username=self.username, avatar_png=self.avatar_png,
-                items=[dict(item) for item in page_items],
+                background_png=self.background_png, items=[dict(item) for item in page_items],
                 unlocked=sum(1 for item in self.items if item["earned"]),
                 total=len(self.items), page=self.page + 1, pages=self.page_count,
             )
@@ -3612,13 +3614,14 @@ class BadgesImageCardView(CardView):
 async def build_badges_image_view(user_id, username, parent=None):
     """The image version of build_badges_view, first page drawn, or None
     without the game's badge list."""
-    items, avatar_png = await asyncio.gather(
+    items, avatar_png, background_png = await asyncio.gather(
         badge_card_items(user_id), fetch_avatar_png(user_id),
+        fetch_profile_background_png(user_id),
     )
     if items is None:
         return None
     view = BadgesImageCardView(items, username=username, avatar_png=avatar_png,
-                               parent=parent)
+                               background_png=background_png, parent=parent)
     await view.refresh()
     return view
 

@@ -1997,7 +1997,6 @@ BADGE_NAME_SIZE, BADGE_NAME_MIN, BADGE_NAME_LINE = 16, 12, 1.05
 # Outline colours handed out in turn, in the design's column order.
 BADGE_COLORS = ("#A57CF7", "#6CC4F4", "#FFA851", "#8BE04E",
                 "#FF7A6B", "#7FE8C2", "#FFD64F", "#6F7FE8")
-BADGES_SKY = ((0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")))
 CLIP_BAR = ((1.5, 0), (98.5, 0), (100, 25), (98.8, 50), (100, 75), (98.5, 100),
             (1.5, 100), (0, 75), (1.2, 50), (0, 25))
 CLIP_BAR_FILL = ((0, 0), (97, 0), (100, 25), (97.5, 50), (100, 75), (97, 100), (0, 100))
@@ -2096,6 +2095,8 @@ def draw_badge_item(canvas, item, left, top):
     # Earned or not, the icon covers the ring's inner half.
     size, inset = 72, 8
     icon = open_image(item.get("icon_png"))
+    if icon is None and not circle:
+        icon = map_placeholder(size)
     art = (badge_icon(icon, size, circle, not earned) if icon is not None
            else badge_placeholder(size, circle, color, not earned))
     canvas.alpha_composite(art, (px(tile_left + inset), px(top + inset)))
@@ -2137,32 +2138,30 @@ def draw_badge_grid(canvas, items):
         top += badge_row_height(row) + BADGE_GAP_Y
 
 
-@functools.lru_cache(maxsize=1)
-def badges_backdrop():
-    """The sky, the dotted strip hanging from the top, and the green hill.
-    The same on every card, so drawn once."""
-    canvas = vertical_gradient(px(BADGES_WIDTH), px(BADGES_HEIGHT), BADGES_SKY)
-
-    # 100x220 of #2B5FBF with 2px #1C468F dots on a 12px grid, turned 6deg.
-    def dots(draw, k):
-        for x in range(6, 100, 12):
-            for y in range(6, 220, 12):
-                draw.ellipse(((x - 2.3) * k, (y - 2.3) * k, (x + 2.3) * k, (y + 2.3) * k),
-                             fill=255)
-    band = solid(100, 220, rgba("#2B5FBF"))
-    band.paste(solid(100, 220, rgba("#1C468F")), (0, 0), shape_mask(100, 220, dots))
-    place(canvas, band, 520, -40, 100, 220, rotate=6)
-
-    # A 1080x190 ellipse from left -60, its bottom 110px below the card.
-    def hill(draw, k):
-        top = BADGES_HEIGHT + 110 - 190
-        draw.ellipse((-60 * k, top * k, 1020 * k, (top + 190) * k), fill=255)
-    canvas.paste(solid(BADGES_WIDTH, BADGES_HEIGHT, rgba("#4F8E3A")), (0, 0),
-                 shape_mask(BADGES_WIDTH, BADGES_HEIGHT, hill))
-    return canvas
+def player_backdrop(username, avatar, background, width, height):
+    """The profile card's background at any size: the player's chosen map
+    thumbnail; else their avatar's two main colours, lightest at the top,
+    under the dots; else their chat colour. Returns (canvas, the colour
+    white text over it is outlined in)."""
+    if background is None and avatar is not None:
+        colors = sorted(dominant_colors(avatar), key=luma, reverse=True)
+        backdrop, outline = map_backdrop(*colors, width, height)
+        return backdrop.copy(), outline
+    canvas = Image.new("RGBA", (px(width), px(height)), (0, 0, 0, 0))
+    return canvas, draw_background(canvas, roblox_name_color(username), background)
 
 
-def draw_badges_header(canvas, username, avatar):
+@functools.lru_cache(maxsize=4)
+def map_placeholder(size):
+    """A map with no thumbnail, as the map card shows it: the dotted sky
+    fade with the blue map icon in the middle, `size` px square."""
+    image = map_backdrop(*NO_THUMBNAIL_PHOTO_COLORS, size, size)[0].copy()
+    icon = round(size * 0.6)
+    paste_icon(image, map_icon("map-blue", icon), (size - icon) / 2, (size - icon) / 2)
+    return image
+
+
+def draw_badges_header(canvas, username, avatar, text_outline):
     """The avatar tile, the purple name banner over its edge, the subtitle."""
     tile = framed_avatar(avatar, 104, 6, 22, "#2A2F4A", "#454D73")
     place(canvas, with_drop_shadow(tile, 6), 30, 22, 104, 104, rotate=-4)
@@ -2180,7 +2179,7 @@ def draw_badges_header(canvas, username, avatar):
     place(canvas, with_drop_shadow(body, 5), 120, 30, width, height, rotate=-1.5)
 
     subtitle = Text("Badges & Achievements", HAND, 26)
-    draw_glowing_text(canvas, [(subtitle, 154, 100)], rgba("#2160B8"))
+    draw_glowing_text(canvas, [(subtitle, 154, 100)], text_outline)
 
 
 def draw_badges_progress(canvas, unlocked, total):
@@ -2221,15 +2220,17 @@ def draw_badges_progress(canvas, unlocked, total):
           bar_width, bar_height, rotate=-1)
 
 
-def compose_badges_card(*, username, avatar_png=None, items=(), unlocked=0, total=0,
-                        page=1, pages=1):
-    canvas = badges_backdrop().copy()
-    draw_badges_header(canvas, username, open_image(avatar_png))
+def compose_badges_card(*, username, avatar_png=None, background_png=None, items=(),
+                        unlocked=0, total=0, page=1, pages=1):
+    avatar = open_image(avatar_png)
+    canvas, text_outline = player_backdrop(username, avatar, open_image(background_png),
+                                           BADGES_WIDTH, BADGES_HEIGHT)
+    draw_badges_header(canvas, username, avatar, text_outline)
     draw_badges_progress(canvas, unlocked, total)
     draw_badge_grid(canvas, list(items)[:BADGES_PER_PAGE])
     footer = Text(f"page {page} / {pages}", HAND, 21)
     draw_glowing_text(canvas, [(footer, BADGES_WIDTH - 36 - footer.width,
-                                BADGES_HEIGHT - 12 - footer.height)], rgba("#2E5E22"))
+                                BADGES_HEIGHT - 12 - footer.height)], text_outline)
     return clip_to(canvas, rounded_mask(BADGES_WIDTH, BADGES_HEIGHT, 24))
 
 
@@ -2240,8 +2241,10 @@ def render_badges_card(**fields):
     name, earned, circle (True for round badge art, False for a square map
     thumbnail), color (hex, the placeholder's fill when the art is missing;
     the outline is always white) and icon_png (bytes, or None for that
-    placeholder). `unlocked` / `total` drive the count and the
-    bar, `page` / `pages` the footer.
+    placeholder; a map without one gets the map card's empty-photo sky).
+    `background_png` is the profile's chosen map thumbnail; the backdrop
+    follows the profile card's (player_backdrop). `unlocked` / `total`
+    drive the count and the bar, `page` / `pages` the footer.
     """
     card = compose_badges_card(**fields)
     out = io.BytesIO()
