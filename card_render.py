@@ -690,7 +690,8 @@ CREATOR_MIN_WIDTH = 130
 CLIP_TAPE = ((3, 0), (97, 0), (100, 25), (96, 50), (100, 75), (97, 100),
              (3, 100), (0, 75), (4, 50), (0, 25))
 # The stat column: left 682, right 34, from top 40, 26 apart.
-MAP_STRIPS_LEFT, MAP_STRIPS_TOP, MAP_STRIPS_GAP = 682, 40, 26
+# The template's gap is 26; 16 makes room for the fourth (completions) strip.
+MAP_STRIPS_LEFT, MAP_STRIPS_TOP, MAP_STRIPS_GAP = 682, 40, 16
 MAP_STRIPS_WIDTH = CARD_WIDTH - MAP_STRIPS_LEFT - 34
 
 # Icon per game mode; unknown modes get the party one.
@@ -920,15 +921,15 @@ def draw_polaroid(canvas, map_name, creator_name, avatar, thumbnail):
 
 
 def draw_map_strip(canvas, top, icon, value, caption, fill, outline, rotate):
-    """One stat strip of the right-hand column. `value` is a laid-out Text.
-    Returns its height."""
+    """One stat strip of the right-hand column. `icon` is a loaded 52px
+    icon, `value` a laid-out Text. Returns its height."""
     dark = rgba(outline)
     label = Text(caption, HAND, 19, line_height=1.1, stroke=4, stroke_color=dark)
     inner = max(52, value.height + label.height)
     height = 10 + inner + 10
 
     def content(image, draw):
-        paste_icon(image, map_icon(icon, 52), 14, 10 + (inner - 52) / 2)
+        paste_icon(image, icon, 14, 10 + (inner - 52) / 2)
         text_top = 10 + (inner - value.height - label.height) / 2
         value.draw(draw, 14 + 52 + 12, text_top)
         label.draw(draw, 14 + 52 + 12, text_top + value.height)
@@ -948,20 +949,27 @@ def map_tag(text, fill, outline):
     return body, width, height
 
 
-def draw_map_strips(canvas, mode, plays, favourites, visibility, featured):
+def draw_map_strips(canvas, mode, plays, completions, favourites, visibility, featured):
     room = MAP_STRIPS_WIDTH - 14 - 52 - 12 - 18
     top = MAP_STRIPS_TOP
+
+    def count(value, outline):
+        return stat_value_text(value, rgba(outline), room, size=34, min_size=30)
 
     mode_text = drawable_text(mode or "", DISPLAY).upper() or "UNKNOWN"
     mode_value = shrink_to_fit(mode_text, DISPLAY, 32, room, min_size=12,
                                line_height=1, stroke=7, stroke_color=rgba("#5E37B8"))
     strips = (
-        (MAP_MODE_ICONS.get(mode_text, "party"), mode_value, "game mode",
+        (map_icon(MAP_MODE_ICONS.get(mode_text, "party"), 52), mode_value, "game mode",
          "#A57CF7", "#5E37B8", 2),
-        ("play", stat_value_text(plays, rgba("#3F8F1E"), room, size=34, min_size=30),
+        (map_icon("play", 52), count(plays, "#3F8F1E"),
          "play" if plays == 1 else "plays", "#8BE04E", "#3F8F1E", -1.5),
-        ("star", stat_value_text(favourites, rgba("#A87A00"), room, size=34, min_size=30),
-         "favourite" if favourites == 1 else "favourites", "#FFD64F", "#A87A00", 1.5),
+        # The profile's "flags reached" flag and colours: a completion is
+        # reaching a map's finish.
+        (profile_icon("flag", 52), count(completions, "#C23A2E"),
+         "completion" if completions == 1 else "completions", "#FF7A6B", "#C23A2E", 1.5),
+        (map_icon("star", 52), count(favourites, "#A87A00"),
+         "favourite" if favourites == 1 else "favourites", "#FFD64F", "#A87A00", -1),
     )
     for icon, value, caption, fill, outline, rotate in strips:
         top += draw_map_strip(canvas, top, icon, value, caption, fill, outline,
@@ -983,7 +991,7 @@ def draw_map_strips(canvas, mode, plays, favourites, visibility, featured):
 
 def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=None,
                     thumbnail_png=None, mode=None, plays=0, favourites=0,
-                    visibility=None, featured=False):
+                    visibility=None, featured=False, completions=0):
     """A community map's card as PNG bytes.
 
     `visibility` is Public / Unlisted / Private, or None to leave the tag
@@ -992,6 +1000,7 @@ def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=
     Missing avatar or thumbnail bytes get placeholders.
     """
     plays, favourites = max(0, plays or 0), max(0, favourites or 0)
+    completions = max(0, completions or 0)
     shown_name = drawable_text(name or "", DISPLAY)
     if not shown_name:
         shown_name = f"Map {map_id}" if map_id is not None else "Unnamed Map"
@@ -1006,7 +1015,7 @@ def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=
     canvas = backdrop.copy()
     draw_polaroid(canvas, shown_name, creator, open_image(creator_avatar_png),
                   thumbnail)
-    draw_map_strips(canvas, mode, plays, favourites, visibility, featured)
+    draw_map_strips(canvas, mode, plays, completions, favourites, visibility, featured)
     if map_id is not None:
         draw_footer(canvas, f"map ID {map_id}", "", footer_outline,
                     size=22, inset=48, bottom=22)

@@ -4113,15 +4113,15 @@ async def build_map_card_view(entry, parent=None):
     async def no_bytes():
         return None
 
-    creator, thumbnail_url, avatar_png = await asyncio.gather(
+    map_id = entry.get("Id")
+    creator, thumbnail_url, avatar_png, board = await asyncio.gather(
         fetch_username(creator_id) if creator_id else no_bytes(),
         fetch_map_thumbnail(entry),
         fetch_avatar_png(creator_id) if creator_id else no_bytes(),
+        fetch_board(MAP_LEADERBOARD_KEY.format(id=map_id)),
     )
     thumbnail_png = (await download_bytes(thumbnail_url, "build_map_card_view")
                      if thumbnail_url else None)
-
-    map_id = entry.get("Id")
     image = await asyncio.to_thread(
         card_render.render_map_card,
         name=entry.get("Name"),
@@ -4134,6 +4134,9 @@ async def build_map_card_view(entry, parent=None):
         favourites=entry.get("Favorites") or 0,
         visibility=entry.get("Privacy"),
         featured=bool(entry.get("Featured")),
+        # One leaderboard entry per player who has finished the map. A map
+        # nobody has finished has no board at all.
+        completions=len(board) if board else 0,
     )
 
     # The exact name and creator in text: the card's font drops emoji and
