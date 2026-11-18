@@ -3415,6 +3415,213 @@ async def build_badges_view(user_id, username, parent=None):
         badges, owned_ids, icons, username=username, parent=parent
     )
 
+BADGES_IMAGE_FILENAME = "badges.png"
+
+async def map_achievement_items(user_id):
+    """The home server's map achievements as badge card items: one per
+    role whose rule is completing a map, earned when the player is on that
+    map's leaderboard (the check /sync grants the role from).
+
+    Badge rules are left out: the badge itself is already on the card.
+    """
+    home = bot.get_guild(HOME_GUILD.id) if HOME_GUILD is not None else None
+    if home is None:
+        return []
+    rules = [rule for rule in visible_achievement_rules(await fetch_role_rules(home.id))
+             if rule.get("type") == "map"]
+    wanted, seen = [], set()
+    for rule in rules:
+        role_id = rule_role_id(rule)
+        role = home.get_role(role_id) if role_id is not None else None
+        if role is None or role_id in seen or role_id in SYNC_CATEGORY_ROLE_IDS:
+            continue
+        try:
+            map_id = int(rule.get("value"))
+        except (TypeError, ValueError):
+            continue
+        seen.add(role_id)
+        wanted.append((role.name, map_id))
+    if not wanted:
+        return []
+
+    cache = {}
+    maps_by_id, *finishers = await asyncio.gather(
+        get_community_maps(),
+        *(map_finishers(map_id, cache) for _, map_id in wanted),
+    )
+    return [
+        {"kind": "map", "key": map_id, "entry": (maps_by_id or {}).get(map_id),
+         "name": name, "earned": user_id in done, "circle": False}
+        for (name, map_id), done in zip(wanted, finishers)
+    ]
+
+async def badge_card_items(user_id):
+    """Every game badge (round), then the map achievements (square), each
+    marked earned or not, with its outline colour. None without the game's
+    badge list."""
+    badges = await fetch_universe_badges()
+    if not badges:
+        return None
+    owned_ids, maps = await asyncio.gather(
+        fetch_owned_badge_ids(user_id, [b["id"] for b in badges]),
+        map_achievement_items(user_id),
+    )
+    items = [
+        {"kind": "badge", "key": badge["id"], "name": badge_display_name(badge),
+         "earned": badge["id"] in owned_ids, "circle": True}
+        for badge in badges
+    ] + maps
+    colors = card_render.BADGE_COLORS
+    for index, item in enumerate(items):
+        item["color"] = colors[index % len(colors)]
+    return items
+
+async def load_badge_card_icons(items):
+    """Download the art for the items that don't have it yet: badge icons
+    and map thumbnails, a page (24) at a time. Missing art stays None and
+    the card draws a placeholder."""
+    todo = [item for item in items if "icon_png" not in item]
+    if not todo:
+        return
+    badge_ids = [item["key"] for item in todo if item["kind"] == "badge"]
+    entries = [item["entry"] for item in todo if item["kind"] == "map" and item.get("entry")]
+    badge_urls, map_urls = await asyncio.gather(
+        fetch_badge_icons(badge_ids),
+        fetch_map_thumbnails(entries) if entries else asyncio.sleep(0, {}),
+    )
+    urls = [(badge_urls if item["kind"] == "badge" else map_urls).get(item["key"])
+            for item in todo]
+    images = await asyncio.gather(*(
+        download_bytes(url, f"badge_card_icon({item['key']})") if url else asyncio.sleep(0)
+        for item, url in zip(todo, urls)
+    ))
+    for item, image in zip(todo, images):
+        item["icon_png"] = image
+
+class BadgesImageCardView(CardView):
+    """Badges and map achievements as one rendered grid, a page at a time.
+
+    On trial behind !testbadges before it replaces BadgesCardView. Missing
+    narrows the grid to what's still locked; the count and bar always
+    cover everything.
+    """
+
+    def __init__(self, items, *, username, avatar_png=None, parent=None,
+                 timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(parent=parent, timeout=timeout)
+        self.items = items
+        self.username = username
+        self.avatar_png = avatar_png
+        self.missing = False
+        self.page = 0
+        self.card_image = None
+        self._render_lock = asyncio.Lock()
+
+    @property
+    def shown(self):
+        return [item for item in self.items if not item["earned"]] if self.missing else self.items
+
+    @property
+    def page_count(self):
+        return max(1, -(-len(self.shown) // card_render.BADGES_PER_PAGE))
+
+    async def refresh(self):
+        """Fetch the page's art, draw the page, and lay out the message."""
+        async with self._render_lock:
+            self.page = max(0, min(self.page, self.page_count - 1))
+            per_page = card_render.BADGES_PER_PAGE
+            page_items = self.shown[self.page * per_page:(self.page + 1) * per_page]
+            await load_badge_card_icons(page_items)
+            self.card_image = await asyncio.to_thread(
+                card_render.render_badges_card,
+                username=self.username, avatar_png=self.avatar_png,
+                items=[dict(item) for item in page_items],
+                unlocked=sum(1 for item in self.items if item["earned"]),
+                total=len(self.items), page=self.page + 1, pages=self.page_count,
+            )
+            self.lay_out()
+
+    def lay_out(self):
+        self.clear_items()
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(
+            media=f"attachment://{BADGES_IMAGE_FILENAME}",
+            description=f"{self.username}'s badges and achievements",
+        )
+        self.add_item(gallery)
+
+        notes = []
+        if self.missing and not self.shown:
+            notes.append("-# Nothing missing: every badge and achievement is earned.")
+        note = dev_universe_note()
+        if note:
+            notes.append(note)
+        if notes:
+            self.add_item(discord.ui.TextDisplay("\n".join(notes)))
+
+        row = discord.ui.ActionRow()
+        previous = discord.ui.Button(
+            label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️",
+            disabled=self.page == 0,
+        )
+        previous.callback = self.previous_page
+        row.add_item(previous)
+        following = discord.ui.Button(
+            label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
+            disabled=self.page >= self.page_count - 1,
+        )
+        following.callback = self.next_page
+        row.add_item(following)
+        toggle = discord.ui.Button(
+            label="All" if self.missing else "Missing",
+            style=discord.ButtonStyle.success if self.missing else discord.ButtonStyle.danger,
+            emoji="✔️" if self.missing else "✖️",
+        )
+        toggle.callback = self.toggle_missing
+        row.add_item(toggle)
+        back = self.make_back_button()
+        if back is not None:
+            row.add_item(back)
+        self.add_item(row)
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_image), filename=BADGES_IMAGE_FILENAME)]
+
+    async def show(self, interaction):
+        # A render plus up to 24 downloads outlasts the 3s to answer.
+        await interaction.response.defer()
+        await self.refresh()
+        await show_card(interaction, self)
+
+    @keeps_context
+    async def previous_page(self, interaction):
+        self.page -= 1
+        await self.show(interaction)
+
+    @keeps_context
+    async def next_page(self, interaction):
+        self.page += 1
+        await self.show(interaction)
+
+    @keeps_context
+    async def toggle_missing(self, interaction):
+        self.missing = not self.missing
+        self.page = 0
+        await self.show(interaction)
+
+async def build_badges_image_view(user_id, username, parent=None):
+    """The image version of build_badges_view, first page drawn, or None
+    without the game's badge list."""
+    items, avatar_png = await asyncio.gather(
+        badge_card_items(user_id), fetch_avatar_png(user_id),
+    )
+    if items is None:
+        return None
+    view = BadgesImageCardView(items, username=username, avatar_png=avatar_png,
+                               parent=parent)
+    await view.refresh()
+    return view
+
 def search_public_maps(maps_by_id, query, limit=50):
     """Public maps whose name matches, best match first.
 
@@ -5564,6 +5771,30 @@ async def test_profile_card(ctx, username: str = None, effect: str = None):
         )
         if view is None:
             await ctx.send(f"No game data saved for **{canonical}**.")
+            return
+
+    view.message = await ctx.send(view=view, files=view.card_files())
+
+@bot.command(name="testbadges", hidden=True)
+@commands.is_owner()
+async def test_badges_card(ctx, username: str = None):
+    """Owner-only preview of the image badges card, before /badges uses it.
+
+    `!testbadges [username|me]`: the game's badges and the home server's
+    map achievements in one grid, 24 a page.
+    """
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+
+    async with ctx.typing():
+        lookup = None if username in (None, "me") else username
+        user_id, canonical = await resolve_command_user(ctx, lookup)
+        if user_id is None:
+            return
+        view = await build_badges_image_view(user_id, canonical)
+        if view is None:
+            await ctx.send("Couldn't fetch the game's badge list.")
             return
 
     view.message = await ctx.send(view=view, files=view.card_files())

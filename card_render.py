@@ -1981,3 +1981,268 @@ def render_map_card_animated(effect, **fields):
                             stroke_scale=CREATOR_HANDLE_SIZE / NAME_SIZE,
                             to_canvas=paper_to_canvas, rotate=POLAROID_TILT)
         return encode_name_animation(card, [name], frames_count, delay)
+
+
+# ---------------------------------------------------------------- badges card
+
+BADGES_WIDTH, BADGES_HEIGHT = 960, 640
+# 8 columns x 3 rows; the grid is 900px wide at (30, 170), gaps 12px 10px.
+BADGE_COLUMNS, BADGE_ROWS = 8, 3
+BADGES_PER_PAGE = BADGE_COLUMNS * BADGE_ROWS
+BADGE_GRID_LEFT, BADGE_GRID_TOP, BADGE_GRID_WIDTH = 30, 170, 900
+BADGE_GAP_X, BADGE_GAP_Y = 10, 12
+BADGE_CELL = (BADGE_GRID_WIDTH - BADGE_GAP_X * (BADGE_COLUMNS - 1)) / BADGE_COLUMNS
+BADGE_TILE = 88
+BADGE_NAME_SIZE, BADGE_NAME_MIN, BADGE_NAME_LINE = 16, 12, 1.05
+# Outline colours handed out in turn, in the design's column order.
+BADGE_COLORS = ("#A57CF7", "#6CC4F4", "#FFA851", "#8BE04E",
+                "#FF7A6B", "#7FE8C2", "#FFD64F", "#6F7FE8")
+BADGES_SKY = ((0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")))
+CLIP_BAR = ((1.5, 0), (98.5, 0), (100, 25), (98.8, 50), (100, 75), (98.5, 100),
+            (1.5, 100), (0, 75), (1.2, 50), (0, 25))
+CLIP_BAR_FILL = ((0, 0), (97, 0), (100, 25), (97.5, 50), (100, 75), (97, 100), (0, 100))
+# The name banner keeps clear of the progress column (right 30, 300 wide).
+BADGES_BANNER_MAX_RIGHT = 620
+LOCKED_OUTLINE = (255, 255, 255, 230)
+
+
+@functools.lru_cache(maxsize=16)
+def badge_outline(shape, dashed, color):
+    """The design's outline frame (white, with a see-through shade under
+    it) tinted `color`, as its CSS mask + background does, at 88px."""
+    name = f"outline-{shape}{'-dashed' if dashed else ''}"
+    with Image.open(os.path.join(ASSETS, "badges", f"{name}.png")) as image:
+        alpha = image.convert("RGBA").getchannel("A").resize(
+            (px(BADGE_TILE), px(BADGE_TILE)), Image.LANCZOS)
+    tinted = Image.new("RGBA", alpha.size, color[:3] + (0,))
+    tinted.putalpha(alpha.point(lambda a: a * color[3] // 255))
+    return tinted
+
+
+def badge_icon(icon, size, circle, locked):
+    """The item's art cover-cropped to `size`, cut round or to 3px corners.
+    Locked: grayscale(1) brightness(1.25) at half opacity."""
+    art = cover_crop(icon, px(size), px(size))
+    if locked:
+        grey = art.convert("L").point(lambda v: min(255, round(v * 1.25)))
+        alpha = art.getchannel("A").point(lambda a: a // 2)
+        art = Image.merge("RGBA", (grey, grey, grey, alpha))
+    return clip_to(art, rounded_mask(size, size, size / 2 if circle else 3))
+
+
+def badge_placeholder(size, circle, color, locked):
+    """A missing icon: the outline colour, deepened, with a question mark;
+    pale and see-through when locked."""
+    if locked:
+        fill, mark_fill, mark_outline = (200, 214, 232, 128), (255, 255, 255, 140), rgba("#4F78B0", 140)
+    else:
+        fill, mark_fill, mark_outline = shade(color, 0.6) + (255,), WHITE, shade(color, 0.35) + (255,)
+    tile = solid(size, size, fill)
+    mark = Text("?", DISPLAY, round(size / 2), line_height=1, stroke=size / 12,
+                stroke_color=mark_outline, fill=mark_fill)
+    mark.draw(ImageDraw.Draw(tile), (size - mark.width) / 2, (size - mark.height) / 2 + size / 36)
+    return clip_to(tile, rounded_mask(size, size, size / 2 if circle else 3))
+
+
+def _cut(text, font, room):
+    """The text with its tail swapped for an ellipsis until it fits."""
+    if font.getlength(text) / SCALE <= room:
+        return text
+    while text and font.getlength(text + "…") / SCALE > room:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+@functools.lru_cache(maxsize=512)
+def wrap_badge_name(name, room=BADGE_CELL):
+    """The name as (lines, size): at most two lines wrapped at spaces, as
+    the browser would. A word too wide for the column shrinks the whole
+    name (down to 12px); a name still over two lines at 14px is cut short
+    on its second."""
+    words = drawable_text(name or "", HAND).split() or ["?"]
+    lines, size = None, BADGE_NAME_MIN
+    for size in range(BADGE_NAME_SIZE, BADGE_NAME_MIN - 1, -1):
+        font = load_font(HAND, size)
+        if max(font.getlength(word) for word in words) / SCALE > room:
+            continue
+        lines, current = [], words[0]
+        for word in words[1:]:
+            if font.getlength(f"{current} {word}") / SCALE <= room:
+                current = f"{current} {word}"
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        if len(lines) <= 2 or size <= 14:
+            break
+    font = load_font(HAND, size)
+    if lines is None:
+        # One word too long even at the smallest size.
+        lines = [" ".join(words)]
+    if len(lines) > 2:
+        lines = [lines[0], " ".join(lines[1:])]
+    return tuple(_cut(line, font, room) for line in lines), size
+
+
+def draw_badge_item(canvas, item, left, top):
+    """One grid cell `BADGE_CELL` wide at (left, top): the outlined icon,
+    its name centred 4px under it."""
+    earned = bool(item.get("earned"))
+    circle = bool(item.get("circle"))
+    color = rgba(item.get("color") or BADGE_COLORS[0])
+    tile_left = left + (BADGE_CELL - BADGE_TILE) / 2
+    outline = badge_outline("circle" if circle else "rect", not earned,
+                            color if earned else LOCKED_OUTLINE)
+    canvas.alpha_composite(outline, (px(tile_left), px(top)))
+    size, inset = (72, 8) if earned else (60, 14)
+    icon = open_image(item.get("icon_png"))
+    art = (badge_icon(icon, size, circle, not earned) if icon is not None
+           else badge_placeholder(size, circle, color, not earned))
+    canvas.alpha_composite(art, (px(tile_left + inset), px(top + inset)))
+
+    lines, size = wrap_badge_name(item.get("name") or "")
+    style = (dict(fill=WHITE, stroke=4, stroke_color=rgba("#3D2490")) if earned else
+             dict(fill=rgba("#EAF4FF"), stroke=4, stroke_color=rgba("#4F78B0")))
+    texts = [Text(line, HAND, size, line_height=BADGE_NAME_LINE, **style) for line in lines]
+    # On a layer of their own, so a locked name fades as a whole (opacity .85)
+    # rather than its fill showing the outline through.
+    pad = 8
+    layer = Image.new("RGBA", (px(BADGE_CELL + 2 * pad),
+                               px(sum(t.height for t in texts) + 2 * pad)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    y = pad
+    for text in texts:
+        text.draw(draw, pad + (BADGE_CELL - text.width) / 2, y)
+        y += text.height
+    if not earned:
+        layer.putalpha(layer.getchannel("A").point(lambda a: a * 85 // 100))
+    canvas.alpha_composite(layer, (px(left - pad), px(top + BADGE_TILE + 4 - pad)))
+
+
+def badge_row_height(items):
+    """The 88px tile, a 4px gap, then the tallest name: rows size as a CSS
+    grid's do, to their tallest cell."""
+    lines = max((len(wrap_badge_name(item.get("name") or "")[0]) for item in items),
+                default=1)
+    return BADGE_TILE + 4 + lines * BADGE_NAME_SIZE * BADGE_NAME_LINE
+
+
+def draw_badge_grid(canvas, items):
+    top = BADGE_GRID_TOP
+    for start in range(0, len(items), BADGE_COLUMNS):
+        row = items[start:start + BADGE_COLUMNS]
+        for column, item in enumerate(row):
+            draw_badge_item(canvas, item,
+                            BADGE_GRID_LEFT + column * (BADGE_CELL + BADGE_GAP_X), top)
+        top += badge_row_height(row) + BADGE_GAP_Y
+
+
+@functools.lru_cache(maxsize=1)
+def badges_backdrop():
+    """The sky, the dotted strip hanging from the top, and the green hill.
+    The same on every card, so drawn once."""
+    canvas = vertical_gradient(px(BADGES_WIDTH), px(BADGES_HEIGHT), BADGES_SKY)
+
+    # 100x220 of #2B5FBF with 2px #1C468F dots on a 12px grid, turned 6deg.
+    def dots(draw, k):
+        for x in range(6, 100, 12):
+            for y in range(6, 220, 12):
+                draw.ellipse(((x - 2.3) * k, (y - 2.3) * k, (x + 2.3) * k, (y + 2.3) * k),
+                             fill=255)
+    band = solid(100, 220, rgba("#2B5FBF"))
+    band.paste(solid(100, 220, rgba("#1C468F")), (0, 0), shape_mask(100, 220, dots))
+    place(canvas, band, 520, -40, 100, 220, rotate=6)
+
+    # A 1080x190 ellipse from left -60, its bottom 110px below the card.
+    def hill(draw, k):
+        top = BADGES_HEIGHT + 110 - 190
+        draw.ellipse((-60 * k, top * k, 1020 * k, (top + 190) * k), fill=255)
+    canvas.paste(solid(BADGES_WIDTH, BADGES_HEIGHT, rgba("#4F8E3A")), (0, 0),
+                 shape_mask(BADGES_WIDTH, BADGES_HEIGHT, hill))
+    return canvas
+
+
+def draw_badges_header(canvas, username, avatar):
+    """The avatar tile, the purple name banner over its edge, the subtitle."""
+    tile = framed_avatar(avatar, 104, 6, 22, "#2A2F4A", "#454D73")
+    place(canvas, with_drop_shadow(tile, 6), 30, 22, 104, 104, rotate=-4)
+
+    outline = rgba("#5E37B8")
+    style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=4)
+    room = BADGES_BANNER_MAX_RIGHT - 120 - 2 * 34
+    text = drawable_text(username or "", DISPLAY) or "Unknown"
+    name = (fit_text(text, DISPLAY, 46, room, min_size=30, **style)
+            or ellipsize(text, DISPLAY, 30, room, **style))
+    # padding 10px 34px 6px; a shrunk name stays centred in the 46px slot.
+    width, height = 34 + name.width + 34, 10 + 46 + 6
+    body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER,
+                 lambda image, draw: name.draw(draw, 34, 10 + (46 - name.height) / 2))
+    place(canvas, with_drop_shadow(body, 5), 120, 30, width, height, rotate=-1.5)
+
+    subtitle = Text("Badges & Achievements", HAND, 26)
+    draw_glowing_text(canvas, [(subtitle, 154, 100)], rgba("#2160B8"))
+
+
+def draw_badges_progress(canvas, unlocked, total):
+    """The "33 / 38" count over the jagged progress bar, right-aligned."""
+    outline = rgba("#5E37B8")
+    style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=4)
+    big = Text(format_count(unlocked), DISPLAY, 38, **style)
+    small = Text(f" / {format_count(total)}", DISPLAY, 26, **style)
+    right, top = BADGES_WIDTH - 30, 30
+    draw = ImageDraw.Draw(canvas)
+    big.draw(draw, right - small.width - big.width, top)
+    # The smaller span sits on the big number's baseline.
+    small.draw(draw, right - small.width, top + big.baseline - small.baseline)
+
+    percent = min(100, round(100 * unlocked / total)) if total else 0
+    bar_width, bar_height, fill_height = 300, 32, 22
+    # width: barPercent% (percent - 1, so the jagged end stays inside the
+    # track), at least 46px so the label fits.
+    fill_width = min(bar_width - 10, max(46, bar_width * max(0, percent - 1) / 100))
+    label = Text(f"{percent}%", DISPLAY, 15, stroke=5, stroke_color=rgba("#3F8F1E"))
+
+    def fill_content(image, draw):
+        # The shine: left 6px, right 12px, top 3px, 5px tall, 45% white.
+        shine_width = fill_width - 18
+        if shine_width > 5:
+            shine = clip_to(solid(shine_width, 5, (255, 255, 255, 115)),
+                            rounded_mask(shine_width, 5, 2.5))
+            image.alpha_composite(shine, (px(6), px(3)))
+        label.draw(draw, fill_width - 12 - label.width,
+                   (fill_height - label.height - 3) / 2 + 3)
+
+    def track_content(image, draw):
+        image.alpha_composite(strip(fill_width, fill_height, rgba("#8BE04E"), CLIP_BAR_FILL,
+                                    fill_content), (px(5), px(5)))
+
+    bar = strip(bar_width, bar_height, outline, CLIP_BAR, track_content)
+    place(canvas, with_drop_shadow(bar, 4), right - bar_width, top + 38 + 8,
+          bar_width, bar_height, rotate=-1)
+
+
+def compose_badges_card(*, username, avatar_png=None, items=(), unlocked=0, total=0,
+                        page=1, pages=1):
+    canvas = badges_backdrop().copy()
+    draw_badges_header(canvas, username, open_image(avatar_png))
+    draw_badges_progress(canvas, unlocked, total)
+    draw_badge_grid(canvas, list(items)[:BADGES_PER_PAGE])
+    footer = Text(f"page {page} / {pages}", HAND, 21)
+    draw_glowing_text(canvas, [(footer, BADGES_WIDTH - 36 - footer.width,
+                                BADGES_HEIGHT - 12 - footer.height)], rgba("#2E5E22"))
+    return clip_to(canvas, rounded_mask(BADGES_WIDTH, BADGES_HEIGHT, 24))
+
+
+def render_badges_card(**fields):
+    """One page of a player's badges and achievements as PNG bytes.
+
+    `items` is up to BADGES_PER_PAGE dicts in the order to show them:
+    name, earned, circle (True for round badge art, False for a square map
+    thumbnail), color (the earned outline, hex) and icon_png (bytes, or
+    None for a placeholder). `unlocked` / `total` drive the count and the
+    bar, `page` / `pages` the footer.
+    """
+    card = compose_badges_card(**fields)
+    out = io.BytesIO()
+    card.save(out, format="PNG", optimize=False, compress_level=6)
+    return out.getvalue()
