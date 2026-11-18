@@ -2518,8 +2518,9 @@ def render_medals_card(**fields):
 
 # ---------------------------------------------------------------- maps grid card
 
-# The label naming the card, top right where the medals card has its totals.
-CORNER_LABEL_FILL, CORNER_LABEL_OUTLINE = "#6CC4F4", "#2A78B8"
+# The label naming the card, top right where the medals card has its totals:
+# a light blue strip, its text outlined in the blue map icon's own ink.
+CORNER_LABEL_FILL, CORNER_LABEL_OUTLINE = "#6CC4F4", PLACEHOLDER_BLUE
 
 
 def draw_corner_label(canvas, text):
@@ -2533,7 +2534,7 @@ def draw_corner_label(canvas, text):
     left = MEDALS_WIDTH - 30 - width
 
     def content(image, draw):
-        paste_icon(image, map_icon("map-purple", 40), 14 - 2, (height - 40) / 2)
+        paste_icon(image, map_icon("map-blue", 40), 14 - 2, (height - 40) / 2)
         label.draw(draw, 14 + 36 + 7, 8 + (inner - label.height - 3) / 2 + 3)
 
     body = strip(width, height, rgba(CORNER_LABEL_FILL), CLIP_MEDAL, content)
