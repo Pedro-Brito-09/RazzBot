@@ -2366,11 +2366,11 @@ def pinned_medal(tier):
     return icon.rotate(-12, resample=Image.BICUBIC, expand=True)
 
 
-def cup_polaroid(cup):
-    """One white polaroid: the photo, `#cup · date`, the map name."""
+def cup_polaroid(item):
+    """One white polaroid: the photo, `#number · detail`, the map name."""
     paper = clip_to(solid(CUP_WIDTH, CUP_HEIGHT, rgba("#FFFDF4")),
                     rounded_mask(CUP_WIDTH, CUP_HEIGHT, 5))
-    thumbnail = open_image(cup.get("thumbnail_png"))
+    thumbnail = open_image(item.get("thumbnail_png"))
     if thumbnail is not None:
         photo = solid(CUP_PHOTO_WIDTH, CUP_PHOTO_HEIGHT, rgba("#2B3F86"))
         photo.alpha_composite(cover_crop(thumbnail, photo.width, photo.height))
@@ -2383,22 +2383,26 @@ def cup_polaroid(cup):
     draw = ImageDraw.Draw(paper)
     left, top = 7 + 3, 7 + CUP_PHOTO_HEIGHT + 5
     # "#285" in the card font, " · 13/11/2026" in the hand font, on one baseline.
-    number = Text(f"#{cup.get('cup', '?')}", DISPLAY, 13, fill=ink)
-    when = Text(f" · {cup.get('date') or 'unknown date'}", HAND, 13, line_height=1.1, fill=ink)
-    number.draw(draw, left, top + when.baseline - number.baseline)
-    when.draw(draw, left + number.width, top)
+    number = Text(f"#{item.get('number', '?')}", DISPLAY, 13, fill=ink)
+    detail = item.get("detail")
+    room = CUP_PHOTO_WIDTH - 6 - number.width
+    after = ellipsize(f" · {detail}" if detail else "", HAND, 13, room,
+                      line_height=1.1, fill=ink)
+    number.draw(draw, left, top + after.baseline - number.baseline)
+    after.draw(draw, left + number.width, top)
 
-    name = drawable_text(cup.get("name") or "", DISPLAY) or "Unknown Map"
+    name = drawable_text(item.get("name") or "", DISPLAY) or "Unknown Map"
     title = ellipsize(name, DISPLAY, 15, CUP_PHOTO_WIDTH - 6, line_height=1.15,
                       stroke=5, stroke_color=ink)
     title.draw(draw, left, top + 13 * 1.1 + 2)
     return paper
 
 
-def draw_cup(canvas, cup, index, left, top):
-    """A polaroid at (left, top) with its medal pinned on, tilted by column."""
-    layer = with_drop_shadow(cup_polaroid(cup), 6, pad=CUP_PAD)
-    tier = cup.get("tier")
+def draw_cup(canvas, item, index, left, top):
+    """A polaroid at (left, top), tilted by column, with its medal pinned
+    on when it has one (`tier`)."""
+    layer = with_drop_shadow(cup_polaroid(item), 6, pad=CUP_PAD)
+    tier = item.get("tier")
     if tier in range(len(MEDAL_TOTALS)):
         medal = pinned_medal(tier)
         # The medal box's centre: right -14px, top -18px, 52px square.
@@ -2409,64 +2413,93 @@ def draw_cup(canvas, cup, index, left, top):
           rotate=CUP_TILTS[index % CUP_COLUMNS])
 
 
-def draw_cup_grid(canvas, cups):
-    for index, cup in enumerate(cups[:CUPS_PER_PAGE]):
+def draw_cup_grid(canvas, items):
+    for index, item in enumerate(items[:CUPS_PER_PAGE]):
         row, column = divmod(index, CUP_COLUMNS)
-        draw_cup(canvas, cup, index,
+        draw_cup(canvas, item, index,
                  CUP_GRID_LEFT + column * (CUP_WIDTH + CUP_GAP_X),
                  CUP_GRID_TOP + row * (CUP_HEIGHT + CUP_GAP_Y))
 
 
-def draw_no_medals(canvas):
+def draw_empty_note(canvas, text):
     """The empty state, centred where the grid would be."""
-    note = Text("No Daily Cup medals yet", DISPLAY, 40, line_height=1, stroke=8,
+    note = Text(text, DISPLAY, 40, line_height=1, stroke=8,
                 stroke_color=rgba("#5E37B8"), shadow=4)
     note.draw(ImageDraw.Draw(canvas), (MEDALS_WIDTH - note.width) / 2, 300)
 
 
-def compose_medals_card(*, username, avatar_png=None, counts=(0, 0, 0, 0), cups=(),
-                        page=1, pages=1, background_png=None, with_name=True,
-                        name_face=DISPLAY):
-    """The card, and (name, at, to_canvas) for animating the name."""
-    avatar = open_image(avatar_png)
-    # The profile card's background (player_backdrop), as the badges card has.
-    canvas, text_outline = player_backdrop(username, avatar, open_image(background_png),
-                                           MEDALS_WIDTH, MEDALS_HEIGHT)
-    totals_left = draw_medal_totals(canvas, counts)
-    # The avatar overlaps the banner's end, as on the profile card.
+def compose_grid_card(canvas, text_outline, *, title, avatar, subtitle, draw_corner,
+                      items, empty_note, page=1, pages=1, with_name=True,
+                      name_face=DISPLAY):
+    """The polaroid-grid card shared by the medals and maps cards, on a
+    backdrop already drawn: the header (avatar over the name banner, as on
+    the profile card), whatever `draw_corner(canvas)` puts top-right (it
+    returns its left edge), up to ten polaroids, the page footer.
+
+    Returns the card and (name, at, to_canvas) for animating the name.
+    """
+    corner_left = draw_corner(canvas)
     placed_name = draw_badges_header(
-        canvas, username, avatar, text_outline,
-        subtitle="Daily Cup Medals", max_right=totals_left - 16,
+        canvas, title, avatar, text_outline,
+        subtitle=subtitle, max_right=corner_left - 16,
         empty="#0F1B33", mark_outline="#2A3B5E", avatar_on_top=True,
         with_name=with_name, face=name_face)
-    cups = list(cups)
-    if cups:
-        draw_cup_grid(canvas, cups)
+    items = list(items)
+    if items:
+        draw_cup_grid(canvas, items)
     else:
-        draw_no_medals(canvas)
+        draw_empty_note(canvas, empty_note)
     footer = Text(f"page {page} / {pages}", HAND, 21)
     draw_glowing_text(canvas, [(footer, MEDALS_WIDTH - 36 - footer.width,
                                 MEDALS_HEIGHT - 12 - footer.height)], text_outline)
     return clip_to(canvas, rounded_mask(MEDALS_WIDTH, MEDALS_HEIGHT, 24)), placed_name
 
 
-def render_medals_card_animated(effect, **fields):
-    """The medals card with the player's username effect playing on the
-    name banner, as animated WebP bytes (half resolution, like the
-    profile's). The banner is tilted, so each frame draws the name upright
-    on a small patch and turns it with the strip, as the map card does.
+def render_grid_animated(compose, effect, fields):
+    """A grid card with the username effect playing on the name banner, as
+    animated WebP bytes (half resolution, like the profile's). The banner
+    is tilted, so each frame draws the name upright on a small patch and
+    turns it with the strip, as the map card does.
 
     The name's patch keeps clear of the avatar: the name starts 34px into
     the banner, past where the tile's corner reaches.
     """
     with ANIMATION_LOCK:
-        card, (name, at, to_canvas) = compose_medals_card(
+        card, (name, at, to_canvas) = compose(
             with_name=False, name_face=effect.get("font") or DISPLAY, **fields)
         frames_count, delay, cycles = plan_loop(effect)
         animated = AnimatedName(card, name, at, effect, cycles, outline=rgba("#5E37B8"),
                                 stroke_scale=46 / NAME_SIZE, to_canvas=to_canvas,
                                 rotate=-1.5)
         return encode_name_animation(card, [animated], frames_count, delay)
+
+
+def png_bytes(card):
+    out = io.BytesIO()
+    card.save(out, format="PNG", optimize=False, compress_level=6)
+    return out.getvalue()
+
+
+def compose_medals_card(*, username, avatar_png=None, counts=(0, 0, 0, 0), cups=(),
+                        page=1, pages=1, background_png=None, with_name=True,
+                        name_face=DISPLAY):
+    avatar = open_image(avatar_png)
+    # The profile card's background (player_backdrop), as the badges card has.
+    canvas, text_outline = player_backdrop(username, avatar, open_image(background_png),
+                                           MEDALS_WIDTH, MEDALS_HEIGHT)
+    items = [dict(cup, number=cup.get("cup", "?"), detail=cup.get("date") or "unknown date")
+             for cup in cups]
+    return compose_grid_card(
+        canvas, text_outline, title=username, avatar=avatar, subtitle="Daily Cup Medals",
+        draw_corner=lambda canvas: draw_medal_totals(canvas, counts), items=items,
+        empty_note="No Daily Cup medals yet", page=page, pages=pages,
+        with_name=with_name, name_face=name_face)
+
+
+def render_medals_card_animated(effect, **fields):
+    """The medals card with the player's username effect playing on the
+    name, as animated WebP bytes."""
+    return render_grid_animated(compose_medals_card, effect, fields)
 
 
 def render_medals_card(**fields):
@@ -2480,7 +2513,81 @@ def render_medals_card(**fields):
     is the profile's chosen map thumbnail; the backdrop follows the
     profile card's (player_backdrop).
     """
-    card, _ = compose_medals_card(**fields)
-    out = io.BytesIO()
-    card.save(out, format="PNG", optimize=False, compress_level=6)
-    return out.getvalue()
+    return png_bytes(compose_medals_card(**fields)[0])
+
+
+# ---------------------------------------------------------------- maps grid card
+
+# The label naming the card, top right where the medals card has its totals.
+CORNER_LABEL_FILL, CORNER_LABEL_OUTLINE = "#6CC4F4", "#2A78B8"
+
+
+def draw_corner_label(canvas, text):
+    """A torn strip with the map icon and the card's name, right-aligned at
+    the top in the medal totals' style. Returns its left edge."""
+    outline = rgba(CORNER_LABEL_OUTLINE)
+    label = Text(text.upper(), DISPLAY, 26, stroke=6, stroke_color=outline)
+    inner = max(26, label.height + 3)
+    height = 8 + inner + 8
+    width = 14 + 36 + 7 + label.width + 16
+    left = MEDALS_WIDTH - 30 - width
+
+    def content(image, draw):
+        paste_icon(image, map_icon("map-purple", 40), 14 - 2, (height - 40) / 2)
+        label.draw(draw, 14 + 36 + 7, 8 + (inner - label.height - 3) / 2 + 3)
+
+    body = strip(width, height, rgba(CORNER_LABEL_FILL), CLIP_MEDAL, content)
+    place(canvas, with_drop_shadow(body, 4), left, 40, width, height, rotate=1.5)
+    return left
+
+
+def map_grid_items(maps):
+    """The polaroids for a page of maps: `#id · 1.2K plays`, the name, and
+    the privacy of any map that isn't public."""
+    items = []
+    for entry in maps:
+        plays = entry.get("plays")
+        detail = f"{compact_count(plays or 0)} play{'' if plays == 1 else 's'}"
+        if entry.get("privacy") and entry["privacy"] != "Public":
+            detail += f" · {entry['privacy'].lower()}"
+        items.append({"number": entry.get("id", "?"), "detail": detail,
+                      "name": entry.get("name"), "thumbnail_png": entry.get("thumbnail_png")})
+    return items
+
+
+def compose_maps_card(*, title, label, subtitle, maps=(), page=1, pages=1,
+                      avatar_png=None, background_png=None, search=False,
+                      with_name=True, name_face=DISPLAY):
+    if search:
+        # No player behind a search: the map card's empty-photo sky, and the
+        # map placeholder in the avatar's frame.
+        backdrop, text_outline = map_backdrop(*NO_THUMBNAIL_COLORS, MEDALS_WIDTH, MEDALS_HEIGHT)
+        canvas, avatar = backdrop.copy(), map_placeholder(104)
+    else:
+        avatar = open_image(avatar_png)
+        canvas, text_outline = player_backdrop(title, avatar, open_image(background_png),
+                                               MEDALS_WIDTH, MEDALS_HEIGHT)
+    return compose_grid_card(
+        canvas, text_outline, title=title, avatar=avatar, subtitle=subtitle,
+        draw_corner=lambda canvas: draw_corner_label(canvas, label),
+        items=map_grid_items(maps), empty_note="No maps yet", page=page, pages=pages,
+        with_name=with_name, name_face=name_face)
+
+
+def render_maps_card_animated(effect, **fields):
+    """The maps card with the creator's username effect playing on their
+    name, as animated WebP bytes."""
+    return render_grid_animated(compose_maps_card, effect, fields)
+
+
+def render_maps_card(**fields):
+    """One page of a map grid (a player's maps, or a name search) as PNG bytes.
+
+    `title` fills the name banner: the player's name, or the search. `label`
+    names the card in the top-right strip ("Created maps", "Map search").
+    `maps` is up to CUPS_PER_PAGE dicts: id, name, plays, privacy and
+    thumbnail_png (bytes, or None for the empty-photo sky). `search` swaps
+    the player's backdrop and avatar for the map card's sky and map icon;
+    otherwise `avatar_png` / `background_png` give the profile's look.
+    """
+    return png_bytes(compose_maps_card(**fields)[0])

@@ -3874,25 +3874,23 @@ async def build_medals_view(user_id, username, parent=None):
         return None
     return MedalListView(medals, username=username, parent=parent)
 
-class MedalsImageCardView(CardView):
-    """A player's Daily Cup medals as rendered polaroids, ten cups a page.
+class PolaroidGridView(CardView):
+    """A rendered grid of map polaroids, ten a page: the medals and maps
+    image cards. Each item carries map_id and entry (the map's community
+    entry, or None); thumbnails are fetched a page at a time and kept for
+    the view's life. Subclasses say how a page is drawn (render_page)."""
 
-    On trial behind !testmedals before it replaces MedalListView. Map
-    thumbnails are fetched a page at a time and kept for the view's life.
-    """
+    # Attachment name, before the extension.
+    stem = "grid"
 
-    def __init__(self, medals, *, username, avatar_png=None, background_png=None,
-                 effect=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
+    def __init__(self, items, *, description, effect=None, parent=None,
+                 timeout=MAP_VIEW_TIMEOUT):
         super().__init__(parent=parent, timeout=timeout)
-        self.medals = medals
-        self.username = username
-        self.avatar_png = avatar_png
-        # The profile's chosen map, so the card shares its background.
-        self.background_png = background_png
-        # The player's username effect plays on the name, as on the profile
-        # card, which makes every page an animated WebP.
+        self.items = items
+        self.description = description
+        # A username effect playing on the name makes every page an animated WebP.
         self.effect = effect
-        self.filename = f"medals.{'webp' if effect else 'png'}"
+        self.filename = f"{self.stem}.{'webp' if effect else 'png'}"
         self.page = 0
         self.card_image = None
         self._thumbnails = {}
@@ -3900,64 +3898,48 @@ class MedalsImageCardView(CardView):
 
     @property
     def page_count(self):
-        return max(1, -(-len(self.medals) // card_render.CUPS_PER_PAGE))
+        return max(1, -(-len(self.items) // card_render.CUPS_PER_PAGE))
 
-    async def load_thumbnails(self, medals):
+    def thumbnail(self, item):
+        return self._thumbnails.get(item["map_id"])
+
+    async def load_thumbnails(self, items):
         """Download the thumbnails of the page's maps not fetched yet."""
         entries, seen = [], set()
-        for medal in medals:
-            map_id = medal["map_id"]
-            if medal["entry"] and map_id not in self._thumbnails and map_id not in seen:
+        for item in items:
+            map_id = item["map_id"]
+            if item["entry"] and map_id not in self._thumbnails and map_id not in seen:
                 seen.add(map_id)
-                entries.append(medal["entry"])
+                entries.append(item["entry"])
         if not entries:
             return
         urls = await fetch_map_thumbnails(entries)
         ids = [entry.get("Id") for entry in entries]
         images = await asyncio.gather(*(
-            download_bytes(urls[map_id], f"medal_card_thumbnail({map_id})")
+            download_bytes(urls[map_id], f"{self.stem}_card_thumbnail({map_id})")
             if urls.get(map_id) else asyncio.sleep(0)
             for map_id in ids
         ))
         self._thumbnails.update(zip(ids, images))
+
+    def render_page(self, page_items):
+        """The page's card as image bytes. Runs in a thread."""
+        raise NotImplementedError
 
     async def refresh(self):
         """Fetch the page's thumbnails, draw the page, lay out the message."""
         async with self._render_lock:
             self.page = max(0, min(self.page, self.page_count - 1))
             per_page = card_render.CUPS_PER_PAGE
-            page_medals = self.medals[self.page * per_page:(self.page + 1) * per_page]
-            await self.load_thumbnails(page_medals)
-            counts = [0] * len(MEDAL_TIERS)
-            for medal in self.medals:
-                counts[medal["tier"]] += 1
-            cups = [{
-                "cup": medal["index"],
-                "date": f"{medal['date']:%d/%m/%Y}" if medal["date"] else "unknown date",
-                "name": medal["map_name"],
-                "tier": medal["tier"],
-                "thumbnail_png": self._thumbnails.get(medal["map_id"]),
-            } for medal in page_medals]
-            fields = dict(
-                username=self.username, avatar_png=self.avatar_png,
-                background_png=self.background_png, counts=tuple(counts),
-                cups=cups, page=self.page + 1, pages=self.page_count,
-            )
-            if self.effect:
-                self.card_image = await asyncio.to_thread(
-                    card_render.render_medals_card_animated, self.effect, **fields)
-            else:
-                self.card_image = await asyncio.to_thread(
-                    card_render.render_medals_card, **fields)
+            page_items = self.items[self.page * per_page:(self.page + 1) * per_page]
+            await self.load_thumbnails(page_items)
+            self.card_image = await asyncio.to_thread(self.render_page, page_items)
             self.lay_out()
 
     def lay_out(self):
         self.clear_items()
         gallery = discord.ui.MediaGallery()
-        gallery.add_item(
-            media=f"attachment://{self.filename}",
-            description=f"{self.username}'s Daily Cup medals",
-        )
+        gallery.add_item(media=f"attachment://{self.filename}", description=self.description)
         self.add_item(gallery)
 
         note = dev_universe_note()
@@ -4003,6 +3985,43 @@ class MedalsImageCardView(CardView):
         self.page += 1
         await self.show(interaction)
 
+class MedalsImageCardView(PolaroidGridView):
+    """A player's Daily Cup medals as rendered polaroids, ten cups a page.
+
+    On trial behind !testmedals before it replaces MedalListView.
+    """
+
+    stem = "medals"
+
+    def __init__(self, medals, *, username, avatar_png=None, background_png=None,
+                 effect=None, parent=None, timeout=MAP_VIEW_TIMEOUT):
+        super().__init__(medals, description=f"{username}'s Daily Cup medals",
+                         effect=effect, parent=parent, timeout=timeout)
+        self.username = username
+        self.avatar_png = avatar_png
+        # The profile's chosen map, so the card shares its background.
+        self.background_png = background_png
+        self.counts = [0] * len(MEDAL_TIERS)
+        for medal in medals:
+            self.counts[medal["tier"]] += 1
+
+    def render_page(self, page_items):
+        fields = dict(
+            username=self.username, avatar_png=self.avatar_png,
+            background_png=self.background_png, counts=tuple(self.counts),
+            page=self.page + 1, pages=self.page_count,
+            cups=[{
+                "cup": medal["index"],
+                "date": f"{medal['date']:%d/%m/%Y}" if medal["date"] else "unknown date",
+                "name": medal["map_name"],
+                "tier": medal["tier"],
+                "thumbnail_png": self.thumbnail(medal),
+            } for medal in page_items],
+        )
+        if self.effect:
+            return card_render.render_medals_card_animated(self.effect, **fields)
+        return card_render.render_medals_card(**fields)
+
 async def build_medals_image_view(user_id, username, parent=None, *, effect_name=None):
     """The image version of build_medals_view, first page drawn. A player
     without medals gets the card's empty state. Their equipped username
@@ -4014,6 +4033,78 @@ async def build_medals_image_view(user_id, username, parent=None, *, effect_name
     effect = username_effects.resolve_effect(effect_name or equipped)
     view = MedalsImageCardView(medals, username=username, avatar_png=avatar_png,
                                background_png=background_png, effect=effect, parent=parent)
+    await view.refresh()
+    return view
+
+class MapsImageCardView(PolaroidGridView):
+    """Maps as rendered polaroids, ten a page: a player's maps (/maps) or a
+    name search (/map), with a label top right naming which.
+
+    On trial behind !testmaps and !testmap before it replaces MapListView.
+    """
+
+    stem = "maps"
+
+    def __init__(self, entries, *, title, label, subtitle, description, search=False,
+                 avatar_png=None, background_png=None, effect=None, parent=None,
+                 timeout=MAP_VIEW_TIMEOUT):
+        items = [{"map_id": entry.get("Id"), "entry": entry} for entry in entries]
+        super().__init__(items, description=description, effect=effect, parent=parent,
+                         timeout=timeout)
+        self.title = title
+        self.label = label
+        self.subtitle = subtitle
+        self.search = search
+        self.avatar_png = avatar_png
+        self.background_png = background_png
+
+    def render_page(self, page_items):
+        fields = dict(
+            title=self.title, label=self.label, subtitle=self.subtitle,
+            search=self.search, avatar_png=self.avatar_png,
+            background_png=self.background_png, page=self.page + 1, pages=self.page_count,
+            maps=[{
+                "id": item["map_id"],
+                "name": item["entry"].get("Name") or "Unnamed Map",
+                "plays": item["entry"].get("Plays") or 0,
+                "privacy": item["entry"].get("Privacy"),
+                "thumbnail_png": self.thumbnail(item),
+            } for item in page_items],
+        )
+        if self.effect:
+            return card_render.render_maps_card_animated(self.effect, **fields)
+        return card_render.render_maps_card(**fields)
+
+async def build_created_maps_image_view(user_id, username, parent=None, include_hidden=False,
+                                        *, effect_name=None):
+    """The image version of build_created_maps_view, first page drawn, or
+    None when they have no maps (or the map list is down). Their profile's
+    background and username effect, as on the medals card."""
+    (maps_by_id, avatar_png, background_png, equipped) = await asyncio.gather(
+        get_community_maps(), fetch_avatar_png(user_id),
+        fetch_profile_background_png(user_id), fetch_equipped_username_effect(user_id),
+    )
+    listed = created_maps(maps_by_id, user_id, include_hidden)
+    if listed is None:
+        return None
+    owned, subtitle = listed
+    view = MapsImageCardView(
+        owned, title=username, label="Created maps", subtitle=subtitle,
+        description=f"Maps by {username}", avatar_png=avatar_png,
+        background_png=background_png,
+        effect=username_effects.resolve_effect(effect_name or equipped), parent=parent,
+    )
+    await view.refresh()
+    return view
+
+async def build_map_search_image_view(query, matches, parent=None):
+    """The image version of build_map_search_view, first page drawn."""
+    count = len(matches)
+    view = MapsImageCardView(
+        matches, title=query, label="Map search", search=True,
+        subtitle=f"{count} result{'s' if count != 1 else ''} · /map <id> opens one",
+        description=f"Maps matching {query}", parent=parent,
+    )
     await view.refresh()
     return view
 
@@ -4164,16 +4255,14 @@ def shows_hidden_maps(channel):
 def no_maps_message(username, include_hidden):
     return f"**{username}** has no {'' if include_hidden else 'public '}maps..."
 
-async def build_created_maps_view(user_id, username, parent=None,
-                                  include_hidden=False):
-    """List the community maps a player has created, most played first.
+def created_maps(maps_by_id, user_id, include_hidden=False):
+    """A player's community maps, most played first, and the subtitle
+    counting them; None when they have none or the map list is down.
 
     include_hidden adds their Private and Unlisted maps to the public ones.
     """
-    maps_by_id = await get_community_maps()
     if not maps_by_id:
         return None
-
     owned = [
         m for m in maps_by_id.values()
         if m.get("Creator") == user_id
@@ -4189,6 +4278,15 @@ async def build_created_maps_view(user_id, username, parent=None,
                     f" · {public} public, {len(owned) - public} hidden")
     else:
         subtitle = f"{len(owned)} public map{'s' if len(owned) != 1 else ''}"
+    return owned, subtitle
+
+async def build_created_maps_view(user_id, username, parent=None,
+                                  include_hidden=False):
+    """List the community maps a player has created, most played first."""
+    listed = created_maps(await get_community_maps(), user_id, include_hidden)
+    if listed is None:
+        return None
+    owned, subtitle = listed
 
     creators = await fetch_usernames([user_id])
     return MapListView(
@@ -6067,10 +6165,11 @@ async def test_medals_card(ctx, username: str = None, effect: str = None):
 @bot.command(name="testmap", hidden=True)
 @commands.is_owner()
 async def test_map_card(ctx, *, query: str):
-    """Owner-only preview of the image map card, before /map uses it.
+    """Owner-only preview of the image map cards, before /map uses them.
 
-    `!testmap <map id or name>`. An ID finds any map, as /map does; a name
-    searches public maps.
+    `!testmap <map id or name>`. As /map: an ID finds any map; a name
+    searches public maps, opening the map card for a single match and the
+    polaroid grid of results for several.
     """
     if card_render is None:
         await ctx.send("Image cards need Pillow — run `!restart` to install it.")
@@ -6084,13 +6183,48 @@ async def test_map_card(ctx, *, query: str):
         cleaned = query.strip()
         if cleaned.isdigit():
             entry = maps_by_id.get(int(cleaned))
+            matches = [entry] if entry else []
         else:
-            matches = search_public_maps(maps_by_id, cleaned, limit=1)
-            entry = matches[0] if matches else None
-        if entry is None:
+            matches = search_public_maps(maps_by_id, cleaned)
+        if not matches:
             await ctx.send(f"No community map found for `{cleaned}`.")
             return
-        view = await build_map_card_view(entry)
+        if len(matches) == 1:
+            view = await build_map_card_view(matches[0])
+        else:
+            view = await build_map_search_image_view(cleaned, matches)
+
+    view.message = await ctx.send(view=view, files=view.card_files())
+
+@bot.command(name="testmaps", hidden=True)
+@commands.is_owner()
+async def test_maps_card(ctx, username: str = None, effect: str = None):
+    """Owner-only preview of the image maps grid, before /maps uses it.
+
+    `!testmaps [username|me] [effect|none]`: the player's maps as
+    polaroids, ten a page, most played first. Private and Unlisted ones
+    show in the staff channels, as /maps. The name plays their equipped
+    username effect unless one is named, as !testprofile.
+    """
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
+        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
+        return
+
+    async with ctx.typing():
+        lookup = None if username in (None, "me") else username
+        user_id, canonical = await resolve_command_user(ctx, lookup)
+        if user_id is None:
+            return
+        include_hidden = shows_hidden_maps(ctx.channel)
+        # "none" can't match a preset, so it shows the still card.
+        view = await build_created_maps_image_view(
+            user_id, canonical, include_hidden=include_hidden, effect_name=effect)
+        if view is None:
+            await ctx.send(no_maps_message(canonical, include_hidden))
+            return
 
     view.message = await ctx.send(view=view, files=view.card_files())
 
