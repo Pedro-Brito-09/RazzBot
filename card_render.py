@@ -352,7 +352,7 @@ def draw_background(canvas, color, image=None):
 
     Returns the colour the footer text should be outlined in.
     """
-    width, height = px(CARD_WIDTH), px(CARD_HEIGHT)
+    width, height = canvas.size
     # The colour goes down first in both cases, so a thumbnail with
     # transparent areas shows it rather than holes in the card.
     canvas.alpha_composite(vertical_gradient(width, height, (
@@ -1176,39 +1176,18 @@ def flag_tile(code, width, height):
     return frame
 
 
-def dotted_slab(width, height, fill, dot, spacing=12, radius=2.3):
-    """A slab with a grid of dots, one centred in each spacing-sized tile:
-    background-image: radial-gradient(dot 2px, transparent 2.6px)."""
-    def paint(draw, k):
-        for cx in range(spacing // 2, width + spacing, spacing):
-            for cy in range(spacing // 2, height + spacing, spacing):
-                draw.ellipse(((cx - radius) * k, (cy - radius) * k,
-                              (cx + radius) * k, (cy + radius) * k), fill=255)
-    slab = solid(width, height, rgba(fill))
-    dots = solid(width, height, rgba(dot))
-    dots.putalpha(shape_mask(width, height, paint))
-    slab.alpha_composite(dots)
-    return slab
+def leaderboard_backdrop(thumbnail):
+    """The card's background and the colour its white text is outlined in.
 
-
-@functools.lru_cache(maxsize=1)
-def leaderboard_backdrop():
-    """The sky, the dotted strip, the hill and the grey block. The same on
-    every card, so it's drawn once; copy it before drawing on it."""
-    width, height = px(LEADERBOARD_WIDTH), px(LEADERBOARD_HEIGHT)
-    canvas = vertical_gradient(width, height, (
-        (0.0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1.0, rgba("#B4DEFF")),
-    ))
-    place(canvas, dotted_slab(100, 300, "#2B5FBF", "#1C468F"), 430, -30, 100, 300,
-          rotate=-6)
-
-    def ellipse(draw, k):
-        draw.ellipse((0, 0, 1080 * k - 1, 190 * k - 1), fill=255)
-    hill = clip_to(solid(1080, 190, rgba("#4F8E3A")), shape_mask(1080, 190, ellipse))
-    place(canvas, hill, -60, LEADERBOARD_HEIGHT + 80 - 190, 1080, 190)
-    block = clip_to(solid(54, 54, rgba("#5A6070")), rounded_mask(54, 54, 8))
-    place(canvas, block, 470, 180, 54, 54, rotate=14)
-    return canvas
+    The map's thumbnail fills it, as a profile card's chosen map does;
+    without one, the map card's no-thumbnail sky fade and dots.
+    """
+    if thumbnail is not None:
+        canvas = Image.new("RGBA", (px(LEADERBOARD_WIDTH), px(LEADERBOARD_HEIGHT)))
+        return canvas, draw_background(canvas, (11, 11, 20), thumbnail)
+    backdrop, outline = map_backdrop(*NO_THUMBNAIL_COLORS, LEADERBOARD_WIDTH,
+                                     LEADERBOARD_HEIGHT)
+    return backdrop.copy(), outline
 
 
 def player_name(name, size, min_size, room, **style):
@@ -1434,16 +1413,16 @@ SHEET_TILT = 1.2
 
 
 def compose_leaderboard_card(*, title, subtitle="", sheet_title="", footer="", players=(),
-                             animate=False):
+                             thumbnail_png=None, animate=False):
     """The card as an RGBA image, and with `animate` the AnimatedName specs
     for every player with an "effect" (whose names are left off)."""
     players = list(players)[:3 + SHEET_ROWS]
     animated = [] if animate else None
-    canvas = leaderboard_backdrop().copy()
+    canvas, text_outline = leaderboard_backdrop(open_image(thumbnail_png))
     draw_title_banner(canvas, title)
     if subtitle:
         text = shrink_to_fit(subtitle, HAND, 26, SHEET_LEFT - 40 - 10, min_size=16)
-        draw_glowing_text(canvas, [(text, 40, 112)], rgba("#2160B8"))
+        draw_glowing_text(canvas, [(text, 40, 112)], text_outline)
 
     # Second, first, third: each avatar overlaps the block to its left.
     for index in (1, 0, 2):
@@ -1455,7 +1434,7 @@ def compose_leaderboard_card(*, title, subtitle="", sheet_title="", footer="", p
     if footer:
         text = shrink_to_fit(footer, HAND, 21, LEADERBOARD_WIDTH - SHEET_LEFT, min_size=14)
         draw_glowing_text(canvas, [(text, LEADERBOARD_WIDTH - 40 - text.width,
-                                    LEADERBOARD_HEIGHT - 20 - text.height)], rgba("#2E5E22"))
+                                    LEADERBOARD_HEIGHT - 20 - text.height)], text_outline)
 
     card = clip_to(canvas, rounded_mask(LEADERBOARD_WIDTH, LEADERBOARD_HEIGHT, 24))
     return card, animated or []
@@ -1504,8 +1483,9 @@ def render_leaderboard_card(**fields):
     optionally country (ISO alpha-2), tier (0 diamond .. 3 bronze, or None
     for no medal) and avatar_png (used for the top 3). The first three
     stand on the podium; the next seven go on the sheet, which says so
-    when there's nobody past third. Username effects are ignored here; see
-    render_leaderboard_card_animated.
+    when there's nobody past third. `thumbnail_png` (the map's, or the
+    cup map's) fills the background; without it, the map card's sky fade.
+    Username effects are ignored here; see render_leaderboard_card_animated.
     """
     card, _ = compose_leaderboard_card(**fields)
     out = io.BytesIO()

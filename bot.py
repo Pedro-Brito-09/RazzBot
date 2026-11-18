@@ -4124,9 +4124,7 @@ class MapCardView(MapView):
         await interaction.response.defer()
 
         map_id = self.entry.get("Id")
-        view = await build_map_leaderboard_card_view(
-            map_id, self.entry.get("Name"), parent=self
-        )
+        view = await build_map_leaderboard_card_view(self.entry, parent=self)
         if view is None:
             key = MAP_LEADERBOARD_KEY.format(id=map_id)
             await interaction.followup.send(
@@ -4362,7 +4360,8 @@ class LeaderboardCardView(CardView):
         return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
 
 async def build_leaderboard_card_view(leaderboard, *, title, subtitle, footer,
-                                      shown_title, medals, parent=None):
+                                      shown_title, medals, thumbnail_png=None,
+                                      parent=None):
     """Render a list-shaped board (map or cup) as a LeaderboardCardView, or
     None when it has no rows.
 
@@ -4407,7 +4406,7 @@ async def build_leaderboard_card_view(leaderboard, *, title, subtitle, footer,
         sheet_title = f"{total} {'time' if total == 1 else 'times'}"
 
     fields = dict(title=title, subtitle=subtitle, sheet_title=sheet_title,
-                  footer=footer, players=players)
+                  footer=footer, players=players, thumbnail_png=thumbnail_png)
     if any(effects):
         image = await asyncio.to_thread(card_render.render_leaderboard_card_animated, **fields)
         extension = "webp"
@@ -4426,12 +4425,25 @@ def card_timestamp():
     now = datetime.now(timezone.utc)
     return f"{now.day} {now:%b %Y, %H:%M} UTC"
 
-async def build_map_leaderboard_card_view(map_id, map_name, parent=None):
-    """The image version of build_map_leaderboard_embed, or None without a board."""
-    leaderboard = await fetch_board(MAP_LEADERBOARD_KEY.format(id=map_id))
+async def fetch_map_thumbnail_png(entry):
+    """A community map's thumbnail as PNG bytes, or None (no map, none set,
+    or the download failed)."""
+    if not entry:
+        return None
+    url = await fetch_map_thumbnail(entry)
+    return await download_bytes(url, "fetch_map_thumbnail_png") if url else None
+
+async def build_map_leaderboard_card_view(entry, parent=None):
+    """The image version of build_map_leaderboard_embed, on the map's
+    thumbnail, or None without a board."""
+    map_id = entry.get("Id")
+    leaderboard, thumbnail_png = await asyncio.gather(
+        fetch_board(MAP_LEADERBOARD_KEY.format(id=map_id)),
+        fetch_map_thumbnail_png(entry),
+    )
     if leaderboard is None:
         return None
-    name = map_name or "Unnamed Map"
+    name = entry.get("Name") or "Unnamed Map"
     return await build_leaderboard_card_view(
         leaderboard,
         title=name,
@@ -4439,17 +4451,21 @@ async def build_map_leaderboard_card_view(map_id, map_name, parent=None):
         footer=card_timestamp(),
         shown_title=f"{name} · Map #{map_id}",
         medals=False,
+        thumbnail_png=thumbnail_png,
         parent=parent,
     )
 
 async def build_cup_leaderboard_card_view(index, date_text, *, todays_map=None):
-    """The image version of send_cup_leaderboard's embed: (view, error text)."""
-    leaderboard, map_id = await asyncio.gather(
+    """The image version of send_cup_leaderboard's embed, on the cup map's
+    thumbnail: (view, error text)."""
+    leaderboard, map_id, maps_by_id = await asyncio.gather(
         fetch_board(f"DailyCup_{index}"),
         get_cup_map_id(index, todays_map or {}),
+        get_community_maps(),
     )
     if not leaderboard:
         return None, f"No leaderboard found for `DailyCup_{index}` ({date_text})."
+    thumbnail_png = await fetch_map_thumbnail_png((maps_by_id or {}).get(map_id))
     view = await build_leaderboard_card_view(
         leaderboard,
         title=f"Daily Cup #{index}",
@@ -4457,6 +4473,7 @@ async def build_cup_leaderboard_card_view(index, date_text, *, todays_map=None):
         footer=f"Map ID {map_id}" if map_id is not None else "",
         shown_title=f"Daily Cup #{index} · {date_text}",
         medals=True,
+        thumbnail_png=thumbnail_png,
     )
     if view is None:
         return None, "The leaderboard came back empty."
@@ -5636,7 +5653,7 @@ async def test_leaderboard_card(ctx, target: str, when: str = None):
             if entry is None:
                 await ctx.send(f"No community map with ID `{map_id}`.")
                 return
-            view = await build_map_leaderboard_card_view(map_id, entry.get("Name"))
+            view = await build_map_leaderboard_card_view(entry)
             if view is None:
                 await ctx.send(
                     f"No leaderboard found for `{MAP_LEADERBOARD_KEY.format(id=map_id)}`."
