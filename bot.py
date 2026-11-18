@@ -3864,8 +3864,6 @@ async def build_medals_view(user_id, username, parent=None):
         return None
     return MedalListView(medals, username=username, parent=parent)
 
-MEDALS_IMAGE_FILENAME = "medals.png"
-
 class MedalsImageCardView(CardView):
     """A player's Daily Cup medals as rendered polaroids, ten cups a page.
 
@@ -3873,12 +3871,16 @@ class MedalsImageCardView(CardView):
     thumbnails are fetched a page at a time and kept for the view's life.
     """
 
-    def __init__(self, medals, *, username, avatar_png=None, parent=None,
+    def __init__(self, medals, *, username, avatar_png=None, effect=None, parent=None,
                  timeout=MAP_VIEW_TIMEOUT):
         super().__init__(parent=parent, timeout=timeout)
         self.medals = medals
         self.username = username
         self.avatar_png = avatar_png
+        # The player's username effect plays on the name, as on the profile
+        # card, which makes every page an animated WebP.
+        self.effect = effect
+        self.filename = f"medals.{'webp' if effect else 'png'}"
         self.page = 0
         self.card_image = None
         self._thumbnails = {}
@@ -3924,18 +3926,23 @@ class MedalsImageCardView(CardView):
                 "tier": medal["tier"],
                 "thumbnail_png": self._thumbnails.get(medal["map_id"]),
             } for medal in page_medals]
-            self.card_image = await asyncio.to_thread(
-                card_render.render_medals_card,
+            fields = dict(
                 username=self.username, avatar_png=self.avatar_png, counts=tuple(counts),
                 cups=cups, page=self.page + 1, pages=self.page_count,
             )
+            if self.effect:
+                self.card_image = await asyncio.to_thread(
+                    card_render.render_medals_card_animated, self.effect, **fields)
+            else:
+                self.card_image = await asyncio.to_thread(
+                    card_render.render_medals_card, **fields)
             self.lay_out()
 
     def lay_out(self):
         self.clear_items()
         gallery = discord.ui.MediaGallery()
         gallery.add_item(
-            media=f"attachment://{MEDALS_IMAGE_FILENAME}",
+            media=f"attachment://{self.filename}",
             description=f"{self.username}'s Daily Cup medals",
         )
         self.add_item(gallery)
@@ -3965,7 +3972,7 @@ class MedalsImageCardView(CardView):
             self.add_item(row)
 
     def card_files(self):
-        return [discord.File(io.BytesIO(self.card_image), filename=MEDALS_IMAGE_FILENAME)]
+        return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
 
     async def show(self, interaction):
         # A render plus up to ten downloads outlasts the 3s to answer.
@@ -3983,14 +3990,17 @@ class MedalsImageCardView(CardView):
         self.page += 1
         await self.show(interaction)
 
-async def build_medals_image_view(user_id, username, parent=None):
+async def build_medals_image_view(user_id, username, parent=None, *, effect_name=None):
     """The image version of build_medals_view, first page drawn. A player
-    without medals gets the card's empty state."""
-    medals, avatar_png = await asyncio.gather(
+    without medals gets the card's empty state. Their equipped username
+    effect plays on the name; effect_name forces one, for previews."""
+    medals, avatar_png, equipped = await asyncio.gather(
         fetch_medal_history(user_id), fetch_avatar_png(user_id),
+        fetch_equipped_username_effect(user_id),
     )
+    effect = username_effects.resolve_effect(effect_name or equipped)
     view = MedalsImageCardView(medals, username=username, avatar_png=avatar_png,
-                               parent=parent)
+                               effect=effect, parent=parent)
     await view.refresh()
     return view
 
@@ -6012,14 +6022,18 @@ async def test_badges_card(ctx, username: str = None):
 
 @bot.command(name="testmedals", hidden=True)
 @commands.is_owner()
-async def test_medals_card(ctx, username: str = None):
+async def test_medals_card(ctx, username: str = None, effect: str = None):
     """Owner-only preview of the image medals card, before /medals uses it.
 
-    `!testmedals [username|me]`: the player's Daily Cup medals as
-    polaroids, ten cups a page, newest first.
+    `!testmedals [username|me] [effect|none]`: the player's Daily Cup
+    medals as polaroids, ten cups a page, newest first. The name plays
+    their equipped username effect unless one is named, as !testprofile.
     """
     if card_render is None:
         await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
+        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
         return
 
     async with ctx.typing():
@@ -6027,7 +6041,8 @@ async def test_medals_card(ctx, username: str = None):
         user_id, canonical = await resolve_command_user(ctx, lookup)
         if user_id is None:
             return
-        view = await build_medals_image_view(user_id, canonical)
+        # "none" can't match a preset, so it shows the still card.
+        view = await build_medals_image_view(user_id, canonical, effect_name=effect)
 
     view.message = await ctx.send(view=view, files=view.card_files())
 

@@ -2163,25 +2163,47 @@ def map_placeholder(size):
 
 def draw_badges_header(canvas, username, avatar, text_outline, *,
                        subtitle="Badges & Achievements", max_right=BADGES_BANNER_MAX_RIGHT,
-                       empty="#2A2F4A", mark_outline="#454D73"):
+                       empty="#2A2F4A", mark_outline="#454D73", avatar_on_top=False,
+                       with_name=True, face=DISPLAY):
     """The avatar tile, the purple name banner over its edge, the subtitle.
-    Shared by the badges and medals cards, whose headers are the same."""
-    tile = framed_avatar(avatar, 104, 6, 22, empty, mark_outline)
-    place(canvas, with_drop_shadow(tile, 6), 30, 22, 104, 104, rotate=-4)
+    Shared by the badges and medals cards, whose headers are the same.
+
+    `avatar_on_top` lays the tile over the banner's end, as the profile
+    card does. `face` sets the name in a username effect's font; without
+    `with_name` the banner is left empty for an animation to fill.
+    Returns (name Text, its top-left in the banner, banner-to-card mapper).
+    """
+    def draw_avatar_tile():
+        tile = framed_avatar(avatar, 104, 6, 22, empty, mark_outline)
+        place(canvas, with_drop_shadow(tile, 6), 30, 22, 104, 104, rotate=-4)
+
+    if not avatar_on_top:
+        draw_avatar_tile()
 
     outline = rgba("#5E37B8")
     style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=4)
     room = max_right - 120 - 2 * 34
     text = drawable_text(username or "", DISPLAY) or "Unknown"
-    name = (fit_text(text, DISPLAY, 46, room, min_size=30, **style)
-            or ellipsize(text, DISPLAY, 30, room, **style))
+    name = None
+    if face != DISPLAY:
+        # Sized to stand as tall as the card font would in the 46px slot.
+        name = fit_name_in_face(text, face, room,
+                                {k: v for k, v in style.items() if k != "line_height"},
+                                size=46, min_size=20)
+    if name is None:
+        name = (fit_text(text, DISPLAY, 46, room, min_size=30, **style)
+                or ellipsize(text, DISPLAY, 30, room, **style))
     # padding 10px 34px 6px; a shrunk name stays centred in the 46px slot.
     width, height = 34 + name.width + 34, 10 + 46 + 6
+    at = (34, 10 + (46 - name.height) / 2)
     body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER,
-                 lambda image, draw: name.draw(draw, 34, 10 + (46 - name.height) / 2))
+                 (lambda image, draw: name.draw(draw, *at)) if with_name else None)
     place(canvas, with_drop_shadow(body, 5), 120, 30, width, height, rotate=-1.5)
 
+    if avatar_on_top:
+        draw_avatar_tile()
     draw_glowing_text(canvas, [(Text(subtitle, HAND, 26), 154, 100)], text_outline)
+    return name, at, lambda x, y: turn_point(x, y, 120, 30, width, height, -1.5)
 
 
 def draw_badges_progress(canvas, unlocked, total):
@@ -2413,12 +2435,16 @@ def draw_no_medals(canvas):
 
 
 def compose_medals_card(*, username, avatar_png=None, counts=(0, 0, 0, 0), cups=(),
-                        page=1, pages=1):
+                        page=1, pages=1, with_name=True, name_face=DISPLAY):
+    """The card, and (name, at, to_canvas) for animating the name."""
     canvas = medals_sky().copy()
     totals_left = draw_medal_totals(canvas, counts)
-    draw_badges_header(canvas, username, open_image(avatar_png), rgba("#2160B8"),
-                       subtitle="Daily Cup Medals", max_right=totals_left - 16,
-                       empty="#0F1B33", mark_outline="#2A3B5E")
+    # The avatar overlaps the banner's end, as on the profile card.
+    placed_name = draw_badges_header(
+        canvas, username, open_image(avatar_png), rgba("#2160B8"),
+        subtitle="Daily Cup Medals", max_right=totals_left - 16,
+        empty="#0F1B33", mark_outline="#2A3B5E", avatar_on_top=True,
+        with_name=with_name, face=name_face)
     cups = list(cups)
     if cups:
         draw_cup_grid(canvas, cups)
@@ -2427,7 +2453,26 @@ def compose_medals_card(*, username, avatar_png=None, counts=(0, 0, 0, 0), cups=
     footer = Text(f"page {page} / {pages}", HAND, 21)
     draw_glowing_text(canvas, [(footer, MEDALS_WIDTH - 36 - footer.width,
                                 MEDALS_HEIGHT - 12 - footer.height)], rgba("#2E5E22"))
-    return clip_to(canvas, rounded_mask(MEDALS_WIDTH, MEDALS_HEIGHT, 24))
+    return clip_to(canvas, rounded_mask(MEDALS_WIDTH, MEDALS_HEIGHT, 24)), placed_name
+
+
+def render_medals_card_animated(effect, **fields):
+    """The medals card with the player's username effect playing on the
+    name banner, as animated WebP bytes (half resolution, like the
+    profile's). The banner is tilted, so each frame draws the name upright
+    on a small patch and turns it with the strip, as the map card does.
+
+    The name's patch keeps clear of the avatar: the name starts 34px into
+    the banner, past where the tile's corner reaches.
+    """
+    with ANIMATION_LOCK:
+        card, (name, at, to_canvas) = compose_medals_card(
+            with_name=False, name_face=effect.get("font") or DISPLAY, **fields)
+        frames_count, delay, cycles = plan_loop(effect)
+        animated = AnimatedName(card, name, at, effect, cycles, outline=rgba("#5E37B8"),
+                                stroke_scale=46 / NAME_SIZE, to_canvas=to_canvas,
+                                rotate=-1.5)
+        return encode_name_animation(card, [animated], frames_count, delay)
 
 
 def render_medals_card(**fields):
@@ -2439,7 +2484,7 @@ def render_medals_card(**fields):
     thumbnail_png (bytes, or None for the empty-photo sky). No cups draws
     the empty state. `page` / `pages` drive the footer.
     """
-    card = compose_medals_card(**fields)
+    card, _ = compose_medals_card(**fields)
     out = io.BytesIO()
     card.save(out, format="PNG", optimize=False, compress_level=6)
     return out.getvalue()
