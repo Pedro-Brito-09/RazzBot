@@ -749,6 +749,57 @@ def map_scene():
     return scene
 
 
+# Colours closer than this (RGB distance) count as one when picking the
+# backdrop's two, so a mostly-dark picture doesn't fade black to near-black.
+MIN_COLOR_DISTANCE = 60
+
+
+def dominant_colors(image):
+    """The picture's two most common colours, (primary, secondary), as RGB.
+
+    Counted on a small copy reduced to a 12-colour palette, with palette
+    entries closer than MIN_COLOR_DISTANCE pooled into one: median cut
+    splits a big dark area into several near-blacks, each of which would
+    otherwise count for less than one small bright area. A one-colour
+    picture gets a lighter or darker shade of its colour as the secondary.
+    """
+    small = image.convert("RGB")
+    small.thumbnail((96, 96))
+    palette = small.quantize(colors=12, method=Image.Quantize.MEDIANCUT)
+    rgb = palette.getpalette()
+    groups = []   # [count, colour of the group's most common entry]
+    for count, index in sorted(palette.getcolors(), reverse=True):
+        color = tuple(rgb[index * 3:index * 3 + 3])
+        group = next((g for g in groups
+                      if math.dist(g[1], color) < MIN_COLOR_DISTANCE), None)
+        if group:
+            group[0] += count
+        else:
+            groups.append([count, color])
+    groups.sort(key=lambda g: g[0], reverse=True)
+    primary = groups[0][1]
+    if len(groups) > 1:
+        return primary, groups[1][1]
+    return primary, shade(primary, 1.4 if sum(primary) < 384 else 0.6)
+
+
+@functools.lru_cache(maxsize=16)
+def map_backdrop(primary, secondary):
+    """The map's own colours: primary fading down to secondary, under the
+    staggered dot pattern. Returns (backdrop, footer outline colour)."""
+    width, height = px(CARD_WIDTH), px(CARD_HEIGHT)
+    backdrop = vertical_gradient(width, height, (
+        (0.0, primary[:3] + (255,)), (1.0, secondary[:3] + (255,)),
+    ))
+    # Dots a shade darker than the colour mid-way, as the profile's are.
+    middle = tuple((a + b) // 2 for a, b in zip(primary[:3], secondary[:3]))
+    backdrop.alpha_composite(dot_pattern(width, height, shade(middle, 0.6) + (64,)))
+    # The white footer text is outlined in the darker colour, deepened, so
+    # it still reads where the fade ends near white.
+    darker = min(primary[:3], secondary[:3], key=sum)
+    return backdrop, shade(darker, 0.4) + (255,)
+
+
 def draw_photo(paper, thumbnail):
     """The map thumbnail filling the photo, or a plain sky with the map icon."""
     width, height = px(PHOTO_WIDTH), px(PHOTO_HEIGHT)
@@ -901,7 +952,9 @@ def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=
     """A community map's card as PNG bytes.
 
     `visibility` is Public / Unlisted / Private, or None to leave the tag
-    off. Missing avatar or thumbnail bytes get placeholders.
+    off. The background fades top to bottom between the thumbnail's two
+    most common colours; without a thumbnail it's the sky-and-hill scene.
+    Missing avatar or thumbnail bytes get placeholders.
     """
     plays, favourites = max(0, plays or 0), max(0, favourites or 0)
     shown_name = drawable_text(name or "", DISPLAY)
@@ -909,12 +962,17 @@ def render_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png=
         shown_name = f"Map {map_id}" if map_id is not None else "Unnamed Map"
     creator = drawable_text(creator_name or "", DISPLAY) or None
 
-    canvas = map_scene().copy()
+    thumbnail = open_image(thumbnail_png)
+    if thumbnail is not None:
+        backdrop, footer_outline = map_backdrop(*dominant_colors(thumbnail))
+    else:
+        backdrop, footer_outline = map_scene(), rgba("#2E5E22")
+    canvas = backdrop.copy()
     draw_polaroid(canvas, shown_name, creator, open_image(creator_avatar_png),
-                  open_image(thumbnail_png))
+                  thumbnail)
     draw_map_strips(canvas, mode, plays, favourites, visibility, featured)
     if map_id is not None:
-        draw_footer(canvas, f"map ID {map_id}", "", rgba("#2E5E22"),
+        draw_footer(canvas, f"map ID {map_id}", "", footer_outline,
                     size=22, inset=48, bottom=22)
 
     card = clip_to(canvas, rounded_mask(CARD_WIDTH, CARD_HEIGHT, 24))
