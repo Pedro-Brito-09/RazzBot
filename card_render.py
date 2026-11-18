@@ -709,12 +709,12 @@ def solid(width, height, color):
     return Image.new("RGBA", (px(width), px(height)), color)
 
 
-# Without a thumbnail: the design's sky blues, for the card's backdrop and,
-# a little deeper, the empty photo.
-NO_THUMBNAIL_COLORS = ((47, 127, 224), (180, 222, 255))
+# Without a thumbnail: the design's sky blues. The card fades light to dark,
+# the empty photo dark to light, so the two don't read as one gradient.
+NO_THUMBNAIL_COLORS = ((180, 222, 255), (47, 127, 224))
 NO_THUMBNAIL_PHOTO_COLORS = ((47, 127, 224), (109, 184, 250))
-# The map icon's own outline, so the placeholder text matches it.
-MAP_ICON_OUTLINE = "#0D6B5F"
+# The empty photo's text outline; its map icon (map-blue) is drawn in it too.
+PLACEHOLDER_BLUE = "#1C468F"
 
 
 # Colours closer than this (RGB distance) count as one when picking the
@@ -776,9 +776,9 @@ def draw_photo(paper, thumbnail):
         photo.alpha_composite(cover_crop(thumbnail, width, height))
     else:
         photo = map_backdrop(*NO_THUMBNAIL_PHOTO_COLORS, PHOTO_WIDTH, PHOTO_HEIGHT)[0].copy()
-        paste_icon(photo, map_icon("map", 110), (PHOTO_WIDTH - 110) / 2, 84)
+        paste_icon(photo, map_icon("map-blue", 110), (PHOTO_WIDTH - 110) / 2, 84)
         note = Text("no picture yet", HAND, 26, stroke=6,
-                    stroke_color=rgba(MAP_ICON_OUTLINE))
+                    stroke_color=rgba(PLACEHOLDER_BLUE))
         note.draw(ImageDraw.Draw(photo), (PHOTO_WIDTH - note.width) / 2, 204)
     photo = clip_to(photo, rounded_mask(PHOTO_WIDTH, PHOTO_HEIGHT, 4))
     paper.alpha_composite(photo, (px(16), px(16)))
@@ -823,7 +823,8 @@ def draw_caption(paper, map_name, creator_name, avatar):
     by.draw(draw, text_left, text_top)
     handle.draw(draw, text_left, text_top + 17 + 6)
 
-    paste_icon(paper, map_icon("map", 54), CAPTION_LEFT, row_mid - 27)
+    # In the name's purple, so the icon and the name outline match.
+    paste_icon(paper, map_icon("map-purple", 54), CAPTION_LEFT, row_mid - 27)
     name_left = CAPTION_LEFT + 54 + 14
     room = group_left - 14 - name_left
     name = fit_or_ellipsize(map_name, DISPLAY, 58, room, min_size=32, line_height=1,
