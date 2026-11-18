@@ -1232,7 +1232,8 @@ def draw_title_banner(canvas, title):
     height = 10 + inner + 6
 
     def content(image, draw):
-        paste_icon(image, profile_icon("trophy", 54), 18, 10)
+        # The banner's own trophy, outlined in its text's purple.
+        paste_icon(image, load_icon("leaderboard", "trophy", 54), 18, 10)
         name.draw(draw, 18 + 54 + 12, 10 + (inner - name.height - 6) / 2 + 6)
 
     body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER, content)
