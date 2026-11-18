@@ -668,7 +668,15 @@ def compose_profile_card(*, username, avatar_png=None, tag=None, stars=0,
     size = (px(CARD_WIDTH), px(CARD_HEIGHT))
 
     below = Image.new("RGBA", size, (0, 0, 0, 0))
-    footer_outline = draw_background(below, roblox_name_color(username), background)
+    if background is None and avatar is not None:
+        # Like the map card: the avatar's two main colours, lightest at the
+        # top fading to darkest at the bottom, under the dot pattern.
+        colors = sorted(dominant_colors(avatar), key=luma, reverse=True)
+        backdrop, footer_outline = map_backdrop(*colors)
+        below.alpha_composite(backdrop)
+    else:
+        # A chosen map thumbnail, or the chat colour when there's no avatar.
+        footer_outline = draw_background(below, roblox_name_color(username), background)
     stars_left = draw_stars_strip(below, stars, stars_all_time)
     banner = draw_name_banner(below, username, stars_left - 16, with_text=with_name,
                               face=name_face)
@@ -762,9 +770,17 @@ def dominant_colors(image):
     splits a big dark area into several near-blacks, each of which would
     otherwise count for less than one small bright area. A one-colour
     picture gets a lighter or darker shade of its colour as the secondary.
+    See-through pixels don't count: an avatar headshot's empty background
+    would otherwise win as black.
     """
-    small = image.convert("RGB")
+    small = image.convert("RGBA")
     small.thumbnail((96, 96))
+    data = small.tobytes()
+    opaque = b"".join(data[i:i + 3] for i in range(0, len(data), 4) if data[i + 3] >= 128)
+    if opaque:
+        small = Image.frombytes("RGB", (len(opaque) // 3, 1), opaque)
+    else:
+        small = small.convert("RGB")
     palette = small.quantize(colors=12, method=Image.Quantize.MEDIANCUT)
     rgb = palette.getpalette()
     groups = []   # [count, colour of the group's most common entry]
@@ -781,6 +797,11 @@ def dominant_colors(image):
     if len(groups) > 1:
         return primary, groups[1][1]
     return primary, shade(primary, 1.4 if sum(primary) < 384 else 0.6)
+
+
+def luma(color):
+    """Perceived brightness (Rec. 601), for ordering colours light to dark."""
+    return 299 * color[0] + 587 * color[1] + 114 * color[2]
 
 
 @functools.lru_cache(maxsize=16)
@@ -1089,9 +1110,8 @@ def compose_map_card(*, name, map_id=None, creator_name=None, creator_avatar_png
 
     thumbnail = open_image(thumbnail_png)
     colors = dominant_colors(thumbnail) if thumbnail is not None else NO_THUMBNAIL_COLORS
-    # Always lightest at the top, darkest at the bottom (Rec. 601 luma).
-    colors = sorted(colors, key=lambda c: 299 * c[0] + 587 * c[1] + 114 * c[2],
-                    reverse=True)
+    # Always lightest at the top, darkest at the bottom.
+    colors = sorted(colors, key=luma, reverse=True)
     backdrop, footer_outline = map_backdrop(*colors)
     canvas = backdrop.copy()
     handle = draw_polaroid(canvas, shown_name, creator, open_image(creator_avatar_png),
