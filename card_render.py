@@ -1149,6 +1149,10 @@ SHEET_ROWS = 7
 # The title banner shrinks from 44px to 28px, then loses its tail, to keep
 # its right edge here: over the dotted strip, clear of the sheet's column.
 TITLE_MAX_RIGHT = 600
+# Player names, bigger than the design's 16px (podium) and 17px (sheet).
+# Long names shrink to the minimum, then lose their tail.
+PODIUM_NAME_SIZE, PODIUM_NAME_MIN = 22, 14
+SHEET_NAME_SIZE, SHEET_NAME_MIN = 22, 16
 
 
 def flag_path(code):
@@ -1255,9 +1259,18 @@ def time_pill(time_text, tier):
     return strip(width, height, rgba(PAPER), CLIP_MEDAL, content), width, height
 
 
+# The podium's flag: a sticker on the avatar tile's bottom-right corner,
+# hanging this far past its right edge, so the name below gets the block's
+# whole width. (The design had it beside the name.)
+PODIUM_FLAG = (36, 24)
+PODIUM_FLAG_OVERHANG = 10
+PODIUM_FLAG_TILT = 8
+
+
 def draw_podium_spot(canvas, index, player, animated=None):
-    """One podium place: the avatar tile above, the block with rank, flag,
-    name and time below. `index` is 0 for first.
+    """One podium place: the avatar tile above (crowned for first, with the
+    player's flag on its corner), the block with rank, name and time below.
+    `index` is 0 for first.
 
     With `animated` (a list), a player with an "effect" has their name left
     off and an AnimatedName spec for it appended instead.
@@ -1266,31 +1279,32 @@ def draw_podium_spot(canvas, index, player, animated=None):
     a_left, a_top, a_size, tilt, empty = avatar_box
     dark = rgba(outline)
 
+    # The crown and flag sit on the tile's corners and tilt with it.
+    pad = 40
+    side = a_size + 2 * pad
+    layer = Image.new("RGBA", (px(side), px(side)), (0, 0, 0, 0))
     tile = with_drop_shadow(
         framed_avatar(open_image(player.get("avatar_png")), a_size, 6, 22, empty, outline), 6)
+    place(layer, tile, pad, pad, a_size, a_size)
     if index == 0:
-        # The crown sits on the tile's top-left corner and tilts with it.
-        pad = 40
-        side = a_size + 2 * pad
-        layer = Image.new("RGBA", (px(side), px(side)), (0, 0, 0, 0))
-        place(layer, tile, pad, pad, a_size, a_size)
         place(layer, profile_icon("crown", 56), pad - 22, pad - 30, 56, 56, rotate=-22)
-        place(canvas, layer, a_left - pad, a_top - pad, side, side, rotate=tilt)
-    else:
-        place(canvas, tile, a_left, a_top, a_size, a_size, rotate=tilt)
+    flag = flag_tile(player.get("country"), *PODIUM_FLAG)
+    if flag:
+        flag_w, flag_h = PODIUM_FLAG[0] + 4, PODIUM_FLAG[1] + 4
+        place(layer, with_drop_shadow(flag, 3), pad + a_size - flag_w + PODIUM_FLAG_OVERHANG,
+              pad + a_size - flag_h, flag_w, flag_h, rotate=PODIUM_FLAG_TILT)
+    place(canvas, layer, a_left - pad, a_top - pad, side, side, rotate=tilt)
 
     rank = Text(str(player.get("rank", index + 1)), DISPLAY, 60, line_height=1,
                 stroke=10, stroke_color=dark, shadow=5)
-    flag = flag_tile(player.get("country"), 28, 19)
-    room = width - 16 - (32 + 6 if flag else 0)
+    room = width - 16
     style = dict(stroke=5, stroke_color=dark)
     effect = player.get("effect") if animated is not None else None
     if effect:
-        name = effect_name_text(player, 16, 8, room, style)
+        name = effect_name_text(player, PODIUM_NAME_SIZE, PODIUM_NAME_MIN, room, style)
     else:
-        name = player_name(player.get("name"), 16, 12, room, **style)
-    row_height = max(23 if flag else 0, name.height + 3)
-    row_width = (32 + 6 if flag else 0) + name.width
+        name = player_name(player.get("name"), PODIUM_NAME_SIZE, PODIUM_NAME_MIN, room, **style)
+    row_height = name.height + 3
     pill, pill_width, pill_height = time_pill(player.get("time") or "--", medal_tier(player))
     name_at = []
 
@@ -1298,11 +1312,7 @@ def draw_podium_spot(canvas, index, player, animated=None):
         # A column centred under padding 12px 8px 0, 6px apart.
         rank.draw(draw, (width - rank.width) / 2, 12)
         y = 12 + rank.height + 6
-        x = (width - row_width) / 2
-        if flag:
-            place(image, with_drop_shadow(flag, 2), x, y + (row_height - 23) / 2, 32, 23)
-            x += 32 + 6
-        name_at.append((x, y + (row_height - name.height - 3) / 2 + 3))
+        name_at.append(((width - name.width) / 2, y + 3))
         if not effect:
             name.draw(draw, *name_at[0])
         y += row_height + 6
@@ -1314,7 +1324,7 @@ def draw_podium_spot(canvas, index, player, animated=None):
     if effect:
         x, y = name_at[0]
         animated.append(dict(name=name, at=(left + x, top + y), effect=effect, outline=dark,
-                             stroke_scale=16 / NAME_SIZE, margin=HANDLE_MARGIN))
+                             stroke_scale=PODIUM_NAME_SIZE / NAME_SIZE, margin=HANDLE_MARGIN))
 
 
 def dashed_rule(draw, left, right, y, color, dash=6, gap=4):
@@ -1363,11 +1373,13 @@ def draw_sheet_row(image, draw, player, top, animated=None):
         # white base would lose on the cream paper: give it an ink outline,
         # as the map card's handle has.
         ink = rgba(NAME_INK)
-        name = effect_name_text(player, 17, 8, name_right - x, dict(stroke=4, stroke_color=ink))
+        name = effect_name_text(player, SHEET_NAME_SIZE, SHEET_NAME_MIN, name_right - x,
+                                dict(stroke=4, stroke_color=ink))
         animated.append(dict(name=name, at=(x, centred(name)), effect=effect, outline=ink,
-                             stroke_scale=17 / NAME_SIZE, margin=SHEET_NAME_MARGIN))
+                             stroke_scale=SHEET_NAME_SIZE / NAME_SIZE, margin=SHEET_NAME_MARGIN))
         return
-    name = player_name(player.get("name"), 17, 14, name_right - x, fill=rgba(NAME_INK))
+    name = player_name(player.get("name"), SHEET_NAME_SIZE, SHEET_NAME_MIN, name_right - x,
+                       fill=rgba(NAME_INK))
     name.draw(draw, x, centred(name))
 
 
