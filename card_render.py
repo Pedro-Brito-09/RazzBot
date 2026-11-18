@@ -1283,8 +1283,10 @@ def draw_podium_spot(canvas, index, player, animated=None):
     pad = 40
     side = a_size + 2 * pad
     layer = Image.new("RGBA", (px(side), px(side)), (0, 0, 0, 0))
+    # A missing avatar's "?" is outlined in a darker shade of the tile's colour.
+    mark_outline = "#%02X%02X%02X" % shade(rgba(empty), 0.6)
     tile = with_drop_shadow(
-        framed_avatar(open_image(player.get("avatar_png")), a_size, 6, 22, empty, outline), 6)
+        framed_avatar(open_image(player.get("avatar_png")), a_size, 6, 22, empty, mark_outline), 6)
     place(layer, tile, pad, pad, a_size, a_size)
     if index == 0:
         place(layer, profile_icon("crown", 56), pad - 22, pad - 30, 56, 56, rotate=-22)
