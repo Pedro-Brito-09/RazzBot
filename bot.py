@@ -9766,57 +9766,59 @@ def build_role_rules_view(rules, guild, *, admin=False, badge_names=None):
     view.add_item(container)
     return view
 
-async def achievements_card_for(caller, player):
-    """The badges and achievements card for a Discord user's linked Roblox
-    account (the caller's when `player` is None): (view, None), or (None, a
-    card saying why not)."""
-    target = player or caller
-    roblox_id = await fetch_linked_user_id(target.id)
-    if roblox_id is None:
-        who = "You haven't" if target.id == caller.id else f"**{target}** hasn't"
-        return None, simple_card(
-            f"{who} linked a Roblox account. Use `/link` first.",
-            colour=discord.Color.greyple(),
-        )
-    name = await fetch_username(roblox_id) or str(roblox_id)
-    view, error = await build_achievements_card(roblox_id, name)
+async def achievements_card_for(ctx, username):
+    """The badges and achievements card for a Roblox username, or the
+    caller's linked account without one: the view, or None once
+    resolve_command_user or the card has said why not. `ctx` only needs
+    .author and .send."""
+    user_id, canonical = await resolve_command_user(ctx, username)
+    if user_id is None:
+        return None
+    view, error = await build_achievements_card(user_id, canonical)
     if view is None:
-        return None, simple_card(error, colour=discord.Color.red())
-    return view, None
+        await ctx.send(error)
+    return view
+
+class InteractionReplies:
+    """Just enough of a Context for resolve_command_user: who ran a slash
+    command and a way to answer its deferred response."""
+
+    def __init__(self, interaction):
+        self.author = interaction.user
+        self._followup = interaction.followup
+
+    async def send(self, content=None, **kwargs):
+        return await self._followup.send(content, **kwargs)
 
 @bot.tree.command(
     name="achievements", description="See which badges and achievements a player has earned"
 )
-@app_commands.describe(player="Whose achievements to show. Defaults to you.")
+@app_commands.describe(username="Roblox username. Uses your linked account if omitted.")
 async def achievements_slash_command(
-    interaction: discord.Interaction, player: discord.User = None
+    interaction: discord.Interaction, username: str = None
 ):
     """The game's badges and the map achievements in one image card."""
     await interaction.response.defer()
     # Tree commands skip before_invoke, which tags the card's buttons with
     # who may press them.
     _active_invoker.set(interaction.user.id)
-    view, error = await achievements_card_for(interaction.user, player)
-    if view is None:
-        await interaction.followup.send(view=error)
-        return
-    view.message = await interaction.followup.send(
-        view=view, files=view.card_files(), wait=True
-    )
+    view = await achievements_card_for(InteractionReplies(interaction), username)
+    if view is not None:
+        view.message = await interaction.followup.send(
+            view=view, files=view.card_files(), wait=True
+        )
 
 # Listed in /help (the slash command is tree-only, so this is its entry);
 # add and remove are admin-only.
 @bot.group(name="achievements", invoke_without_command=True,
            description="See which badges and achievements a player has earned")
-async def admin_achievements(ctx, player: discord.User = None):
-    """!achievements [player]: the badges and achievements card, as
+async def admin_achievements(ctx, username: str = None):
+    """!achievements [username]: the badges and achievements card, as
     /achievements. `rules`, `add` and `remove` manage the roles."""
     async with ctx.typing():
-        view, error = await achievements_card_for(ctx.author, player)
-    if view is None:
-        await ctx.send(view=error)
-        return
-    view.message = await ctx.send(view=view, files=view.card_files())
+        view = await achievements_card_for(ctx, username)
+    if view is not None:
+        view.message = await ctx.send(view=view, files=view.card_files())
 
 @admin_achievements.command(name="rules")
 async def admin_achievements_rules(ctx):
