@@ -6838,6 +6838,119 @@ async def run_process(*args, shell=False, timeout=60):
     else:
         process = await asyncio.create_subprocess_exec(*args, **options)
     try:
+# The stats card's banner picture; its colours also make the backdrop.
+STATS_THUMBNAIL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "assets", "stats", "thumbnail.webp")
+
+def pick_stats_thumbnail():
+    """The banner picture's path, or None if it's missing (a sky stands in)."""
+    return STATS_THUMBNAIL if os.path.exists(STATS_THUMBNAIL) else None
+
+def read_file_bytes(path):
+    with open(path, "rb") as file:
+        return file.read()
+
+async def render_game_stats_card(stats, thumbnail_path):
+    """The /stats card's PNG bytes from fetch_game_stats' dict."""
+    icon_url = stats.get("iconUrl")
+    icon_png, maps, thumbnail_png = await asyncio.gather(
+        download_bytes(icon_url, "stats icon") if icon_url else asyncio.sleep(0),
+        get_community_maps(),
+        asyncio.to_thread(read_file_bytes, thumbnail_path) if thumbnail_path
+        else asyncio.sleep(0),
+    )
+    maps = maps or {}
+    return await asyncio.to_thread(
+        card_render.render_stats_card,
+        name=stats.get("name"), icon_png=icon_png, thumbnail_png=thumbnail_png,
+        playing=stats.get("playing"), visits=stats.get("visits"),
+        favourites=stats.get("favoritedCount"), server_size=stats.get("maxPlayers"),
+        total_maps=len(maps) if maps else None,
+        public_maps=len(public_maps(maps)) if maps else None,
+        likes=stats.get("upVotes"), dislikes=stats.get("downVotes"),
+        created=parse_roblox_time(stats.get("created")),
+        updated=parse_roblox_time(stats.get("updated")),
+    )
+
+class GameStatsCardView(CardView):
+    """The live game numbers as a rendered card, with Game page and Refresh.
+
+    On trial behind !teststats before it replaces /stats' text card. Refresh
+    keeps the banner picture, so only the numbers change.
+    """
+
+    def __init__(self, stats, card_image, thumbnail_path):
+        super().__init__()
+        self.thumbnail_path = thumbnail_path
+        self.build(stats, card_image)
+
+    def build(self, stats, card_image):
+        self.clear_items()
+        self.stats = stats
+        self.card_image = card_image
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(media="attachment://game.png",
+                         description=(stats.get("name") or "The game") + " live stats")
+        self.add_item(gallery)
+
+        # Relative times stay current as Discord timestamps, not in the picture.
+        footer = []
+        updated = parse_roblox_time(stats.get("updated"))
+        if updated:
+            footer.append(f"updated <t:{updated}:R>")
+        footer.append(f"fetched <t:{int(time.time())}:R>")
+        text = "-# " + "  ·  ".join(footer)
+        note = dev_universe_note()
+        if note:
+            text += "\n" + note
+        self.add_item(discord.ui.TextDisplay(text))
+
+        path = stats.get("canonicalUrlPath")
+        refresh = discord.ui.Button(
+            label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄",
+        )
+        refresh.callback = self.refresh
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(
+            label="Game page", style=discord.ButtonStyle.link,
+            url=f"https://www.roblox.com{path}" if path else GAME_URL,
+        ))
+        row.add_item(refresh)
+        self.add_item(row)
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_image), filename="game.png")]
+
+    @keeps_context
+    async def refresh(self, interaction):
+        await interaction.response.defer()
+        stats = await fetch_game_stats(current_universe())
+        if stats is None:
+            await interaction.followup.send(
+                "Couldn't reach the game page right now. Try again in a bit.",
+                ephemeral=True,
+            )
+            return
+        self.build(stats, await render_game_stats_card(stats, self.thumbnail_path))
+        await show_card(interaction, self)
+
+@bot.command(name="teststats", hidden=True)
+@commands.is_owner()
+async def test_stats_card(ctx):
+    """Owner-only preview of the image /stats card, before /stats uses it."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    async with ctx.typing():
+        stats = await fetch_game_stats(current_universe())
+        if stats is None:
+            await ctx.send("Couldn't reach the game page right now. Try again in a bit.")
+            return
+        thumbnail_path = pick_stats_thumbnail()
+        image = await render_game_stats_card(stats, thumbnail_path)
+        view = GameStatsCardView(stats, image, thumbnail_path)
+    view.message = await ctx.send(view=view, files=view.card_files())
+
         output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         try:

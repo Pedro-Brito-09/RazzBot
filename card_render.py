@@ -2856,3 +2856,268 @@ def render_versus_card(*, left, right):
                 image.paste(name.patch(index / frames_count), name.at)
 
         return encode_lazy_animation(still, frames_count, draw_frame, delay), "webp"
+
+
+# ---------------------------------------------------------------- game stats card
+
+# 960x640: the game thumbnail as a 270px banner with a torn bottom edge, the
+# icon and name over its bottom-left, then two rows of strips over the
+# thumbnail's colours, lightest at the top, and a footer.
+STATS_WIDTH, STATS_HEIGHT = 960, 640
+STATS_BANNER_HEIGHT = 270
+# The torn edge the backdrop cuts into the banner's bottom: (x %, y px from
+# the card's top), the template's 40px strip at 250px drawn as clip-path.
+STATS_TORN_EDGE = ((0, 270), (8, 258), (18, 274), (30, 260), (42, 272), (55, 256),
+                   (68, 270), (80, 258), (92, 272), (100, 262))
+# The game's name: 46px, shrinking to 30px, then cut with "…".
+STATS_NAME_SIZE, STATS_NAME_MIN = 46, 30
+# Two rows across 900px with 14px gaps: 1.15fr 1fr 1fr 1fr, then 1fr 1fr 2fr.
+STATS_ROW_LEFT, STATS_ROW_WIDTH, STATS_GAP = 30, 900, 14
+STATS_ROW1_TOP, STATS_ROW2_TOP = 320, 446
+STATS_BIG_HEIGHT, STATS_SMALL_HEIGHT = 104, 82
+VOTE_PURPLE, LIKE_GREEN, DISLIKE_RED = "#3D2490", "#8BE04E", "#FF6B6B"
+# The like bar's spikes, in px: both ends of the track and of the green are
+# cut alike, the achievements track's shape at its 300px size.
+VOTE_SPIKE, VOTE_SPIKE_MID = 4.5, 3.6
+
+
+def vote_bar_clip(width):
+    """Two shallow spikes at each end of a `width`-px bar, as clip-path %."""
+    edge, mid = VOTE_SPIKE / width * 100, VOTE_SPIKE_MID / width * 100
+    return ((edge, 0), (100 - edge, 0), (100, 25), (100 - mid, 50), (100, 75),
+            (100 - edge, 100), (edge, 100), (0, 75), (mid, 50), (0, 25))
+# The banner picture's sky, light at the top to deep blue at the bottom: the
+# picture's own two main colours (grey-blue, brown) fought with the strips.
+STATS_BACKDROP_COLORS = ((128, 204, 255), (36, 108, 214))
+
+
+def stats_icon(name, size):
+    return load_icon("stats", name, size)
+
+
+def stats_columns(fractions):
+    """(left, width) of each grid column across the row, in design px."""
+    free = STATS_ROW_WIDTH - STATS_GAP * (len(fractions) - 1)
+    unit = free / sum(fractions)
+    left, columns = STATS_ROW_LEFT, []
+    for fraction in fractions:
+        columns.append((left, unit * fraction))
+        left += unit * fraction + STATS_GAP
+    return columns
+
+
+def stats_banner(thumbnail):
+    """The thumbnail across the top, darkening towards its torn bottom edge.
+    Without one, the map card's empty-photo sky."""
+    width, height = px(STATS_WIDTH), px(STATS_BANNER_HEIGHT)
+    if thumbnail is not None:
+        banner = cover_crop(thumbnail, width, height)
+    else:
+        banner = map_backdrop(*NO_THUMBNAIL_PHOTO_COLORS, STATS_WIDTH,
+                              STATS_BANNER_HEIGHT)[0].copy()
+    banner.alpha_composite(vertical_gradient(width, height, (
+        (0.0, (20, 20, 60, 0)), (0.45, (20, 20, 60, 0)), (1.0, (20, 20, 60, 115)),
+    )))
+    outline = ((0, 0), (100, 0)) + tuple(
+        (x, min(y, STATS_BANNER_HEIGHT) / STATS_BANNER_HEIGHT * 100)
+        for x, y in reversed(STATS_TORN_EDGE))
+    return clip_to(banner, polygon_mask(STATS_WIDTH, STATS_BANNER_HEIGHT, outline))
+
+
+def draw_live_tag(canvas):
+    """The red LIVE tag: a white dot in a faint ring, then LIVE, +3deg."""
+    label = Text("LIVE", DISPLAY, 22, stroke=6, stroke_color=rgba("#9E1C22"))
+    inner = max(14, label.height)
+    width, height = 14 + 14 + 8 + label.width + 18, 6 + inner + 3
+
+    def content(image, draw):
+        # The dot's 4px box-shadow ring reaches past its 14px.
+        for diameter, color in ((22, (255, 255, 255, 89)), (14, WHITE)):
+            def paint(d, k, diameter=diameter):
+                d.ellipse((0, 0, diameter * k - 1, diameter * k - 1), fill=255)
+            offset = (14 - diameter) / 2
+            body = clip_to(solid(diameter, diameter, color),
+                           shape_mask(diameter, diameter, paint))
+            image.alpha_composite(body, (px(14 + offset),
+                                         px(6 + (inner - 14) / 2 + offset)))
+        # Luckiest Guy sits high in its box; nudged 3px down like the tags.
+        label.draw(draw, 14 + 14 + 8, 6 + (inner - label.height - 3) / 2 + 3)
+
+    body = strip(width, height, rgba("#E8333A"), CLIP_MEDAL, content)
+    place(canvas, with_drop_shadow(body, 4), 28, 24, width, height, rotate=3)
+
+
+def draw_game_name(canvas, name):
+    """The purple name strip, from 132px in, its top at 210px, -1.5deg."""
+    style = dict(line_height=1, stroke=8, stroke_color=rgba("#5E37B8"), shadow=4)
+    room = STATS_WIDTH - 132 - 30 - 32 - 30
+    text = (fit_text(name, DISPLAY, STATS_NAME_SIZE, room, min_size=STATS_NAME_MIN, **style)
+            or ellipsize(name, DISPLAY, STATS_NAME_MIN, room, **style))
+    width, height = 30 + text.width + 32, 10 + text.height + 6
+    body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER,
+                 lambda image, draw: text.draw(draw, 30, 10))
+    # A smaller name keeps the strip's bottom where the full-size one sits.
+    top = 210 + (STATS_NAME_SIZE - text.height)
+    place(canvas, with_drop_shadow(body, 5), 132, top, width, height, rotate=-1.5)
+
+
+def draw_stats_strip(canvas, left, top, width, height, icon, value, caption, fill,
+                     outline, *, icon_size=40, pad_x=16, caption_size=19, rotate=0,
+                     shadow=4):
+    """A torn stat strip: icon, then the value over its caption."""
+    label = Text(caption, HAND, caption_size, line_height=1.1, stroke=4,
+                 stroke_color=rgba(outline))
+
+    def content(image, draw):
+        paste_icon(image, stats_icon(icon, icon_size), pad_x, (height - icon_size) / 2)
+        text_left = pad_x + icon_size + 12
+        text_top = (height - value.height - label.height) / 2
+        value.draw(draw, text_left, text_top)
+        label.draw(draw, text_left, text_top + value.height)
+
+    body = strip(width, height, rgba(fill), CLIP_STAT, content)
+    place(canvas, with_drop_shadow(body, shadow), left, top, width, height, rotate=rotate)
+
+
+def stats_value(value, outline, room, size=28, min_size=20, stroke=7, shadow=0):
+    """A strip's number: full, shrunk, then shortened (10.2M). None is "—"."""
+    style = dict(line_height=1, stroke=stroke, stroke_color=rgba(outline), shadow=shadow)
+    text = value if isinstance(value, str) else format_count(value)
+    fitted = fit_text(text, DISPLAY, size, room, min_size=min_size, **style)
+    if fitted is None and isinstance(value, (int, float)):
+        fitted = fit_text(compact_count(value), DISPLAY, size, room, min_size=16, **style)
+    return fitted or ellipsize(text, DISPLAY, 16, room, **style)
+
+
+def draw_vote_bar(canvas, left, width, bottom, likes, dislikes):
+    """The likes / % liked / dislikes labels over the approval bar.
+    Without votes (or when they couldn't be read) the bar is empty."""
+    voted = isinstance(likes, int) and isinstance(dislikes, int) and likes + dislikes > 0
+    percent = round(likes / (likes + dislikes) * 100) if voted else 0
+    labels = (
+        Text(f"{format_count(likes)} like{'' if likes == 1 else 's'}" if voted else "", DISPLAY, 17,
+             stroke=5, stroke_color=rgba("#3F8F1E")),
+        Text(f"{percent}% liked" if voted else "no votes yet", DISPLAY, 22,
+             stroke=6, stroke_color=rgba(VOTE_PURPLE), shadow=3),
+        Text(f"{format_count(dislikes)} dislike{'' if dislikes == 1 else 's'}" if voted else "", DISPLAY, 17,
+             stroke=5, stroke_color=rgba("#C23A2E")),
+    )
+    # The achievements card's jagged progress bar, the green part liked,
+    # its green spiked at both ends like the track.
+    bar_height, fill_height = 32, 22
+    bar_top = bottom - bar_height
+    row_bottom = bar_top - 6
+    # justify-content: space-between inside 4px padding, bottoms aligned.
+    spare = (width - 8 - sum(t.width for t in labels)) / 2
+    x = left + 4
+    draw = ImageDraw.Draw(canvas)
+    for text in labels:
+        text.draw(draw, x, row_bottom - text.height)
+        x += text.width + spare
+
+    # Green from the left for the likes, red after it for the dislikes. The
+    # red starts under the green's spiked end, so the two touch with the
+    # green's spikes pointing into the red. No votes: an empty track.
+    inner = width - 10
+    if not voted:
+        green_width = red_width = 0
+    elif dislikes == 0:
+        green_width, red_width = inner, 0
+    elif likes == 0:
+        green_width, red_width = 0, inner
+    else:
+        green_width = min(inner - 12, max(12, inner * likes / (likes + dislikes)))
+        red_width = inner - green_width + VOTE_SPIKE
+
+    def segment(fill_width, color, clip):
+        def content(image, draw):
+            # The shine: left 6px, right 12px, as the achievements bar's.
+            shine_width = fill_width - 6 - 12
+            if shine_width > 5:
+                shine = clip_to(solid(shine_width, 5, (255, 255, 255, 115)),
+                                rounded_mask(shine_width, 5, 2.5))
+                image.alpha_composite(shine, (px(6), px(3)))
+        return strip(fill_width, fill_height, rgba(color), clip, content)
+
+    def track_content(image, draw):
+        if red_width:
+            clip = vote_bar_clip(red_width)
+            if green_width:
+                # Its left end hides under the green: square it off.
+                clip = ((0, 0),) + clip[1:6] + ((0, 100),)
+            image.alpha_composite(segment(red_width, DISLIKE_RED, clip),
+                                  (px(5 + inner - red_width), px(5)))
+        if green_width:
+            image.alpha_composite(segment(green_width, LIKE_GREEN,
+                                          vote_bar_clip(green_width)), (px(5), px(5)))
+
+    bar = strip(width, bar_height, rgba("#5E37B8"), vote_bar_clip(width), track_content)
+    place(canvas, with_drop_shadow(bar, 4), left, bar_top, width, bar_height, rotate=-1)
+
+
+def compose_stats_card(*, name, icon_png=None, thumbnail_png=None, playing=None,
+                       visits=None, favourites=None, server_size=None, total_maps=None,
+                       public_maps=None, likes=None, dislikes=None, created=None,
+                       updated=None):
+    thumbnail = open_image(thumbnail_png)
+    backdrop, footer_outline = map_backdrop(*STATS_BACKDROP_COLORS, STATS_WIDTH, STATS_HEIGHT)
+    canvas = backdrop.copy()
+    canvas.alpha_composite(stats_banner(thumbnail))
+
+    draw_live_tag(canvas)
+    draw_game_name(canvas, drawable_text(name or "", DISPLAY) or "The game")
+    icon = framed_avatar(open_image(icon_png), 120, 6, 24, "#0F1B33", "#2A3B5E")
+    place(canvas, with_drop_shadow(icon, 6), 30, 180, 120, 120, rotate=-4)
+
+    # Row one: the big "playing now" strip, centred against three smaller ones.
+    (big_left, big_width), *smalls = stats_columns((1.15, 1, 1, 1))
+    big_value = stats_value(playing, "#3F8F1E", big_width - 18 - 58 - 12 - 18,
+                            size=52, min_size=34, stroke=9, shadow=4)
+    draw_stats_strip(canvas, big_left, STATS_ROW1_TOP, big_width, STATS_BIG_HEIGHT,
+                     "gamepad", big_value, "playing now", LIKE_GREEN, "#3F8F1E",
+                     icon_size=58, pad_x=18, caption_size=21, rotate=-1.5, shadow=5)
+    small_top = STATS_ROW1_TOP + (STATS_BIG_HEIGHT - STATS_SMALL_HEIGHT) / 2
+    server = f"{format_count(server_size)} players" if server_size else None
+    for (left, width), (icon_name, value, caption, fill, outline) in zip(smalls, (
+            ("visits", visits, "visits", "#6CC4F4", "#2A78B8"),
+            ("favorites", favourites, "favorites", "#FFD64F", "#A87A00"),
+            ("server", server, "server size", "#A57CF7", "#5E37B8"))):
+        number = stats_value(value, outline, width - 16 - 40 - 12 - 16)
+        draw_stats_strip(canvas, left, small_top, width, STATS_SMALL_HEIGHT, icon_name,
+                         number, caption, fill, outline)
+
+    # Row two: the map counts and the votes, bottoms aligned.
+    columns = stats_columns((1, 1, 2))
+    for (left, width), (icon_name, value, caption, fill, outline) in zip(columns, (
+            ("total-maps", total_maps, "total maps", "#7FE8C2", "#239372"),
+            ("public-maps", public_maps, "public maps", "#FF7A6B", "#C23A2E"))):
+        number = stats_value(value, outline, width - 16 - 40 - 12 - 16)
+        draw_stats_strip(canvas, left, STATS_ROW2_TOP, width, STATS_SMALL_HEIGHT,
+                         icon_name, number, caption, fill, outline)
+    vote_left, vote_width = columns[2]
+    draw_vote_bar(canvas, vote_left, vote_width, STATS_ROW2_TOP + STATS_SMALL_HEIGHT,
+                  likes, dislikes)
+
+    # Relative times would go stale in a picture: the message under the card
+    # carries those as Discord timestamps.
+    parts = []
+    if created is not None:
+        parts.append(f"created {format_date(created)}")
+    if updated is not None:
+        parts.append(f"updated {format_date(updated)}")
+    if parts:
+        footer = Text(" · ".join(parts), HAND, 21)
+        draw_glowing_text(canvas, [(footer, (STATS_WIDTH - footer.width) / 2,
+                                    STATS_HEIGHT - 14 - footer.height)], footer_outline)
+
+    return clip_to(canvas, rounded_mask(STATS_WIDTH, STATS_HEIGHT, 24))
+
+
+def render_stats_card(**fields):
+    """The /stats card as PNG bytes.
+
+    `thumbnail_png` fills the banner, over a fixed sky-blue backdrop;
+    `icon_png` is the game icon. Numbers may be None when they
+    couldn't be read; `created` / `updated` are Unix timestamps or None.
+    """
+    return png_bytes(compose_stats_card(**fields))
