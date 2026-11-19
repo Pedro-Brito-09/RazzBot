@@ -2596,13 +2596,17 @@ def render_maps_card(**fields):
 
 # ---------------------------------------------------------------- versus card
 
-VERSUS_WIDTH, VERSUS_HEIGHT = 960, 640
-# (icon, label), in the rows' order: what /compare lines up.
+# The template's 640px, less the 40px the grass hill took between the
+# papers and the summary.
+VERSUS_WIDTH, VERSUS_HEIGHT = 960, 600
+# (icon, label), in the rows' order: what /compare lines up. The first four
+# are white icons outlined in each side's ink, from assets/versus as
+# "<icon>-<outline hex>.png"; the medals are the profile's.
 VERSUS_STATS = (
     ("trophy", "Wins"),
     ("fire", "Win streak"),
     ("star", "Stars"),
-    ("trend", "All-time stars"),
+    ("arrow-up", "All-time stars"),
     ("medal-diamond", "Diamond medals"),
     ("medal-gold", "Gold medals"),
     ("medal-silver", "Silver medals"),
@@ -2632,6 +2636,14 @@ VERSUS_NAME_SIZE, VERSUS_NAME_MIN = 30, 24
 # (paper fill, outline) for the left and right player.
 VERSUS_SIDES = (("#6CC4F4", "#2A78B8"), ("#FF7A6B", "#C23A2E"))
 VS_PURPLE, VS_INK = "#A57CF7", "#5E37B8"
+
+
+def versus_icon(name, outline_hex, size):
+    """A row's icon: the medals are the profile's, the rest come outlined
+    in the side's ink."""
+    if name.startswith("medal-"):
+        return profile_icon(name, size)
+    return load_icon("versus", f"{name}-{outline_hex.lstrip('#').upper()}", size)
 
 
 def versus_paper_left(side):
@@ -2695,7 +2707,8 @@ def versus_paper(side, player, values, wins, score, name):
                           rounded_mask(PAPER_INNER, VERSUS_ROW, 8))
             image.alpha_composite(row, (px(PAPER_PAD_X), px(top)))
             left = PAPER_PAD_X + 8
-            paste_icon(image, profile_icon(icon, 32), left, top + (VERSUS_ROW - 32) / 2)
+            paste_icon(image, versus_icon(icon, outline_hex, 32), left,
+                       top + (VERSUS_ROW - 32) / 2)
             caption = Text(label, HAND, 18, stroke=4, stroke_color=outline)
             caption.draw(draw, left + 40, top + (VERSUS_ROW - caption.height) / 2)
             # padding-right 12px; the crown's -4px margin pulls it 4px past that.
@@ -2713,7 +2726,7 @@ def versus_paper(side, player, values, wins, score, name):
 
 def draw_versus_backdrop(canvas, players):
     """Each player's profile background on their half, split along the
-    ragged line, with the grass hill along the bottom."""
+    ragged line."""
     for side, player in enumerate(players):
         half, _ = player_backdrop(player.get("username"), open_image(player.get("avatar_png")),
                                   open_image(player.get("background_png")),
@@ -2725,15 +2738,6 @@ def draw_versus_backdrop(canvas, players):
         layer.alpha_composite(half, (px(VERSUS_WIDTH - HALF_WIDTH), 0))
         canvas.alpha_composite(clip_to(layer, polygon_mask(VERSUS_WIDTH, VERSUS_HEIGHT,
                                                            CLIP_RIGHT_HALF)))
-
-    # The hill: a 1080 x 190 ellipse at left -60px, bottom -120px.
-    top = VERSUS_HEIGHT + 120 - 190
-
-    def paint(draw, k):
-        draw.ellipse((-60 * k, 0, 1020 * k, 190 * k), fill=255)
-    hill = solid(VERSUS_WIDTH, VERSUS_HEIGHT - top, rgba("#4F8E3A"))
-    canvas.alpha_composite(clip_to(hill, shape_mask(VERSUS_WIDTH, VERSUS_HEIGHT - top, paint)),
-                           (0, px(top)))
 
 
 def draw_vs_sticker(canvas):
@@ -2761,7 +2765,7 @@ def draw_vs_sticker(canvas):
 
 
 def draw_versus_footer(canvas, text):
-    """The summary on a purple strip over the grass, centred, -1deg."""
+    """The summary on a purple strip at the bottom, centred, -1deg."""
     label = ellipsize(text, DISPLAY, 22, VERSUS_WIDTH - 200,
                       stroke=6, stroke_color=rgba(VS_INK))
     width, height = 26 + label.width + 26, 6 + label.height + 3
