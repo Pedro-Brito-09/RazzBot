@@ -6808,7 +6808,10 @@ async def render_game_stats_card(stats, thumbnail_path):
         playing=stats.get("playing"), visits=stats.get("visits"),
         favourites=stats.get("favoritedCount"), server_size=stats.get("maxPlayers"),
         total_maps=len(maps) if maps else None,
-        public_maps=len(public_maps(maps)) if maps else None,
+        # The card's public count takes in unlisted maps too.
+        public_maps=(sum(1 for m in maps.values()
+                         if m.get("Privacy") in ("Public", "Unlisted"))
+                     if maps else None),
         likes=stats.get("upVotes"), dislikes=stats.get("downVotes"),
         created=parse_roblox_time(stats.get("created")),
         updated=parse_roblox_time(stats.get("updated")),
