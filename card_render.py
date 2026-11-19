@@ -2599,9 +2599,9 @@ def render_maps_card(**fields):
 # The template's 640px, less the 40px the grass hill took between the
 # papers and the summary.
 VERSUS_WIDTH, VERSUS_HEIGHT = 960, 600
-# (icon, label), in the rows' order: what /compare lines up. The first four
-# are white icons outlined in each side's ink, from assets/versus as
-# "<icon>-<outline hex>.png"; the medals are the profile's.
+# (icon, label), in the rows' order: what /compare lines up. The first four,
+# like the winner's crown, are white icons outlined in each side's ink, from
+# assets/versus as "<icon>-<outline hex>.png"; the medals are the profile's.
 VERSUS_STATS = (
     ("trophy", "Wins"),
     ("fire", "Win streak"),
@@ -2693,7 +2693,7 @@ def versus_paper(side, player, values, wins, score, name):
     column_top = PAPER_PAD_TOP + (VERSUS_AVATAR - VERSUS_NAME_SIZE - won.height) / 2
     text_left = PAPER_PAD_X + VERSUS_AVATAR + 14
     name_at = (text_left, column_top + (VERSUS_NAME_SIZE - name.height) / 2)
-    crown = profile_icon("crown", 28)
+    crown = versus_icon("crown", outline_hex, 28)
 
     def content(image, draw):
         place(image, with_drop_shadow(avatar, 5, color=LIGHT_SHADOW),
