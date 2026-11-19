@@ -3199,7 +3199,29 @@ def pool_photo_placeholder():
     return image
 
 
+# The veto's marks: a torn stamp across the photo, (fill, outline, tilt).
+POOL_STAMPS = {
+    "banned": ("BANNED", "#FF6B5E", "#8E1F16", -8),
+    "picked": ("PICKED", "#8BE04E", "#3E7A1A", -6),
+}
+BANNED_INK = "#C23A2E"
+BANNED_NAME_INK = "#8A86A0"
+
+
+def pool_stamp(kind):
+    word, fill, outline, tilt = POOL_STAMPS[kind]
+    label = Text(word, DISPLAY, 34, stroke=8, stroke_color=rgba(outline))
+    width, height = 18 + label.width + 18, 8 + label.height + 2
+    body = strip(width, height, rgba(fill), CLIP_TAG,
+                 lambda image, draw: label.draw(draw, 18, 8))
+    return with_drop_shadow(body, 4), width, height, tilt
+
+
 def pool_polaroid(entry):
+    """One map's polaroid. A map with `banned_by` (a name) is greyed out,
+    stamped BANNED and says who banned it (`auto` for a timed-out ban); a
+    `picked` one is stamped PICKED."""
+    banned = entry.get("banned_by") is not None
     paper = clip_to(solid(POOL_SLOT, POOL_SLOT_HEIGHT, rgba("#FFFDF4")),
                     rounded_mask(POOL_SLOT, POOL_SLOT_HEIGHT, 6))
     thumbnail = open_image(entry.get("thumbnail_png"))
@@ -3208,28 +3230,46 @@ def pool_polaroid(entry):
         photo.alpha_composite(cover_crop(thumbnail, photo.width, photo.height))
     else:
         photo = pool_photo_placeholder().copy()
+    if banned:
+        grey = photo.convert("L").convert("RGBA")
+        photo = Image.blend(grey, Image.new("RGBA", grey.size, rgba("#1A1F3A")), 0.35)
     paper.alpha_composite(clip_to(photo, rounded_mask(POOL_PHOTO_WIDTH, POOL_PHOTO_HEIGHT, 4)),
                           (px(8), px(8)))
 
-    ink = rgba(CUP_INK)
+    kind = "banned" if banned else "picked" if entry.get("picked") else None
+    if kind:
+        stamp, width, height, tilt = pool_stamp(kind)
+        place(paper, stamp, 8 + (POOL_PHOTO_WIDTH - width) / 2,
+              8 + (POOL_PHOTO_HEIGHT - height) / 2, width, height, rotate=tilt)
+
+    ink = rgba(BANNED_NAME_INK if banned else CUP_INK)
     draw = ImageDraw.Draw(paper)
     left, top = 8 + 4, 8 + POOL_PHOTO_HEIGHT + 6 + 2
+    room = POOL_PHOTO_WIDTH - 8
     name = drawable_text(entry.get("name") or "", DISPLAY) or "Unknown Map"
-    ellipsize(name, DISPLAY, 22, POOL_PHOTO_WIDTH - 8, line_height=1.15,
+    ellipsize(name, DISPLAY, 22, room, line_height=1.15,
               stroke=6, stroke_color=ink).draw(draw, left, top)
-    Text(f"#{entry.get('id', '?')}", HAND, 15, line_height=1.1,
-         fill=ink).draw(draw, left, top + 22 * 1.15)
+    if banned:
+        who = drawable_text(entry["banned_by"], HAND) or "someone"
+        detail = f"banned by {who}" + (" · timed out" if entry.get("auto") else "")
+        ellipsize(detail, HAND, 15, room, line_height=1.1,
+                  fill=rgba(BANNED_INK)).draw(draw, left, top + 22 * 1.15)
+    else:
+        Text(f"#{entry.get('id', '?')}", HAND, 15, line_height=1.1,
+             fill=ink).draw(draw, left, top + 22 * 1.15)
     return paper
 
 
-def compose_tournament_pool_card(*, name, date="", maps=()):
+def compose_tournament_pool_card(*, name, date="", maps=(), subtitle=None):
     canvas = pool_backdrop()
     date_left = draw_pool_date(canvas, date) if date else POOL_WIDTH - 30
     draw_pool_title(canvas, name, date_left - POOL_TITLE_GAP)
     maps = list(maps)
     count = len(maps)
-    subtitle = Text(f"Map pool · {count} map{'' if count == 1 else 's'}", HAND, 26)
-    draw_glowing_text(canvas, [(subtitle, 44, 110)], rgba("#2160B8"))
+    if subtitle is None:
+        subtitle = f"Map pool · {count} map{'' if count == 1 else 's'}"
+    text = shrink_to_fit(subtitle, HAND, 26, POOL_WIDTH - 2 * 44, min_size=16)
+    draw_glowing_text(canvas, [(text, 44, 110)], rgba("#2160B8"))
 
     for row_start in range(0, count, POOL_COLUMNS):
         row = maps[row_start:row_start + POOL_COLUMNS]
@@ -3251,6 +3291,8 @@ def render_tournament_pool_card(**fields):
     `name` is the tournament's, on the banner; `date` the text on the tag
     top-right (left off when empty). `maps` is the pool in order (5, laid
     out 3 + 2), each a dict: id, name, thumbnail_png (bytes, or None for
-    the empty-photo sky).
+    the empty-photo sky), and in a veto banned_by (the banner's name) with
+    auto (timed out), or picked for the map left standing. `subtitle`
+    replaces "Map pool · 5 maps".
     """
     return png_bytes(compose_tournament_pool_card(**fields))

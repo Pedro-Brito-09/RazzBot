@@ -11814,25 +11814,70 @@ class TournamentCheckinView(discord.ui.LayoutView):
         await handle_checkin(interaction)
 
 TOURNAMENT_POOL_FILENAME = "map-pool.png"
+# The match card's veto shows the pool card, banned maps stamped, in place
+# of the list. Off until the image tournament cards go live; !testveto
+# previews it either way.
+MATCH_VETO_POOL_CARD = False
+# A pool's thumbnails, by tournament: (expiry, {map id: PNG bytes or None}).
+# Every ban re-renders the card, and the pictures don't change mid-match.
+POOL_THUMBNAIL_TTL = 3600
+_pool_thumbnails = {}
 
-async def render_tournament_pool(record):
+async def pool_thumbnails(record):
+    now = time.monotonic()
+    key = str(record.get("Id"))
+    cached = _pool_thumbnails.get(key)
+    ids = [entry["Id"] for entry in record["Pool"]]
+    if cached and cached[0] > now and all(map_id in cached[1] for map_id in ids):
+        return cached[1]
+    maps_by_id = await get_community_maps() or {}
+    pngs = await asyncio.gather(*(
+        fetch_map_thumbnail_png(maps_by_id.get(map_id)) for map_id in ids))
+    # Only one tournament's are kept: one runs at a time.
+    _pool_thumbnails.clear()
+    _pool_thumbnails[key] = (now + POOL_THUMBNAIL_TTL, dict(zip(ids, pngs)))
+    return _pool_thumbnails[key][1]
+
+async def render_tournament_pool(record, match=None):
     """The record's map pool as the rendered card's PNG, or None without a
-    pool or Pillow. Thumbnails come from the map index, as open_checkin's do."""
+    pool or Pillow. Thumbnails come from the map index, as open_checkin's do.
+
+    With a `match` in its veto, its bans are stamped on and the subtitle
+    says whose ban it is; once it's playing, the map left is stamped picked.
+    """
     if card_render is None or not record.get("Pool"):
         return None
-    maps_by_id = await get_community_maps() or {}
-    thumbnails = await asyncio.gather(*(
-        fetch_map_thumbnail_png(maps_by_id.get(entry["Id"]))
-        for entry in record["Pool"]
-    ))
-    maps = [{"id": entry["Id"], "name": entry.get("Name"), "thumbnail_png": png}
-            for entry, png in zip(record["Pool"], thumbnails)]
-    start = record.get("MatchesStart")
+    thumbnails = await pool_thumbnails(record)
+    bans = {ban["Map"]: ban for ban in (match or {}).get("Bans") or []}
+    picked = (match or {}).get("Map") if (match or {}).get("State") == "playing" else None
+    maps = []
+    for entry in record["Pool"]:
+        item = {"id": entry["Id"], "name": entry.get("Name"),
+                "thumbnail_png": thumbnails.get(entry["Id"])}
+        ban = bans.get(entry["Id"])
+        if ban:
+            item.update(banned_by=player_name(record, ban["By"]), auto=bool(ban.get("Auto")))
+        elif picked == entry["Id"]:
+            item["picked"] = True
+        maps.append(item)
+    subtitle = None
+    tag = card_render.format_date(record["MatchesStart"]) if record.get("MatchesStart") else ""
+    if match is not None:
+        tag = f"Match {match['Code']}" if match.get("Code") else ""
+        left = len(record["Pool"]) - len(bans)
+        if picked is not None:
+            subtitle = f"Playing {pool_entry(record, picked)['Name']}"
+        elif ban_turn(match):
+            subtitle = (f"Map veto · {left} map{'' if left == 1 else 's'} left · "
+                        f"{player_name(record, ban_turn(match))} to ban")
+        else:
+            subtitle = "Map veto"
     return await asyncio.to_thread(
         card_render.render_tournament_pool_card,
         name=record["Name"],
-        date=card_render.format_date(start) if start else "",
+        date=tag,
         maps=maps,
+        subtitle=subtitle,
     )
 
 async def fake_checkin_tournament():
@@ -13656,8 +13701,18 @@ def tournament_match_url(record, match_id):
     return TOURNAMENT_MATCH_URL_TEMPLATE.format(
         place_id=place_id, match_id=quote(str(match_id), safe=""))
 
-def match_card(record, match_id, match):
-    """The one message in a match thread, rendered for its current state."""
+def pool_card_gallery(record):
+    gallery = discord.ui.MediaGallery()
+    gallery.add_item(media=f"attachment://{TOURNAMENT_POOL_FILENAME}",
+                     description=f"{record['Name']} map pool")
+    return gallery
+
+def match_card(record, match_id, match, pool_image=None):
+    """The one message in a match thread, rendered for its current state.
+
+    With `pool_image` (render_tournament_pool's PNG for this match) the
+    veto and the map picked show it; send it as TOURNAMENT_POOL_FILENAME.
+    """
     container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
     high, low = match["High"], match["Low"]
     container.add_item(discord.ui.TextDisplay(
@@ -13683,6 +13738,24 @@ def match_card(record, match_id, match):
         row.add_item(match_button("checkin", match_id, label="Check in",
                                   style=discord.ButtonStyle.success,
                                   emoji="✋"))
+        container.add_item(row)
+
+    elif state == "veto" and pool_image is not None:
+        turn = ban_turn(match)
+        banned = {ban["Map"] for ban in match.get("Bans") or []}
+        container.add_item(pool_card_gallery(record))
+        container.add_item(discord.ui.TextDisplay(
+            f"<@{turn}> to ban · {when(match['Deadline'], 'R')}\n"
+            f"-# Ban order: lower seed, higher, higher, lower. Out of time "
+            f"bans a random map."
+        ))
+        row = discord.ui.ActionRow()
+        for entry in record["Pool"]:
+            row.add_item(match_button(
+                "ban", match_id, entry["Id"], label=entry["Name"],
+                style=discord.ButtonStyle.danger,
+                disabled=entry["Id"] in banned,
+            ))
         container.add_item(row)
 
     elif state == "veto":
@@ -13717,6 +13790,8 @@ def match_card(record, match_id, match):
     elif state == "playing":
         chosen = pool_entry(record, match["Map"])
         by = f" · by {chosen['Creator']}" if chosen.get("Creator") else ""
+        if pool_image is not None:
+            container.add_item(pool_card_gallery(record))
         container.add_item(discord.ui.TextDisplay(
             f"## 🎯 {chosen['Name']}\n-# `{chosen['Id']}`{by}\n\n"
             f"<@{high}> <@{low}> — you're up. Best of {record['BestOf']} "
@@ -13775,6 +13850,94 @@ async def match_thread(record, match):
             return None
     return thread
 
+async def match_pool_image(record, match):
+    """The pool card for a match in its veto or playing its map, else None.
+    A render that fails leaves the card on its text list."""
+    if match.get("State") not in ("veto", "playing"):
+        return None
+    try:
+        return await render_tournament_pool(record, match)
+    except Exception:
+        print(f"tournament {record.get('Id')}: pool card render failed:")
+        traceback.print_exc()
+        return None
+
+class TestVetoView(CardView):
+    """!testveto: a match card's veto on a made-up match, played through
+    by its buttons with nothing saved and nobody pinged."""
+
+    def __init__(self, record, match, image):
+        super().__init__()
+        self.record, self.match, self.image = record, match, image
+        self.build()
+
+    def build(self):
+        self.clear_items()
+        card = match_card(self.record, "test", self.match, pool_image=self.image)
+        for child in list(card.children):
+            card.remove_item(child)
+            self.add_item(child)
+        # The ban buttons carry the live tm: IDs the match listener routes;
+        # give them IDs of their own and answer them here.
+        for item in self.walk_children():
+            if (isinstance(item, discord.ui.Button) and item.custom_id
+                    and item.custom_id.startswith(f"{MATCH_BUTTON_PREFIX}ban:")):
+                map_id = item.custom_id.rsplit(":", 1)[1]
+                item.custom_id = f"testveto:{secrets.token_hex(4)}:{map_id}"
+                item.callback = functools.partial(self.ban, map_id=map_id)
+
+    def card_files(self):
+        if self.image is None:
+            return []
+        return [discord.File(io.BytesIO(self.image), filename=TOURNAMENT_POOL_FILENAME)]
+
+    @keeps_context
+    async def ban(self, interaction, map_id):
+        await interaction.response.defer()
+        match = self.match
+        chosen = next((entry["Id"] for entry in self.record["Pool"]
+                       if str(entry["Id"]) == map_id), None)
+        if match.get("State") != "veto" or chosen is None:
+            return
+        match["Bans"].append({"Map": chosen, "By": ban_turn(match), "Auto": False})
+        left = remaining_maps(self.record, match)
+        if len(match["Bans"]) >= len(BAN_ORDER) or len(left) == 1:
+            match.update({"State": "playing", "Map": left[0]["Id"], "Deadline": None})
+        else:
+            match["Deadline"] = now_epoch() + BAN_SECONDS
+        self.image = await match_pool_image(self.record, match)
+        self.build()
+        await show_card(interaction, self)
+
+@bot.command(name="testveto", hidden=True)
+@commands.is_owner()
+async def test_veto_card(ctx):
+    """Owner-only preview of a match veto with the pool card: a made-up
+    match on random public maps. Its ban buttons work, on this message
+    only -- nothing is saved and nobody is pinged."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    async with ctx.typing():
+        record = await fake_checkin_tournament()
+        if not record["Pool"]:
+            await ctx.send("No public maps to make a pool from.")
+            return
+        # Made-up Discord IDs: the mentions show as unknown users, never
+        # anyone real.
+        record.update({
+            "BestOf": 3, "Universe": UNIVERSE_ID,
+            "Players": [{"DiscordId": "1", "Name": "RazzMaster"},
+                        {"DiscordId": "2", "Name": "SpeedyPanda"}],
+            "Seeded": [{"DiscordId": "1"}, {"DiscordId": "2"}],
+        })
+        match = {"Id": "test", "Code": "C", "Round": 2, "High": "1", "Low": "2",
+                 "State": "veto", "Bans": [], "Map": None,
+                 "Deadline": now_epoch() + BAN_SECONDS}
+        view = TestVetoView(record, match, await match_pool_image(record, match))
+    view.message = await ctx.send(view=view, files=view.card_files(),
+                                  allowed_mentions=SILENT)
+
 async def refresh_match_card(record, match_id, match, *, ping=False):
     """Re-render the card in place. Returns True when it landed."""
     thread = await match_thread(record, match)
@@ -13782,7 +13945,17 @@ async def refresh_match_card(record, match_id, match, *, ping=False):
         return False
     try:
         message = await thread.fetch_message(int(match["MessageId"]))
-        await message.edit(view=match_card(record, match_id, match))
+        if MATCH_VETO_POOL_CARD:
+            image = await match_pool_image(record, match)
+            # Every edit replaces the attachments, so the picture goes once
+            # the match is past it.
+            await message.edit(
+                view=match_card(record, match_id, match, pool_image=image),
+                attachments=[discord.File(io.BytesIO(image),
+                                          filename=TOURNAMENT_POOL_FILENAME)]
+                if image else [])
+        else:
+            await message.edit(view=match_card(record, match_id, match))
     except (discord.HTTPException, ValueError):
         return False
     # An edit never pings, so a turn that needs someone's attention says so
