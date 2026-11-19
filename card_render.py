@@ -3121,3 +3121,136 @@ def render_stats_card(**fields):
     couldn't be read; `created` / `updated` are Unix timestamps or None.
     """
     return png_bytes(compose_stats_card(**fields))
+
+
+# ---------------------------------------------------------------- tournament map pool card
+
+POOL_WIDTH, POOL_HEIGHT = 960, 680
+POOL_SKY = ((0, rgba("#2F7FE0")), (0.62, rgba("#6DB8FA")), (1, rgba("#B4DEFF")))
+# The grass hill: an ellipse 1080 x 190 at left -60px, bottom -120px.
+POOL_HILL_TOP = POOL_HEIGHT + 120 - 190
+# The polaroids: 264px wide, 3 to a row in the 860px between left/right
+# 50px, rows centred, gaps 30px 34px, from top 168px. Each is padded
+# 8px 8px 7px round a 248 x 146 photo, 6px, then the name (22px at
+# line-height 1.15, 2px on top) and the #id (15px at 1.1), 4px in.
+POOL_GRID_LEFT, POOL_GRID_TOP, POOL_GRID_WIDTH = 50, 168, 860
+POOL_COLUMNS, POOL_GAP_X, POOL_GAP_Y = 3, 34, 30
+POOL_SLOT = 264
+POOL_PHOTO_WIDTH, POOL_PHOTO_HEIGHT = POOL_SLOT - 16, 146
+POOL_SLOT_HEIGHT = 8 + POOL_PHOTO_HEIGHT + 6 + 2 + 22 * 1.15 + 15 * 1.1 + 7
+# The .slot:nth-child(5n+k) tilts.
+POOL_TILTS = (-2, 1.5, -1.5, 2, -1)
+# The title shrinks from 42px to 30px, then loses its tail, to stay this
+# far clear of the date tag.
+POOL_TITLE_SIZE, POOL_TITLE_MIN, POOL_TITLE_GAP = 42, 30, 16
+
+
+def pool_backdrop():
+    canvas = vertical_gradient(px(POOL_WIDTH), px(POOL_HEIGHT), POOL_SKY)
+    height = POOL_HEIGHT - POOL_HILL_TOP
+
+    def paint(draw, k):
+        draw.ellipse((-60 * k, 0, (1080 - 60) * k, 190 * k), fill=255)
+
+    hill = solid(POOL_WIDTH, height, rgba("#4F8E3A"))
+    hill.putalpha(shape_mask(POOL_WIDTH, height, paint))
+    canvas.alpha_composite(hill, (0, px(POOL_HILL_TOP)))
+    return canvas
+
+
+def draw_pool_date(canvas, date):
+    """The yellow date tag top-right. Returns its left edge."""
+    label = Text(date, DISPLAY, 22, stroke=6, stroke_color=rgba("#A87A00"))
+    width, height = 20 + label.width + 20, 6 + label.height + 3
+    left = POOL_WIDTH - 30 - width
+    body = strip(width, height, rgba("#FFD64F"), CLIP_MEDAL,
+                 lambda image, draw: label.draw(draw, 20, 6))
+    place(canvas, with_drop_shadow(body, 4), left, 40, width, height, rotate=2)
+    return left
+
+
+def draw_pool_title(canvas, title, max_right):
+    """The purple banner with the trophy and the tournament's name."""
+    outline = rgba("#5E37B8")
+    style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=4)
+    room = max_right - 26 - (18 + 54 + 12 + 36)
+    text = drawable_text(title or "", DISPLAY) or "Tournament"
+    name = (fit_text(text, DISPLAY, POOL_TITLE_SIZE, room, min_size=POOL_TITLE_MIN, **style)
+            or ellipsize(text, DISPLAY, POOL_TITLE_MIN, room, **style))
+    inner = 54
+    width = 18 + 54 + 12 + name.width + 36
+    height = 10 + inner + 6
+
+    def content(image, draw):
+        paste_icon(image, load_icon("leaderboard", "trophy", 54), 18, 10)
+        name.draw(draw, 18 + 54 + 12, 10 + (inner - name.height - 6) / 2 + 6)
+
+    body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER, content)
+    place(canvas, with_drop_shadow(body, 5), 26, 26, width, height, rotate=-1.5)
+
+
+@functools.lru_cache(maxsize=1)
+def pool_photo_placeholder():
+    """A map with no thumbnail: the empty-photo sky with the map icon."""
+    image = map_backdrop(*NO_THUMBNAIL_PHOTO_COLORS, POOL_PHOTO_WIDTH, POOL_PHOTO_HEIGHT)[0].copy()
+    icon = 80
+    paste_icon(image, map_icon("map-blue", icon),
+               (POOL_PHOTO_WIDTH - icon) / 2, (POOL_PHOTO_HEIGHT - icon) / 2)
+    return image
+
+
+def pool_polaroid(entry):
+    paper = clip_to(solid(POOL_SLOT, POOL_SLOT_HEIGHT, rgba("#FFFDF4")),
+                    rounded_mask(POOL_SLOT, POOL_SLOT_HEIGHT, 6))
+    thumbnail = open_image(entry.get("thumbnail_png"))
+    if thumbnail is not None:
+        photo = solid(POOL_PHOTO_WIDTH, POOL_PHOTO_HEIGHT, rgba("#2B3F86"))
+        photo.alpha_composite(cover_crop(thumbnail, photo.width, photo.height))
+    else:
+        photo = pool_photo_placeholder().copy()
+    paper.alpha_composite(clip_to(photo, rounded_mask(POOL_PHOTO_WIDTH, POOL_PHOTO_HEIGHT, 4)),
+                          (px(8), px(8)))
+
+    ink = rgba(CUP_INK)
+    draw = ImageDraw.Draw(paper)
+    left, top = 8 + 4, 8 + POOL_PHOTO_HEIGHT + 6 + 2
+    name = drawable_text(entry.get("name") or "", DISPLAY) or "Unknown Map"
+    ellipsize(name, DISPLAY, 22, POOL_PHOTO_WIDTH - 8, line_height=1.15,
+              stroke=6, stroke_color=ink).draw(draw, left, top)
+    Text(f"#{entry.get('id', '?')}", HAND, 15, line_height=1.1,
+         fill=ink).draw(draw, left, top + 22 * 1.15)
+    return paper
+
+
+def compose_tournament_pool_card(*, name, date="", maps=()):
+    canvas = pool_backdrop()
+    date_left = draw_pool_date(canvas, date) if date else POOL_WIDTH - 30
+    draw_pool_title(canvas, name, date_left - POOL_TITLE_GAP)
+    maps = list(maps)
+    count = len(maps)
+    subtitle = Text(f"Map pool · {count} map{'' if count == 1 else 's'}", HAND, 26)
+    draw_glowing_text(canvas, [(subtitle, 44, 110)], rgba("#2160B8"))
+
+    for row_start in range(0, count, POOL_COLUMNS):
+        row = maps[row_start:row_start + POOL_COLUMNS]
+        row_width = len(row) * POOL_SLOT + (len(row) - 1) * POOL_GAP_X
+        left = POOL_GRID_LEFT + (POOL_GRID_WIDTH - row_width) / 2
+        top = POOL_GRID_TOP + row_start // POOL_COLUMNS * (POOL_SLOT_HEIGHT + POOL_GAP_Y)
+        for offset, entry in enumerate(row):
+            index = row_start + offset
+            place(canvas, with_drop_shadow(pool_polaroid(entry), 7),
+                  left + offset * (POOL_SLOT + POOL_GAP_X), top, POOL_SLOT, POOL_SLOT_HEIGHT,
+                  rotate=POOL_TILTS[index % len(POOL_TILTS)])
+
+    return clip_to(canvas, rounded_mask(POOL_WIDTH, POOL_HEIGHT, 24))
+
+
+def render_tournament_pool_card(**fields):
+    """A tournament's map pool as PNG bytes.
+
+    `name` is the tournament's, on the banner; `date` the text on the tag
+    top-right (left off when empty). `maps` is the pool in order (5, laid
+    out 3 + 2), each a dict: id, name, thumbnail_png (bytes, or None for
+    the empty-photo sky).
+    """
+    return png_bytes(compose_tournament_pool_card(**fields))

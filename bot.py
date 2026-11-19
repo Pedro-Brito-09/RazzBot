@@ -11651,12 +11651,18 @@ class TournamentRegisterView(discord.ui.LayoutView):
         await handle_registration(interaction)
 
 class TournamentCheckinView(discord.ui.LayoutView):
-    """Check-in card, carrying the pool reveal. Persistent."""
+    """Check-in card, carrying the pool reveal. Persistent.
 
-    def __init__(self, record=None, thumbnails=None):
+    With `pool_image` (the rendered map pool card's PNG) the pool is that
+    picture instead of the list and thumbnail grid; send card_files() with
+    it. On trial behind !testcheckin.
+    """
+
+    def __init__(self, record=None, thumbnails=None, pool_image=None):
         super().__init__(timeout=None)
         container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
         thumbnails = thumbnails or {}
+        self.pool_image = pool_image
 
         if record is None:
             container.add_item(discord.ui.TextDisplay("## ✋ Check-in"))
@@ -11672,7 +11678,17 @@ class TournamentCheckinView(discord.ui.LayoutView):
                 f"{when(record['MatchesStart'])}** or you won't be in the "
                 f"bracket."
             ))
-            if record["Pool"]:
+            if record["Pool"] and pool_image is not None:
+                container.add_item(discord.ui.Separator())
+                gallery = discord.ui.MediaGallery()
+                gallery.add_item(media=f"attachment://{TOURNAMENT_POOL_FILENAME}",
+                                 description=f"{record['Name']} map pool")
+                container.add_item(gallery)
+                container.add_item(discord.ui.TextDisplay(
+                    "-# Every match vetoes these down to one. You have until "
+                    "matches start to practise."
+                ))
+            elif record["Pool"]:
                 container.add_item(discord.ui.Separator())
                 container.add_item(discord.ui.TextDisplay(
                     f"## 🗺️ The pool\n{pool_lines(record['Pool'])}"
@@ -11705,9 +11721,73 @@ class TournamentCheckinView(discord.ui.LayoutView):
         container.add_item(row)
         self.add_item(container)
 
+    def card_files(self):
+        if self.pool_image is None:
+            return []
+        return [discord.File(io.BytesIO(self.pool_image),
+                             filename=TOURNAMENT_POOL_FILENAME)]
+
     async def check_in(self, interaction):
         await interaction.response.defer(ephemeral=True)
         await handle_checkin(interaction)
+
+TOURNAMENT_POOL_FILENAME = "map-pool.png"
+
+async def render_tournament_pool(record):
+    """The record's map pool as the rendered card's PNG, or None without a
+    pool or Pillow. Thumbnails come from the map index, as open_checkin's do."""
+    if card_render is None or not record.get("Pool"):
+        return None
+    maps_by_id = await get_community_maps() or {}
+    thumbnails = await asyncio.gather(*(
+        fetch_map_thumbnail_png(maps_by_id.get(entry["Id"]))
+        for entry in record["Pool"]
+    ))
+    maps = [{"id": entry["Id"], "name": entry.get("Name"), "thumbnail_png": png}
+            for entry, png in zip(record["Pool"], thumbnails)]
+    start = record.get("MatchesStart")
+    return await asyncio.to_thread(
+        card_render.render_tournament_pool_card,
+        name=record["Name"],
+        date=card_render.format_date(start) if start else "",
+        maps=maps,
+    )
+
+async def fake_checkin_tournament():
+    """A made-up tournament in check-in for !testcheckin: its pool is
+    random public maps from the index, starting in an hour."""
+    maps = [entry for entry in (await get_community_maps() or {}).values()
+            if entry.get("Privacy") == "Public"]
+    pool = [{"Id": entry["Id"], "Name": entry.get("Name") or "Unnamed Map"}
+            for entry in secrets.SystemRandom().sample(
+                maps, min(TOURNAMENT_POOL_SIZE, len(maps)))]
+    return {"Id": 0, "Name": "Sample Cup", "Pool": pool,
+            "MatchesStart": now_epoch() + 3600}
+
+@bot.command(name="testcheckin", hidden=True)
+@commands.is_owner()
+async def test_checkin_card(ctx, tournament_id: str = None):
+    """Owner-only preview of the check-in post with the map pool card, here,
+    pinging nobody. With an ID, from that tournament; without, a fake one.
+    Its Check in button is the real one, so pressed here it says check-in
+    isn't open."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    async with ctx.typing():
+        if tournament_id is None:
+            record = await fake_checkin_tournament()
+        else:
+            record = await read_tournament(tournament_id)
+            if record is None:
+                await ctx.send(f"No tournament `{tournament_id}`.")
+                return
+        if not record.get("Pool"):
+            await ctx.send(f"**{record['Name']}** has no map pool set.")
+            return
+        image = await render_tournament_pool(record)
+        view = TournamentCheckinView(record, pool_image=image)
+    await ctx.send(view=view, files=view.card_files(), allowed_mentions=SILENT)
 
 async def reply_quietly(interaction, text, *, colour=None):
     await interaction.followup.send(
@@ -13023,6 +13103,173 @@ async def log_tournament_result(record, standings, field_size):
     except discord.HTTPException as error:
         print(f"tournament {record['Id']}: couldn't post to the results "
               f"log: {error}")
+
+# --- Winner card (image) ---------------------------------------------------
+# The leaderboard card with the final standings on it: the top three on the
+# podium, 4th-10th on the sheet. On trial behind !testwinner before it
+# replaces the "we have a winner" text card.
+
+TOURNAMENT_WINNER_FILENAME = "winner"
+
+def ordinal(number):
+    suffix = ("th" if 10 <= number % 100 <= 20
+              else {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th"))
+    return f"{number}{suffix}"
+
+def tournament_place_label(rank, shared):
+    """The tag under a finisher's name. A rank shared by `shared` players
+    (knocked out in the same round) reads as the round's reach: four 5ths
+    in an 8-player bracket are its top 8."""
+    if rank == 1:
+        return "Champion"
+    if rank == 2:
+        return "Runner-up"
+    if shared > 1:
+        return f"Top {rank + shared - 1}"
+    return f"{ordinal(rank)} place"
+
+class TournamentWinnerCardView(discord.ui.LayoutView):
+    """The winner announcement as an image, with the podium's mentions,
+    the champion-role note and a link to the bracket under it."""
+
+    def __init__(self, card_image, *, record, mentions, note="", extension="png"):
+        super().__init__(timeout=None)
+        self.card_image = card_image
+        self.filename = f"{TOURNAMENT_WINNER_FILENAME}.{extension}"
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(media=f"attachment://{self.filename}",
+                         description=f"{record['Name']} — final standings")
+        self.add_item(gallery)
+        text = " · ".join(mentions)
+        if note:
+            text = (text + "\n" if text else "") + note
+        if text:
+            self.add_item(discord.ui.TextDisplay(text))
+        url = (record.get("Challonge") or {}).get("Url")
+        if url:
+            row = discord.ui.ActionRow()
+            row.add_item(discord.ui.Button(
+                label="Bracket", style=discord.ButtonStyle.link, url=url,
+                emoji="🔗",
+            ))
+            self.add_item(row)
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
+
+async def build_tournament_winner_view(record, standings, field_size, note=""):
+    """Render the winner card. `standings` is best first, each a dict with
+    DiscordId, Name and Rank (the record's "Standings")."""
+    rows = [entry for entry in standings
+            if isinstance(entry.get("Rank"), int)][:TOURNAMENT_LOG_PLACES]
+    shared = {}
+    for entry in standings:
+        if isinstance(entry.get("Rank"), int):
+            shared[entry["Rank"]] = shared.get(entry["Rank"], 0) + 1
+    roblox_ids = {str(player["DiscordId"]): player.get("RobloxId")
+                  for player in record.get("Players") or ()}
+    names = {str(player["DiscordId"]): player.get("Name")
+             for player in record.get("Players") or ()}
+
+    async def equipped_effect(roblox_id):
+        if normalize_user_id(roblox_id) is None:
+            return None
+        return username_effects.resolve_effect(
+            await fetch_equipped_username_effect(normalize_user_id(roblox_id)))
+
+    async def background():
+        # The pool's first map with a picture: the maps they played on.
+        maps_by_id = await get_community_maps() or {}
+        for entry in record.get("Pool") or ():
+            png = await fetch_map_thumbnail_png(maps_by_id.get(entry["Id"]))
+            if png:
+                return png
+        return None
+
+    ids = [roblox_ids.get(str(entry.get("DiscordId"))) for entry in rows]
+    avatars, effects, thumbnail_png = await asyncio.gather(
+        asyncio.gather(*(fetch_leaderboard_avatar(roblox_id) for roblox_id in ids[:3])),
+        asyncio.gather(*(equipped_effect(roblox_id) for roblox_id in ids)),
+        background(),
+    )
+    players = []
+    for index, entry in enumerate(rows):
+        rank = entry["Rank"]
+        players.append({
+            "rank": rank,
+            "name": (entry.get("Name") or names.get(str(entry.get("DiscordId")))
+                     or "Unknown"),
+            "time": tournament_place_label(rank, shared[rank]),
+            "tier": {1: 1, 2: 2, 3: 3}.get(rank),
+            "avatar_png": avatars[index] if index < len(avatars) else None,
+            "effect": effects[index],
+        })
+
+    champion = rows[0].get("Name") if rows else None
+    fields = dict(
+        title=record["Name"],
+        subtitle=f"Won by {champion}" if champion else "",
+        sheet_title=f"{field_size} {'player' if field_size == 1 else 'players'}",
+        footer=(f"{CHALLONGE_FORMATS.get(record.get('Format'), '')} · "
+                f"Bo{record['BestOf']} · {card_timestamp()}"),
+        players=players, thumbnail_png=thumbnail_png,
+    )
+    if any(effects):
+        image = await asyncio.to_thread(card_render.render_leaderboard_card_animated, **fields)
+        extension = "webp"
+    else:
+        image = await asyncio.to_thread(card_render.render_leaderboard_card, **fields)
+        extension = "png"
+
+    mentions = []
+    for entry in rows:
+        if entry["Rank"] > 3:
+            break
+        if entry.get("DiscordId"):
+            mentions.append(f"{('🥇', '🥈', '🥉')[entry['Rank'] - 1]} <@{entry['DiscordId']}>")
+    return TournamentWinnerCardView(image, record=record, mentions=mentions,
+                                    note=note, extension=extension)
+
+def fake_finished_tournament():
+    """A made-up finished tournament for !testwinner: eight players, single
+    elimination, so the card shows a shared 3rd and a shared 5th."""
+    names = ("RazzMaster", "SpeedyPanda", "xXLavaJumperXx", "CloudHopper",
+             "Pixelated_Pete", "Noob123", "TurboTom", "Zigzag")
+    ranks = (1, 2, 3, 3, 5, 5, 5, 5)
+    return {
+        "Id": 0, "Name": "Sample Cup", "Format": "single", "BestOf": 3,
+        "Players": [{"DiscordId": str(i), "RobloxId": None, "Name": name}
+                    for i, name in enumerate(names, 1)],
+        "Standings": [{"DiscordId": None, "Name": name, "Rank": rank}
+                      for name, rank in zip(names, ranks)],
+        "FieldSize": len(names), "Pool": [],
+        "Challonge": {"Url": "https://challonge.com/"},
+    }
+
+@bot.command(name="testwinner", hidden=True)
+@commands.is_owner()
+async def test_winner_card(ctx, tournament_id: str = None):
+    """Owner-only preview of the image winner card, here, pinging nobody.
+    With an ID, from that finished tournament; without, from a fake one."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    async with ctx.typing():
+        if tournament_id is None:
+            record = fake_finished_tournament()
+        else:
+            record = await read_tournament(tournament_id)
+            if record is None:
+                await ctx.send(f"No tournament `{tournament_id}`.")
+                return
+            if not record.get("Standings"):
+                await ctx.send(f"**{record['Name']}** has no final standings yet.")
+                return
+        view = await build_tournament_winner_view(
+            record, record["Standings"],
+            record.get("FieldSize") or len(record["Standings"]),
+        )
+    await ctx.send(view=view, files=view.card_files(), allowed_mentions=SILENT)
 
 # --- !tournament cleanup ---------------------------------------------------
 
