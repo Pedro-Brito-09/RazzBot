@@ -4353,12 +4353,13 @@ class MapCardView(MapView):
         view.message = interaction.message
         await show_card(interaction, view)
 
-async def build_map_card_view(entry, parent=None):
-    """The image version of build_map_view.
+async def build_map_card_view(entry, parent=None, view_class=None):
+    """The image version of build_map_view; view_class defaults to MapCardView.
 
     The creator's equipped username effect plays on their handle, as on
     their profile card, which makes the card an animated WebP.
     """
+    view_class = view_class or MapCardView
     creator_id = entry.get("Creator")
 
     async def no_bytes():
@@ -4409,7 +4410,7 @@ async def build_map_card_view(entry, parent=None):
     parts.append(f"ID {map_id}")
     note = "-# " + " · ".join(parts)
 
-    return MapCardView(
+    return view_class(
         image, entry, creator_id=creator_id, creator_name=creator,
         extension=extension, parent=parent, note=note,
     )
@@ -6207,6 +6208,63 @@ async def build_random_map_view(exclude=None):
         return None
     entry = secrets.choice(pool)
     return await build_map_view(entry, view_class=RandomMapView)
+
+class RandomMapCardView(MapCardView):
+    """The image map card with RandomMapView's Reroll button.
+
+    On trial behind !testrandommap before it replaces RandomMapView.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        button = discord.ui.Button(
+            label="Reroll", style=discord.ButtonStyle.primary, emoji="🎲",
+        )
+        button.callback = self.reroll
+
+        last = self.children[-1] if self.children else None
+        if isinstance(last, discord.ui.ActionRow) and len(last.children) < 5:
+            last.add_item(button)
+        else:
+            row = discord.ui.ActionRow()
+            row.add_item(button)
+            self.add_item(row)
+
+    @keeps_context
+    async def reroll(self, interaction):
+        await interaction.response.defer()
+        view = await build_random_map_card_view(exclude=self.entry.get("Id"))
+        if view is None:
+            await interaction.followup.send(
+                "There are no other public maps to roll.", ephemeral=True
+            )
+            return
+        view.message = interaction.message
+        await show_card(interaction, view)
+
+async def build_random_map_card_view(exclude=None):
+    """The image version of build_random_map_view."""
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        return None
+    pool = [m for m in public_maps(maps_by_id) if m.get("Id") != exclude]
+    if not pool:
+        return None
+    return await build_map_card_view(secrets.choice(pool), view_class=RandomMapCardView)
+
+@bot.command(name="testrandommap", hidden=True)
+@commands.is_owner()
+async def test_random_map_card(ctx):
+    """Owner-only preview of the image /randommap card, Reroll included."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    async with ctx.typing():
+        view = await build_random_map_card_view()
+    if view is None:
+        await ctx.send("Failed to fetch the community map list.")
+        return
+    view.message = await ctx.send(view=view, files=view.card_files())
 
 @bot.hybrid_command(name="randommap", description="Show a random public community map")
 async def randommap_command(ctx):
