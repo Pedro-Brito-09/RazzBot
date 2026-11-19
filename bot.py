@@ -15,6 +15,7 @@ import socket
 import contextvars
 import copy
 import functools
+import random
 import re
 import secrets
 import string
@@ -424,6 +425,11 @@ class CardView(OwnedView, discord.ui.LayoutView):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
+
+def view_files(view):
+    """The attachments a card needs sent with it: none for a text card."""
+    card_files = getattr(view, "card_files", None)
+    return card_files() if card_files is not None else []
 
 async def show_card(interaction, view):
     """Swap a deferred interaction's message over to another card."""
@@ -1912,11 +1918,12 @@ def manageable_role(guild, role_id):
         return None
     return role if role < me.top_role else None
 
-async def sync_member_roles(member, roblox_id, rules, *, map_cache):
+async def sync_member_roles(member, roblox_id, rules, *, map_cache, apply=True):
     """Bring one member's roles in line with the rules.
 
     Only roles named by a rule are ever touched, so unrelated roles are
-    left alone. Returns (added, removed, blocked) as role lists.
+    left alone. Returns (added, removed, blocked) as role lists. With
+    apply=False nothing is changed: it only says what a sync would do.
     """
     # A rule whose condition this build no longer understands is ignored
     # outright -- treating it as unmet would strip the role from everyone.
@@ -1953,6 +1960,8 @@ async def sync_member_roles(member, roblox_id, rules, *, map_cache):
             category_add.append(role)
 
     roles_to_add = add + category_add
+    if not apply:
+        return add, remove, blocked
     if roles_to_add:
         await member.add_roles(*roles_to_add, reason="RazzBot role sync")
     if remove:
@@ -3137,7 +3146,7 @@ class ProfileView(CardView):
 class ProfileCardView(ProfileView):
     """The profile as a rendered image, with the same buttons under it.
 
-    On trial behind !testprofile before it replaces ProfileView. The stats
+    /profile's card; ProfileView is the fallback without Pillow. The stats
     live in the picture (card_render.render_profile_card); the buttons stay
     real components, and their callbacks are ProfileView's.
     """
@@ -3637,6 +3646,13 @@ async def fetch_medal_history(user_id):
     return medals
 
 async def build_medals_view(user_id, username, parent=None):
+    """The medals image card, or the text list without Pillow (None when
+    they have no medals)."""
+    if card_render is not None:
+        return await build_medals_image_view(user_id, username, parent=parent)
+    return await build_medals_text_view(user_id, username, parent=parent)
+
+async def build_medals_text_view(user_id, username, parent=None):
     """A player's medal history, newest cup first, or None when they have none."""
     medals = await fetch_medal_history(user_id)
     if not medals:
@@ -3757,7 +3773,7 @@ class PolaroidGridView(CardView):
 class MedalsImageCardView(PolaroidGridView):
     """A player's Daily Cup medals as rendered polaroids, ten cups a page.
 
-    On trial behind !testmedals before it replaces MedalListView.
+    /medals' card; MedalListView is the fallback without Pillow.
     """
 
     stem = "medals"
@@ -3809,7 +3825,7 @@ class MapsImageCardView(PolaroidGridView):
     """Maps as rendered polaroids, ten a page: a player's maps (/maps) or a
     name search (/map), with a label top right naming which.
 
-    On trial behind !testmaps and !testmap before it replaces MapListView.
+    MapListView is the fallback without Pillow.
     """
 
     stem = "maps"
@@ -3999,6 +4015,13 @@ async def build_linked_view(guild, parent=None):
     return LinkedListView(links, parent=parent)
 
 async def build_map_search_view(query, matches, parent=None):
+    """The search results as the maps image grid, or a text pick-list
+    without Pillow."""
+    if card_render is not None:
+        return await build_map_search_image_view(query, matches, parent=parent)
+    return await build_map_search_text_view(query, matches, parent=parent)
+
+async def build_map_search_text_view(query, matches, parent=None):
     """A pick-list of maps matching a name search."""
     creators = await fetch_usernames([m.get("Creator") for m in matches])
     return MapListView(
@@ -4051,6 +4074,15 @@ def created_maps(maps_by_id, user_id, include_hidden=False):
 
 async def build_created_maps_view(user_id, username, parent=None,
                                   include_hidden=False):
+    """A player's maps as the image grid, or the text list without Pillow."""
+    if card_render is not None:
+        return await build_created_maps_image_view(
+            user_id, username, parent=parent, include_hidden=include_hidden)
+    return await build_created_maps_text_view(
+        user_id, username, parent=parent, include_hidden=include_hidden)
+
+async def build_created_maps_text_view(user_id, username, parent=None,
+                                       include_hidden=False):
     """List the community maps a player has created, most played first."""
     listed = created_maps(await get_community_maps(), user_id, include_hidden)
     if listed is None:
@@ -4067,6 +4099,13 @@ async def build_created_maps_view(user_id, username, parent=None,
     )
 
 async def build_profile_view(user_id, username, parent=None, guild=None):
+    """The profile image card, or the text card without Pillow; None when
+    the player has no saved data."""
+    if card_render is not None:
+        return await build_profile_card_view(user_id, username, parent=parent, guild=guild)
+    return await build_profile_text_view(user_id, username, parent=parent, guild=guild)
+
+async def build_profile_text_view(user_id, username, parent=None, guild=None):
     """Assemble a profile card, or None when the player has no saved data."""
     entry = await fetch_entry(str(user_id), datastore="Main_Data")
     if not entry:
@@ -4303,7 +4342,7 @@ MAP_CARD_FILENAME = "map"
 class MapCardView(MapView):
     """The map card as a rendered image, with MapView's buttons under it.
 
-    On trial behind !testmap before it replaces MapView. The details live
+    /map's card; MapView is the fallback without Pillow. The details live
     in the picture (card_render.render_map_card); the buttons stay real
     components, and their callbacks are MapView's.
     """
@@ -4552,7 +4591,7 @@ async def fetch_leaderboard_avatar(user_id):
 class LeaderboardCardView(CardView):
     """A map or Daily Cup leaderboard as a rendered image.
 
-    On trial behind !testleaderboard before it replaces the embeds. A
+    Used by /leaderboard and /cup; the embeds are the fallback. A
     Components V2 message, so unlike the embed it can replace the map card
     in place, with a Back button to return to it.
     """
@@ -4899,9 +4938,9 @@ async def crosspost_message(message):
         return False
     return True
 
-# The scheduled post's format. On trial behind !testcup, which always uses
-# the image cards; flip this once they're approved.
-DAILY_CUP_IMAGE_CARDS = False
+# The scheduled post's format: the image cards, or the embeds when False.
+# !testcup always uses the image cards.
+DAILY_CUP_IMAGE_CARDS = True
 
 async def build_daily_cup_image_messages(previous_leaderboard, previous_index,
                                          previous_map_id, entry, current_index,
@@ -5376,7 +5415,17 @@ async def on_command_error(ctx, error):
         await ctx.send(message)
 
 async def send_cup_leaderboard(ctx, index, date_text, *, todays_map=None):
-    """Post one cup's leaderboard, or explain why it isn't there."""
+    """Post one cup's leaderboard, or explain why it isn't there: the image
+    card, or the embed without Pillow."""
+    if card_render is not None:
+        view, error = await build_cup_leaderboard_card_view(
+            index, date_text, todays_map=todays_map)
+        if view is None:
+            await ctx.send(error)
+            return
+        view.message = await ctx.send(view=view, files=view_files(view))
+        return
+
     leaderboard, map_id = await asyncio.gather(
         fetch_board(f"DailyCup_{index}"),
         get_cup_map_id(index, todays_map or {}),
@@ -5672,7 +5721,7 @@ async def maps_command(ctx, username: str = None):
         await ctx.send(no_maps_message(canonical, include_hidden))
         return
 
-    await ctx.send(view=view)
+    view.message = await ctx.send(view=view, files=view_files(view))
 
 @bot.hybrid_command(name="medals", description="Show the daily cups a player earned medals in")
 @app_commands.describe(username="Roblox username. Uses your linked account if omitted.")
@@ -5688,7 +5737,7 @@ async def medals_command(ctx, username: str = None):
         await ctx.send(f"**{canonical}** hasn't earned any daily cup medals.")
         return
 
-    await ctx.send(view=view)
+    view.message = await ctx.send(view=view, files=view_files(view))
 
 def achievement_leaderboard_rows(guild, rules):
     """Members ranked by how many configured achievement roles they hold.
@@ -5802,6 +5851,29 @@ async def build_leaderboard_reply(target, guild=None):
         return None, f"No leaderboard found for `{key}`."
     return embed, None
 
+async def build_leaderboard_card_reply(target, guild=None):
+    """The image version of build_leaderboard_reply: (view, error text)."""
+    selected = target.strip().lower()
+    if selected == "achievements":
+        return await build_achievement_leaderboard_card_view(guild)
+    if selected in GLOBAL_LEADERBOARDS:
+        return await build_global_leaderboard_card_view(selected)
+    try:
+        map_id = int(selected)
+    except ValueError:
+        return None, ("Choose a map ID, `wins`, `medals`, `creators`, "
+                      "or `achievements`.")
+    maps_by_id = await get_community_maps()
+    if not maps_by_id:
+        return None, "Failed to fetch the community map list."
+    entry = maps_by_id.get(map_id)
+    if entry is None:
+        return None, f"No community map with ID `{map_id}`."
+    view = await build_map_leaderboard_card_view(entry)
+    if view is None:
+        return None, f"No leaderboard found for `{MAP_LEADERBOARD_KEY.format(id=map_id)}`."
+    return view, None
+
 @bot.tree.command(
     name="leaderboard",
     description="Show a map, wins, medals, creators or achievements leaderboard",
@@ -5811,6 +5883,14 @@ async def build_leaderboard_reply(target, guild=None):
 )
 async def leaderboard_slash_command(interaction: discord.Interaction, target: str):
     await interaction.response.defer()
+    if card_render is not None:
+        view, error = await build_leaderboard_card_reply(target, interaction.guild)
+        if view is None:
+            await interaction.followup.send(error)
+            return
+        view.message = await interaction.followup.send(
+            view=view, files=view_files(view), wait=True)
+        return
     embed, error = await build_leaderboard_reply(target, interaction.guild)
     if error:
         await interaction.followup.send(error)
@@ -5822,6 +5902,14 @@ async def leaderboard_slash_command(interaction: discord.Interaction, target: st
 @bot.group(name="leaderboard", invoke_without_command=True)
 async def leaderboard_command(ctx, target: str):
     """Show a map, wins, medals, creators or achievements leaderboard."""
+    if card_render is not None:
+        async with ctx.typing():
+            view, error = await build_leaderboard_card_reply(target, ctx.guild)
+        if view is None:
+            await ctx.send(error)
+            return
+        view.message = await ctx.send(view=view, files=view_files(view))
+        return
     async with ctx.typing():
         embed, error = await build_leaderboard_reply(target, ctx.guild)
     if error:
@@ -5830,6 +5918,13 @@ async def leaderboard_command(ctx, target: str):
     await ctx.send(embed=embed)
 
 async def build_map_view(entry, parent=None, view_class=None):
+    """The map image card, or the text card without Pillow. view_class is
+    a MapView subclass for the text card."""
+    if card_render is not None and view_class is None:
+        return await build_map_card_view(entry, parent=parent)
+    return await build_map_text_view(entry, parent=parent, view_class=view_class)
+
+async def build_map_text_view(entry, parent=None, view_class=None):
     """Resolve a map's creator and wrap it in a card."""
     creator_id = entry.get("Creator")
     creator = await fetch_username(creator_id) if creator_id else None
@@ -5871,7 +5966,7 @@ async def map_command(ctx, *, query: str):
             await ctx.send(f"No community map with ID `{cleaned}`.")
             return
         view = await build_map_view(entry)
-        view.message = await ctx.send(view=view)
+        view.message = await ctx.send(view=view, files=view_files(view))
         return
 
     matches = search_public_maps(maps_by_id, cleaned)
@@ -5881,11 +5976,11 @@ async def map_command(ctx, *, query: str):
 
     if len(matches) == 1:
         view = await build_map_view(matches[0])
-        view.message = await ctx.send(view=view)
+        view.message = await ctx.send(view=view, files=view_files(view))
         return
 
     view = await build_map_search_view(cleaned, matches)
-    view.message = await ctx.send(view=view)
+    view.message = await ctx.send(view=view, files=view_files(view))
 
 @bot.hybrid_command(name="profile", description="Show a player's profile")
 @app_commands.describe(username="Roblox username. Uses your linked account if omitted.")
@@ -5901,7 +5996,7 @@ async def profile_command(ctx, username: str = None):
         await ctx.send(f"No game data saved for **{canonical}**.")
         return
 
-    view.message = await ctx.send(view=view)
+    view.message = await ctx.send(view=view, files=view_files(view))
 
 @bot.command(name="testprofile", hidden=True)
 @commands.is_owner()
@@ -5939,209 +6034,6 @@ async def test_profile_card(ctx, username: str = None, effect: str = None):
 
     view.message = await ctx.send(view=view, files=view.card_files())
 
-@bot.command(name="testbadges", hidden=True)
-@commands.is_owner()
-async def test_badges_card(ctx, username: str = None, effect: str = None):
-    """Owner-only preview of the badges and achievements card, as
-    /achievements shows it, with an effect to try.
-
-    `!testbadges [username|me] [effect|none]`: the game's badges and the
-    home server's map achievements in one grid, 24 a page. The name plays
-    their equipped username effect unless one is named, as !testprofile.
-    """
-    if card_render is None:
-        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
-        return
-    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
-        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
-        return
-
-    async with ctx.typing():
-        lookup = None if username in (None, "me") else username
-        user_id, canonical = await resolve_command_user(ctx, lookup)
-        if user_id is None:
-            return
-        # "none" can't match a preset, so it shows the still card.
-        view = await build_badges_image_view(user_id, canonical, effect_name=effect)
-        if view is None:
-            await ctx.send("Couldn't fetch the game's badge list.")
-            return
-
-    view.message = await ctx.send(view=view, files=view.card_files())
-
-@bot.command(name="testmedals", hidden=True)
-@commands.is_owner()
-async def test_medals_card(ctx, username: str = None, effect: str = None):
-    """Owner-only preview of the image medals card, before /medals uses it.
-
-    `!testmedals [username|me] [effect|none]`: the player's Daily Cup
-    medals as polaroids, ten cups a page, newest first. The name plays
-    their equipped username effect unless one is named, as !testprofile.
-    """
-    if card_render is None:
-        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
-        return
-    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
-        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
-        return
-
-    async with ctx.typing():
-        lookup = None if username in (None, "me") else username
-        user_id, canonical = await resolve_command_user(ctx, lookup)
-        if user_id is None:
-            return
-        # "none" can't match a preset, so it shows the still card.
-        view = await build_medals_image_view(user_id, canonical, effect_name=effect)
-
-    view.message = await ctx.send(view=view, files=view.card_files())
-
-@bot.command(name="testmap", hidden=True)
-@commands.is_owner()
-async def test_map_card(ctx, *, query: str):
-    """Owner-only preview of the image map cards, before /map uses them.
-
-    `!testmap <map id or name>`. As /map: an ID finds any map; a name
-    searches public maps, opening the map card for a single match and the
-    polaroid grid of results for several.
-    """
-    if card_render is None:
-        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
-        return
-
-    async with ctx.typing():
-        maps_by_id = await get_community_maps()
-        if not maps_by_id:
-            await ctx.send("Failed to fetch the community map list.")
-            return
-        cleaned = query.strip()
-        if cleaned.isdigit():
-            entry = maps_by_id.get(int(cleaned))
-            matches = [entry] if entry else []
-        else:
-            matches = search_public_maps(maps_by_id, cleaned)
-        if not matches:
-            await ctx.send(f"No community map found for `{cleaned}`.")
-            return
-        if len(matches) == 1:
-            view = await build_map_card_view(matches[0])
-        else:
-            view = await build_map_search_image_view(cleaned, matches)
-
-    view.message = await ctx.send(view=view, files=view.card_files())
-
-@bot.command(name="testmaps", hidden=True)
-@commands.is_owner()
-async def test_maps_card(ctx, username: str = None, effect: str = None):
-    """Owner-only preview of the image maps grid, before /maps uses it.
-
-    `!testmaps [username|me] [effect|none]`: the player's maps as
-    polaroids, ten a page, most played first. Private and Unlisted ones
-    show in the staff channels, as /maps. The name plays their equipped
-    username effect unless one is named, as !testprofile.
-    """
-    if card_render is None:
-        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
-        return
-    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
-        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
-        return
-
-    async with ctx.typing():
-        lookup = None if username in (None, "me") else username
-        user_id, canonical = await resolve_command_user(ctx, lookup)
-        if user_id is None:
-            return
-        include_hidden = shows_hidden_maps(ctx.channel)
-        # "none" can't match a preset, so it shows the still card.
-        view = await build_created_maps_image_view(
-            user_id, canonical, include_hidden=include_hidden, effect_name=effect)
-        if view is None:
-            await ctx.send(no_maps_message(canonical, include_hidden))
-            return
-
-    view.message = await ctx.send(view=view, files=view.card_files())
-
-@bot.command(name="testleaderboard", hidden=True)
-@commands.is_owner()
-async def test_leaderboard_card(ctx, target: str, when: str = None):
-    """Owner-only preview of the image leaderboard, before /leaderboard and
-    /cup use it.
-
-    `!testleaderboard <map id>` for a map's board, or
-    `!testleaderboard cup [index|DD/MM/YYYY]` for a Daily Cup (today's by
-    default), or `!testleaderboard wins|medals|creators|achievements`.
-    """
-    if card_render is None:
-        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
-        return
-
-    selected = target.strip().lower()
-    async with ctx.typing():
-        if selected == "cup":
-            todays_map = await fetch_entry("TodaysMap") or {}
-            current_index = coerce_cup_index(todays_map.get("Index"))
-            if when is None:
-                if current_index is None:
-                    await ctx.send("No daily cup index set.")
-                    return
-                index, date_text = current_index, get_todays_date()
-            elif when.strip().isdigit():
-                index = int(when.strip())
-                day = cup_date_for_index(index, current_index)
-                date_text = f"{day:%d/%m/%Y}" if day else f"Index {index}"
-            else:
-                day = parse_cup_date(when)
-                if day is None or current_index is None:
-                    await ctx.send("Give a cup index or a `DD/MM/YYYY` date.")
-                    return
-                index = current_index - (cup_day_today() - day).days
-                if index < 0 or index > current_index:
-                    await ctx.send(f"No cup on `{day:%d/%m/%Y}`.")
-                    return
-                date_text = f"{day:%d/%m/%Y}"
-            view, error = await build_cup_leaderboard_card_view(
-                index, date_text, todays_map=todays_map
-            )
-            if view is None:
-                await ctx.send(error)
-                return
-        elif selected in GLOBAL_LEADERBOARDS:
-            view, error = await build_global_leaderboard_card_view(selected)
-            if view is None:
-                await ctx.send(error)
-                return
-        elif selected == "achievements":
-            view, error = await build_achievement_leaderboard_card_view(ctx.guild)
-            if view is None:
-                await ctx.send(error)
-                return
-        elif selected.isdigit():
-            map_id = int(selected)
-            maps_by_id = await get_community_maps()
-            if not maps_by_id:
-                await ctx.send("Failed to fetch the community map list.")
-                return
-            entry = maps_by_id.get(map_id)
-            if entry is None:
-                await ctx.send(f"No community map with ID `{map_id}`.")
-                return
-            view = await build_map_leaderboard_card_view(entry)
-            if view is None:
-                await ctx.send(
-                    f"No leaderboard found for `{MAP_LEADERBOARD_KEY.format(id=map_id)}`."
-                )
-                return
-        else:
-            await ctx.send(
-                "Usage: `!testleaderboard <map id>`, "
-                "`!testleaderboard cup [index|DD/MM/YYYY]`, or "
-                "`!testleaderboard wins|medals|creators|achievements`."
-            )
-            return
-
-    view.message = await ctx.send(view=view, files=view.card_files())
-
-# Typed instead of a map to go back to the chat-colour backdrop.
 CLEAR_BACKGROUND_WORDS = {"none", "clear", "reset", "off", "default"}
 MAP_AUTOCOMPLETE_LIMIT = 25
 
@@ -6267,7 +6159,7 @@ class RandomMapView(MapView):
     @keeps_context
     async def reroll(self, interaction):
         await interaction.response.defer()
-        view = await build_random_map_view(exclude=self.entry.get("Id"))
+        view = await build_random_map_text_view(exclude=self.entry.get("Id"))
         if view is None:
             await interaction.followup.send(
                 "There are no other public maps to roll.", ephemeral=True
@@ -6277,6 +6169,13 @@ class RandomMapView(MapView):
         await show_card(interaction, view)
 
 async def build_random_map_view(exclude=None):
+    """A card for one public map, every map equally likely: the image card
+    with Reroll, or the text one without Pillow."""
+    if card_render is not None:
+        return await build_random_map_card_view(exclude=exclude)
+    return await build_random_map_text_view(exclude=exclude)
+
+async def build_random_map_text_view(exclude=None):
     """A card for one public map, every map equally likely."""
     maps_by_id = await get_community_maps()
     if not maps_by_id:
@@ -6290,7 +6189,7 @@ async def build_random_map_view(exclude=None):
 class RandomMapCardView(MapCardView):
     """The image map card with RandomMapView's Reroll button.
 
-    On trial behind !testrandommap before it replaces RandomMapView.
+    /randommap's card; RandomMapView is the fallback without Pillow.
     """
 
     def __init__(self, *args, **kwargs):
@@ -6330,20 +6229,6 @@ async def build_random_map_card_view(exclude=None):
         return None
     return await build_map_card_view(secrets.choice(pool), view_class=RandomMapCardView)
 
-@bot.command(name="testrandommap", hidden=True)
-@commands.is_owner()
-async def test_random_map_card(ctx):
-    """Owner-only preview of the image /randommap card, Reroll included."""
-    if card_render is None:
-        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
-        return
-    async with ctx.typing():
-        view = await build_random_map_card_view()
-    if view is None:
-        await ctx.send("Failed to fetch the community map list.")
-        return
-    view.message = await ctx.send(view=view, files=view.card_files())
-
 @bot.hybrid_command(name="randommap", description="Show a random public community map")
 async def randommap_command(ctx):
     await ctx.defer()
@@ -6351,7 +6236,7 @@ async def randommap_command(ctx):
     if view is None:
         await ctx.send("Failed to fetch the community map list.")
         return
-    view.message = await ctx.send(view=view)
+    view.message = await ctx.send(view=view, files=view_files(view))
 
 async def fetch_compare_stats(user_id):
     """The numbers /compare lines up, or None when there's no saved data."""
@@ -6391,6 +6276,14 @@ async def compare_command(ctx, player1: str, player2: str = None):
         return
     if first_id == second_id:
         await ctx.send("Pick two different players to compare.")
+        return
+
+    if card_render is not None:
+        view, missing = await build_compare_card_view(first_id, first, second_id, second)
+        if view is None:
+            await ctx.send(f"No game data saved for **{'** or **'.join(missing)}**.")
+            return
+        view.message = await ctx.send(view=view, files=view_files(view))
         return
 
     first_stats, second_stats = await asyncio.gather(
@@ -6437,7 +6330,7 @@ async def compare_command(ctx, player1: str, player2: str = None):
 class CompareCardView(CardView):
     """Two players' stats side by side as a rendered versus card.
 
-    On trial behind !testcompare before it replaces /compare's text card.
+    /compare's card; the text card is the fallback without Pillow.
     """
 
     def __init__(self, card_image, *, extension, first, second, parent=None,
@@ -6489,42 +6382,6 @@ async def build_compare_card_view(first_id, first, second_id, second, *, effect_
     image, extension = await asyncio.to_thread(card_render.render_versus_card,
                                                left=left, right=right)
     return CompareCardView(image, extension=extension, first=first, second=second), []
-
-@bot.command(name="testcompare", hidden=True)
-@commands.is_owner()
-async def test_compare_card(ctx, player1: str, player2: str = None, effect: str = None):
-    """Owner-only preview of the image versus card, before /compare uses it.
-
-    `!testcompare <player1> [player2|me] [effect|none]`. As /compare, a
-    missing second player is your linked account. Each name plays its
-    equipped username effect unless one is named for both, as !testprofile.
-    """
-    if card_render is None:
-        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
-        return
-    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
-        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
-        return
-
-    async with ctx.typing():
-        first_id, first = await resolve_command_user(ctx, None if player1 == "me" else player1)
-        if first_id is None:
-            return
-        second_id, second = await resolve_command_user(
-            ctx, None if player2 in (None, "me") else player2)
-        if second_id is None:
-            return
-        if first_id == second_id:
-            await ctx.send("Pick two different players to compare.")
-            return
-        # "none" can't match a preset, so it shows the still card.
-        view, missing = await build_compare_card_view(first_id, first, second_id, second,
-                                                      effect_name=effect)
-        if view is None:
-            await ctx.send(f"No game data saved for **{'** or **'.join(missing)}**.")
-            return
-
-    view.message = await ctx.send(view=view, files=view.card_files())
 
 def describe_command(command, prefix):
     usage = f"{prefix}{command.qualified_name}"
@@ -6599,6 +6456,177 @@ async def help_command(ctx):
         # DMs closed; better in-channel than not at all.
         await ctx.send(view=admin_view)
 
+# /sync answers with a rendered "Profile synced" card: the linked accounts
+# and the achievements the sync unlocked or took away. Off until the image
+# cards go live; !testsync previews it without touching anyone's roles.
+SYNC_RESULT_CARD = True
+SYNC_CARD_FILENAME = "sync"
+
+async def sync_achievement_items(guild, rules, roles):
+    """The roles a sync changed as the badges card's items: a badge rule's
+    role shows the badge (round), a map rule's the map (square), with the
+    same names and art as on /achievements. A role with neither falls back
+    to its own icon, or a placeholder in its colour."""
+    if not roles:
+        return []
+    by_role = {}
+    for rule in rules:
+        role_id = rule_role_id(rule)
+        if role_id is not None and rule.get("type") in ("badge", "map"):
+            by_role.setdefault(role_id, rule)
+    wants_badges = any(by_role.get(role.id, {}).get("type") == "badge" for role in roles)
+    wants_maps = any(by_role.get(role.id, {}).get("type") == "map" for role in roles)
+    badges, maps_by_id = await asyncio.gather(
+        fetch_universe_badges() if wants_badges else asyncio.sleep(0, []),
+        get_community_maps() if wants_maps else asyncio.sleep(0, {}),
+    )
+    badges_by_id = {badge["id"]: badge for badge in badges or ()}
+    colors = card_render.BADGE_COLORS
+    items = []
+    for index, role in enumerate(roles):
+        rule = by_role.get(role.id) or {}
+        color = (f"#{role.colour.value:06X}" if role.colour.value
+                 else colors[index % len(colors)])
+        item = {"name": role.name, "color": color, "circle": True, "role": role}
+        if rule.get("type") == "badge":
+            badge = badges_by_id.get(rule.get("value"))
+            item.update(kind="badge", key=rule.get("value"),
+                        name=badge_display_name(badge) if badge else role.name)
+        elif rule.get("type") == "map":
+            try:
+                map_id = int(rule.get("value"))
+            except (TypeError, ValueError):
+                map_id = None
+            item.update(kind="map", key=map_id, circle=False,
+                        entry=(maps_by_id or {}).get(map_id))
+        else:
+            item.update(kind="role", icon_png=None)
+        items.append(item)
+    await load_badge_card_icons([item for item in items if item["kind"] != "role"])
+
+    async def role_icon(item):
+        icon = item["role"].icon
+        if item.get("icon_png") is None and icon is not None:
+            try:
+                item["icon_png"] = await icon.read()
+            except discord.HTTPException:
+                pass
+
+    await asyncio.gather(*(role_icon(item) for item in items))
+    for item in items:
+        del item["role"]
+    return items
+
+class SyncCardView(CardView):
+    """/sync's outcome as the rendered "Profile synced" card."""
+
+    def __init__(self, card_image, *, extension="png", description, note=None):
+        super().__init__(timeout=None)
+        self.card_image = card_image
+        # png, or webp when the Roblox name's username effect plays.
+        self.filename = f"{SYNC_CARD_FILENAME}.{extension}"
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(media=f"attachment://{self.filename}", description=description)
+        self.add_item(gallery)
+        if note:
+            self.add_item(discord.ui.TextDisplay(note))
+
+    def card_files(self):
+        return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
+
+async def build_sync_card_view(member, roblox_id, rules, added, removed, blocked, *,
+                               note=None, effect_name=None):
+    """The sync card for what sync_member_roles returned, or None when it
+    can't be drawn (the caller falls back to the text card). The Roblox
+    name plays its equipped username effect; effect_name forces one, or
+    "none" none, for previews."""
+    try:
+        (name, avatar_png, background_png, equipped, discord_avatar,
+         unlocked, taken) = await asyncio.gather(
+            fetch_username(roblox_id), fetch_avatar_png(roblox_id),
+            fetch_profile_background_png(roblox_id),
+            fetch_equipped_username_effect(roblox_id),
+            member.display_avatar.replace(size=256, static_format="png").read(),
+            sync_achievement_items(member.guild, rules, added),
+            sync_achievement_items(member.guild, rules, removed),
+        )
+        image, extension = await asyncio.to_thread(
+            card_render.render_sync_card,
+            discord_name=member.name, discord_avatar_png=discord_avatar,
+            roblox_name=name or str(roblox_id), roblox_avatar_png=avatar_png,
+            background_png=background_png, unlocked=unlocked, removed=taken,
+            effect=username_effects.resolve_effect(effect_name or equipped),
+        )
+    except Exception:
+        print(f"sync card for {member.id} failed:")
+        traceback.print_exc()
+        return None
+    lines = [note] if note else []
+    if blocked:
+        lines.append(f"-# ⚠️ {len(blocked)} role(s) I can't manage: "
+                     + ", ".join(f"`{r}`" for r in blocked))
+    extra = dev_universe_note()
+    if extra:
+        lines.append(extra)
+    return SyncCardView(image, extension=extension,
+                        description=f"{member.name} synced with {name or roblox_id}",
+                        note="\n".join(lines) or None)
+
+@bot.command(name="testsync", hidden=True)
+@commands.is_owner()
+async def test_sync_card(ctx, member: str = None, *options: str):
+    """Owner-only preview of the sync card, here, pinging nobody and
+    changing no roles. `!testsync [member|me] [demo] [effect|none]`: what a
+    sync would do for them right now; with demo, as if it unlocked every
+    achievement role they hold and took one away, to show the grid. Their
+    Roblox name plays its equipped username effect unless one is named
+    (or none), as !testprofile."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    if ctx.guild is None:
+        await ctx.send("This only works inside a server.")
+        return
+    demo = any(option.lower() == "demo" for option in options)
+    effect = next((option for option in options if option.lower() != "demo"), None)
+    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
+        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
+        return
+    async with ctx.typing():
+        target = ctx.guild.get_member(ctx.author.id) or ctx.author
+        if member not in (None, "me"):
+            found = await find_discord_user(ctx, member)
+            target = ctx.guild.get_member(found.id) if found is not None else None
+            if target is None:
+                await ctx.send(f"Couldn't find `{member}` in this server.")
+                return
+        roblox_id = await fetch_linked_user_id(target.id)
+        if roblox_id is None:
+            await ctx.send(f"**{target}** hasn't linked a Roblox account.")
+            return
+        rules = await fetch_role_rules(ctx.guild.id)
+        if demo:
+            governed = {rule_role_id(rule) for rule in rules
+                        if rule.get("type") in ("badge", "map")}
+            held = [role for role in target.roles
+                    if role.id in governed and role.id not in SYNC_CATEGORY_ROLE_IDS]
+            if not held:
+                held = [role for role_id in governed
+                        if role_id and (role := ctx.guild.get_role(role_id))][:3]
+            added, removed, blocked = held[1:] or held, held[:1], []
+            note = "-# Preview — made-up changes, no roles touched."
+        else:
+            added, removed, blocked = await sync_member_roles(
+                target, roblox_id, rules, map_cache={}, apply=False)
+            note = "-# Preview — what a sync would do, no roles touched."
+        view = await build_sync_card_view(target, roblox_id, rules, added, removed,
+                                          blocked, note=note, effect_name=effect)
+        if view is None:
+            await ctx.send("Couldn't render the sync card — the log has why.")
+            return
+    view.message = await ctx.send(view=view, files=view.card_files(),
+                                  allowed_mentions=SILENT)
+
 def summarize_sync(added, removed, blocked):
     lines = []
     if added:
@@ -6632,6 +6660,11 @@ async def sync_member_card(member, viewer_id, rules, map_cache=None):
             "I don't have permission to edit those roles.",
             colour=discord.Color.red(),
         )
+
+    if SYNC_RESULT_CARD and card_render is not None:
+        view = await build_sync_card_view(member, roblox_id, rules, added, removed, blocked)
+        if view is not None:
+            return view
 
     name, headshots = await asyncio.gather(
         fetch_username(roblox_id), fetch_headshots([roblox_id])
@@ -6679,7 +6712,9 @@ async def sync_slash_command(interaction: discord.Interaction):
         interaction.guild.get_member(interaction.user.id) or interaction.user
     )
     view = await sync_member_card(member, interaction.user.id, rules)
-    await interaction.followup.send(view=view, allowed_mentions=SILENT)
+    files = view.card_files() if isinstance(view, CardView) else []
+    await interaction.followup.send(view=view, allowed_mentions=SILENT,
+                                    **({"files": files} if files else {}))
 
 # Prefix-only, so the target stays available to admins without appearing as
 # an option on the slash command everyone sees.
@@ -6770,7 +6805,9 @@ async def sync_command(ctx, *, target: str = None):
     view = await sync_member_card(
         member, ctx.author.id, rules, map_cache=map_cache
     )
-    await ctx.send(view=view, allowed_mentions=SILENT)
+    files = view.card_files() if isinstance(view, CardView) else []
+    await ctx.send(view=view, allowed_mentions=SILENT,
+                   **({"files": files} if files else {}))
 
 @bot.hybrid_command(description="Check that the bot is alive")
 async def ping(ctx):
@@ -6913,8 +6950,13 @@ async def stats_command(ctx):
             colour=discord.Color.red(),
         ))
         return
-    view = GameStatsView(stats)
-    view.message = await ctx.send(view=view)
+    if card_render is not None:
+        thumbnail_path = pick_stats_thumbnail()
+        image = await render_game_stats_card(stats, thumbnail_path)
+        view = GameStatsCardView(stats, image, thumbnail_path)
+    else:
+        view = GameStatsView(stats)
+    view.message = await ctx.send(view=view, files=view_files(view))
 
 # The stats card's banner picture; its colours also make the backdrop.
 STATS_THUMBNAIL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -6956,7 +6998,7 @@ async def render_game_stats_card(stats, thumbnail_path):
 class GameStatsCardView(CardView):
     """The live game numbers as a rendered card, with Game page and Refresh.
 
-    On trial behind !teststats before it replaces /stats' text card. Refresh
+    /stats' card; GameStatsView is the fallback without Pillow. Refresh
     keeps the banner picture, so only the numbers change.
     """
 
@@ -7014,23 +7056,6 @@ class GameStatsCardView(CardView):
             return
         self.build(stats, await render_game_stats_card(stats, self.thumbnail_path))
         await show_card(interaction, self)
-
-@bot.command(name="teststats", hidden=True)
-@commands.is_owner()
-async def test_stats_card(ctx):
-    """Owner-only preview of the image /stats card, before /stats uses it."""
-    if card_render is None:
-        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
-        return
-    async with ctx.typing():
-        stats = await fetch_game_stats(current_universe())
-        if stats is None:
-            await ctx.send("Couldn't reach the game page right now. Try again in a bit.")
-            return
-        thumbnail_path = pick_stats_thumbnail()
-        image = await render_game_stats_card(stats, thumbnail_path)
-        view = GameStatsCardView(stats, image, thumbnail_path)
-    view.message = await ctx.send(view=view, files=view.card_files())
 
 @bot.hybrid_command(description="Get the link to the Roblox group")
 async def group(ctx):
@@ -10197,8 +10222,7 @@ async def test_cup_announcement(
     Name a channel to post somewhere else: `!testcup #scratch`.
     Pass true to crosspost as well: `!testcup true` -- that reaches every
     server following an announcement channel for real, so it defaults to off.
-    Posts the image cards, on trial before the scheduled post switches to
-    them (DAILY_CUP_IMAGE_CARDS).
+    Always posts the image cards, whatever DAILY_CUP_IMAGE_CARDS says.
     """
     async with ctx.typing():
         posted = await publish_daily_cup_announcement(
@@ -11640,7 +11664,7 @@ async def announce_tournament(record, view, *, kind="info", ping=False,
     pinged = attach_mention(view, tournament_ping(record, ping))
     try:
         message = await channel.send(
-            view=view,
+            view=view, files=view_files(view),
             allowed_mentions=(discord.AllowedMentions(
                 everyone=False, users=False, roles=True, replied_user=False,
             ) if pinged else SILENT),
@@ -11737,7 +11761,7 @@ class TournamentCheckinView(discord.ui.LayoutView):
 
     With `pool_image` (the rendered map pool card's PNG) the pool is that
     picture instead of the list and thumbnail grid; send card_files() with
-    it. On trial behind !testcheckin.
+    it. Previewed by !testcheckin.
     """
 
     def __init__(self, record=None, thumbnails=None, pool_image=None):
@@ -11817,7 +11841,7 @@ TOURNAMENT_POOL_FILENAME = "map-pool.png"
 # The match card's veto shows the pool card, banned maps stamped, in place
 # of the list. Off until the image tournament cards go live; !testveto
 # previews it either way.
-MATCH_VETO_POOL_CARD = False
+MATCH_VETO_POOL_CARD = True
 # A pool's thumbnails, by tournament: (expiry, {map id: PNG bytes or None}).
 # Every ban re-renders the card, and the pictures don't change mid-match.
 POOL_THUMBNAIL_TTL = 3600
@@ -12137,8 +12161,15 @@ async def open_checkin(record):
     )
 
     # Players are pinged here through their role, never DMed.
-    await announce_tournament(record, TournamentCheckinView(record, thumbnails),
-                              ping="players")
+    pool_image = None
+    try:
+        pool_image = await render_tournament_pool(record)
+    except Exception:
+        # The text pool and thumbnails still go out.
+        traceback.print_exc()
+    await announce_tournament(
+        record, TournamentCheckinView(record, thumbnails, pool_image=pool_image),
+        ping="players")
 
 # Seeding blends two rankings, each taken as a percentile of the field so
 # neither dominates by scale: career wins run into the thousands while a
@@ -13156,7 +13187,15 @@ async def crown_champion(record, decided=None):
         note = ("\n-# Couldn't hand out the champion roles — check that mine "
                 "sits above them and that they're still in the server.")
 
-    await announce_tournament(saved, simple_card(
+    winner_view = None
+    if card_render is not None and saved.get("Standings"):
+        try:
+            winner_view = await build_tournament_winner_view(
+                saved, saved["Standings"], len(participants), note=note.lstrip("\n"))
+        except Exception:
+            # The text podium below still crowns them.
+            traceback.print_exc()
+    await announce_tournament(saved, winner_view or simple_card(
         "\n".join(podium)
         + f"\n\n🔗 {saved['Challonge']['Url']}{note}",
         heading=f"🏆 {saved['Name']} — we have a winner",
@@ -13233,8 +13272,8 @@ async def log_tournament_result(record, standings, field_size):
 
 # --- Winner card (image) ---------------------------------------------------
 # The leaderboard card with the final standings on it: the top three on the
-# podium, 4th-10th on the sheet. On trial behind !testwinner before it
-# replaces the "we have a winner" text card.
+# podium, 4th-10th on the sheet. Replaces the "we have a
+# winner" text card; previewed by !testwinner.
 
 TOURNAMENT_WINNER_FILENAME = "winner"
 
@@ -13707,11 +13746,13 @@ def pool_card_gallery(record):
                      description=f"{record['Name']} map pool")
     return gallery
 
-def match_card(record, match_id, match, pool_image=None):
+def match_card(record, match_id, match, pool_image=None, result_file=None):
     """The one message in a match thread, rendered for its current state.
 
     With `pool_image` (render_tournament_pool's PNG for this match) the
     veto and the map picked show it; send it as TOURNAMENT_POOL_FILENAME.
+    With `result_file` (match_result_image's filename) a finished match
+    shows that picture in place of its headline.
     """
     container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
     high, low = match["High"], match["Low"]
@@ -13827,6 +13868,18 @@ def match_card(record, match_id, match, pool_image=None):
             "game-disconnect": "reported by the game — the other player "
                                "disconnected and didn't come back",
         }.get(match.get("How"), match.get("How") or "")
+        if result_file:
+            gallery = discord.ui.MediaGallery()
+            gallery.add_item(media=f"attachment://{result_file}",
+                             description=match_label(record, match))
+            container.add_item(gallery)
+            container.add_item(discord.ui.TextDisplay(
+                (f"-# 🏁 <@{winner}> wins" if winner else "-# 🏁 Finished")
+                + (f" · {how}" if how else "")
+            ))
+            view = discord.ui.LayoutView(timeout=None)
+            view.add_item(container)
+            return view
         headline = (f"## 🏁 <@{winner}> wins"
                     + (f" {match['Score']}" if match.get("Score") else "")
                     if winner else "## 🏁 Finished")
@@ -13938,6 +13991,175 @@ async def test_veto_card(ctx):
     view.message = await ctx.send(view=view, files=view.card_files(),
                                   allowed_mentions=SILENT)
 
+# A finished match's card shows the result as a rendered versus card: both
+# players, the winner crowned, the score or how it was decided. Off until
+# the image tournament cards go live; !testmatchresult previews it.
+MATCH_RESULT_CARD = True
+
+# How a match was decided without being played out -> (the loser's big
+# text, the loser's pill, how the summary says it was won).
+MATCH_RESULT_HOW = {
+    "walkover": ("L", "No check-in", "by walkover"),
+    "forfeit": ("FF", "Forfeited", "by forfeit"),
+    "game-no-show": ("L", "No-show", "by no-show"),
+    "game-disconnect": ("L", "Disconnected", "by disconnect"),
+}
+
+def match_loser_note(record, match, loser):
+    """Where losing this match leaves the loser."""
+    if match.get("ThirdPlace"):
+        return "4th place"
+    if record.get("Format") == "double" and losses(record, loser) < 2:
+        return "Drops to losers"
+    if awaits_third_place(record, loser):
+        return "Plays for 3rd"
+    return "Eliminated"
+
+def match_result_fields(record, match):
+    """render_versus_card's `match` for a finished match, the higher seed
+    on the left as in the thread title."""
+    winner = match.get("Winner")
+    loser_text, loser_note, by = MATCH_RESULT_HOW.get(match.get("How"), (None, None, None))
+    # Score is the winner's first; a walkover's or forfeit's 1-0 is made up.
+    score = match.get("Score") or ""
+    numbers = (score.split("-") if by is None and re.fullmatch(r"\d+-\d+", score)
+               else None)
+    sides = []
+    for who in (match["High"], match["Low"]):
+        won = winner == who
+        if winner is None:
+            big, note = "–", "Finished"
+        elif won:
+            big, note = (numbers[0] if numbers else "W"), "Winner"
+        else:
+            big = numbers[1] if numbers else (loser_text or "L")
+            note = loser_note or match_loser_note(record, match, who)
+        seed = seed_of(record, who)
+        sides.append(dict(won=won, score=big, note=note,
+                          subtitle=f"Seed {seed}" if seed < 10_000 else ""))
+
+    if winner is None:
+        summary = f"{match_label(record, match)} · Finished"
+    else:
+        summary = f"{player_name(record, winner)} wins " + (
+            f"{numbers[0]}–{numbers[1]}" if numbers else by or "")
+    if match.get("ThirdPlace"):
+        summary += " · 3rd place"
+    if match.get("Map") is not None:
+        summary += f" · {pool_entry(record, match['Map'])['Name']}"
+    return dict(sides=sides, summary=summary.replace("  ", " ").strip())
+
+async def match_result_player(record, discord_id):
+    """render_versus_card's dict for one player in the match: the compare
+    card's avatar, background and effect, by their linked Roblox account."""
+    player = player_by_discord(record, discord_id) or {}
+    roblox_id = normalize_user_id(player.get("RobloxId"))
+    fields = dict(username=player.get("Name") or "Unknown")
+    if roblox_id is None:
+        return fields
+    avatar_png, background_png, equipped = await asyncio.gather(
+        fetch_avatar_png(roblox_id), fetch_profile_background_png(roblox_id),
+        fetch_equipped_username_effect(roblox_id),
+    )
+    fields.update(avatar_png=avatar_png, background_png=background_png,
+                  effect=username_effects.resolve_effect(equipped))
+    return fields
+
+async def match_result_image(record, match):
+    """The finished match as (image bytes, filename), or None. A render
+    that fails leaves the card on its text headline."""
+    if card_render is None or match.get("State") != "done":
+        return None
+    try:
+        left, right = await asyncio.gather(
+            match_result_player(record, match["High"]),
+            match_result_player(record, match["Low"]),
+        )
+        image, extension = await asyncio.to_thread(
+            card_render.render_versus_card, left=left, right=right,
+            match=match_result_fields(record, match))
+    except Exception:
+        print(f"tournament {record.get('Id')}: match result render failed:")
+        traceback.print_exc()
+        return None
+    return image, f"match-result.{extension}"
+
+# !testmatchresult's made-up endings: (How, Score with the winner's first).
+TEST_MATCH_ENDINGS = {
+    "played": ("game", "2-1"),
+    "host": ("host", "3-2"),
+    "ff": ("forfeit", "1-0"),
+    "walkover": ("walkover", "1-0"),
+    "noshow": ("game-no-show", "1-0"),
+    "dc": ("game-disconnect", "1-0"),
+    "challonge": ("challonge", None),
+}
+
+async def find_any_match(reference):
+    """A match by letter or id in the live tournament, else the latest
+    ones: (record, match id, match), or Nones."""
+    record = await active_tournament()
+    if record is not None:
+        match_id, match = find_match(record, reference)
+        if match is not None:
+            return record, match_id, match
+    for entry in list(reversed(await read_tournament_index()))[:5]:
+        if not isinstance(entry, dict) or (record and entry.get("Id") == record["Id"]):
+            continue
+        other = await read_tournament(entry["Id"])
+        if other is None:
+            continue
+        match_id, match = find_match(other, reference)
+        if match is not None:
+            return other, match_id, match
+    return None, None, None
+
+@bot.command(name="testmatchresult", hidden=True)
+@commands.is_owner()
+async def test_match_result_card(ctx, reference: str = None):
+    """Owner-only preview of a finished match's result card, here, pinging
+    nobody. `!testmatchresult [match]`: a match's letter or id from the live
+    or a recent tournament; without one, a made-up match -- or one of
+    played, host, ff, walkover, noshow, dc, challonge for how it ended."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    ending = TEST_MATCH_ENDINGS.get((reference or "played").lower())
+    async with ctx.typing():
+        if ending is None:
+            record, match_id, match = await find_any_match(reference)
+            if match is None:
+                await ctx.send(f"No match `{reference}` in the live or recent tournaments.")
+                return
+            if match.get("State") != "done":
+                await ctx.send(f"{match_label(record, match)} isn't finished yet.")
+                return
+        else:
+            how, score = ending
+            # Made-up Discord IDs: the mentions show as unknown users.
+            record = {
+                "Id": 0, "Name": "Sample Cup", "Format": "single", "BestOf": 3,
+                "Players": [{"DiscordId": "1", "RobloxId": None, "Name": "RazzMaster"},
+                            {"DiscordId": "2", "RobloxId": None, "Name": "SpeedyPanda"}],
+                "Seeded": [{"DiscordId": "1"}, {"DiscordId": "2"}],
+                "Pool": [{"Id": 1, "Name": "Lava Tower"}], "Matches": {},
+            }
+            # The lower seed wins a forfeit, so both sides get a turn.
+            winner = "2" if how == "forfeit" else "1"
+            match_id, match = "test", {
+                "Id": "test", "Code": "C", "Round": 2, "High": "1", "Low": "2",
+                "State": "done", "Winner": winner, "Score": score, "How": how,
+                "Map": None if how in ("walkover", "challonge") else 1,
+            }
+        result = await match_result_image(record, match)
+        if result is None:
+            await ctx.send("Couldn't render that result — the log has why.")
+            return
+    image, filename = result
+    await ctx.send(view=match_card(record, match_id, match, result_file=filename),
+                   files=[discord.File(io.BytesIO(image), filename=filename)],
+                   allowed_mentions=SILENT)
+
 async def refresh_match_card(record, match_id, match, *, ping=False):
     """Re-render the card in place. Returns True when it landed."""
     thread = await match_thread(record, match)
@@ -13945,7 +14167,14 @@ async def refresh_match_card(record, match_id, match, *, ping=False):
         return False
     try:
         message = await thread.fetch_message(int(match["MessageId"]))
-        if MATCH_VETO_POOL_CARD:
+        result = (await match_result_image(record, match)
+                  if MATCH_RESULT_CARD and match.get("State") == "done" else None)
+        if result is not None:
+            image, filename = result
+            await message.edit(
+                view=match_card(record, match_id, match, result_file=filename),
+                attachments=[discord.File(io.BytesIO(image), filename=filename)])
+        elif MATCH_VETO_POOL_CARD:
             image = await match_pool_image(record, match)
             # Every edit replaces the attachments, so the picture goes once
             # the match is past it.
@@ -14154,6 +14383,9 @@ async def finish_match(record, match_id, winner_id, scores, how):
                 + "\n".join(f"· {match_label(saved, m)}" for m in waiting)
                 + "\n-# `!tournament result` or `!tournament ff` each one.",
             )
+        # No bracket read follows a finalized bracket's result, so the card
+        # is redrawn here, after any crowning.
+        await update_bracket_card(saved)
     elif how != "challonge":
         await refresh_bracket(saved)
     if winner_id is None:
@@ -14352,6 +14584,441 @@ async def collect_game_result(record, match_id, match, stored):
 # below keeps only the deadlines and the game's results, which cost nothing.
 _refreshed_since_boot = set()
 
+# --- The bracket card ---------------------------------------------------------
+# The bracket drawn from the record: the seeding Challonge was given (seed
+# order, so the tree is Challonge's own) and the results the bot reported.
+# Up to 16 players it's one card; bigger brackets show their last rounds,
+# with a button per 16-player section. A double-elimination bracket adds
+# losers-bracket cards. The posted card is re-drawn every time the bot reads
+# the bracket -- results it reports, ones entered on Challonge, the start --
+# so it never costs a Challonge request of its own. Off until the image
+# tournament cards go live; !testbracket previews it either way.
+BRACKET_CARD_LIVE = True
+BRACKET_FILENAME = "bracket"
+BRACKET_BUTTON_PREFIX = "tbk:"
+# Four rounds a section: 8, 4, 2 and 1 matches.
+BRACKET_SECTION_ROUNDS = 4
+BRACKET_COLUMN_MATCHES = 8
+BRACKET_PAGE_COLUMNS = 4
+_bracket_card_lock = asyncio.Lock()
+
+def seeding_order(size):
+    """Seeds in bracket order, top to bottom, for a power-of-two field:
+    1 v size, then the rest so the top seeds meet as late as possible."""
+    order = [1]
+    while len(order) < size:
+        total = len(order) * 2
+        order = [seed for top in order for seed in (top, total + 1 - top)]
+    return order
+
+def bracket_match_scores(match):
+    """{discord id: text for the score box} for a finished match: the
+    numbers, or W and FF/– for one decided without being played out."""
+    winner = match.get("Winner")
+    if match.get("State") != "done" or not winner:
+        return {}
+    loser = match["Low"] if winner == match["High"] else match["High"]
+    how = match.get("How")
+    if how in MATCH_RESULT_HOW:
+        return {winner: "W", loser: "FF" if how == "forfeit" else "–"}
+    score = match.get("Score") or ""
+    if re.fullmatch(r"\d+-\d+", score):
+        won, lost = score.split("-")
+        return {winner: won, loser: lost}
+    return {winner: "W", loser: ""}
+
+def bracket_match_fields(record, players, match):
+    """render_bracket_card's match for two players (Discord IDs, None for
+    not decided yet) and the record's match between them, if any."""
+    done = bool(match and match.get("State") == "done" and match.get("Winner"))
+    scores = bracket_match_scores(match) if match else {}
+    slots = []
+    for who in players:
+        slots.append({
+            "name": player_name(record, who) if who else "TBD",
+            "score": scores.get(who, "") if who else "",
+            "win": done and who is not None and match["Winner"] == who,
+        })
+    return {"a": slots[0], "b": slots[1]}
+
+def winners_bracket(record):
+    """The winners bracket as rounds of nodes, first round first. A node:
+    players (two Discord IDs, None for undecided), match (the record's, or
+    None), winner, and bye (a first-round slot with one player, who goes
+    straight through)."""
+    seeds = [entry.get("DiscordId") for entry in record.get("Seeded") or []
+             if isinstance(entry, dict)]
+    size = 2
+    while size < len(seeds):
+        size *= 2
+    leaves = [seeds[seed - 1] if seed <= len(seeds) else None
+              for seed in seeding_order(size)]
+    rounds_count = size.bit_length() - 1
+    by_pair = {}
+    for match in (record.get("Matches") or {}).values():
+        if (isinstance(match.get("Round"), int) and 0 < match["Round"] <= rounds_count
+                and not match.get("ThirdPlace")):
+            by_pair.setdefault(frozenset((match["High"], match["Low"])), []).append(match)
+
+    rounds, pairs = [], [leaves[i:i + 2] for i in range(0, size, 2)]
+    for number in range(1, rounds_count + 1):
+        row = []
+        for a, b in pairs:
+            node = {"players": [a, b], "match": None, "winner": None,
+                    "bye": number == 1 and (a is None) != (b is None)}
+            if node["bye"]:
+                node["winner"] = a or b
+            elif a and b:
+                found = by_pair.get(frozenset((a, b))) or []
+                found.sort(key=lambda m: m.get("Round") != number)
+                node["match"] = found[0] if found else None
+                if node["match"] and node["match"].get("State") == "done":
+                    node["winner"] = node["match"].get("Winner")
+            row.append(node)
+        rounds.append(row)
+        pairs = [[row[i]["winner"], row[i + 1]["winner"]] for i in range(0, len(row) - 1, 2)]
+    return rounds
+
+def round_label(count, double=False):
+    name = ({1: "Final", 2: "Semifinals", 4: "Quarterfinals"}.get(count)
+            or f"Round of {2 * count}")
+    return f"Winners {name.lower()}" if double else name
+
+def bracket_column(record, nodes, label, tier):
+    return {"label": label, "tier": tier,
+            "matches": [None if node["bye"] else
+                        bracket_match_fields(record, node["players"], node["match"])
+                        for node in nodes]}
+
+def sort_by_code(matches):
+    # Challonge's letters run A..Z, then AA, AB...
+    return sorted(matches, key=lambda m: (len(str(m.get("Code") or "")),
+                                          str(m.get("Code") or "")))
+
+def bracket_pages(record):
+    """Every page of the bracket card, the posted one first: dicts with
+    key, label (for its button), fields (render_bracket_card's, but
+    `champion` as a Discord ID, None for TBD, or False for none)."""
+    seeded = len(record.get("Seeded") or [])
+    double = record.get("Format") == "double"
+    rounds = winners_bracket(record)
+    total = len(rounds)
+    matches = list((record.get("Matches") or {}).values())
+    date = (card_render.format_date(record["MatchesStart"])
+            if record.get("MatchesStart") else "")
+    base = f"Bracket · {seeded} players"
+
+    # Double elimination ends in a grand final (and a reset) past the
+    # winners bracket's last round.
+    grand = sort_by_code([m for m in matches if isinstance(m.get("Round"), int)
+                          and m["Round"] > total and not m.get("ThirdPlace")])
+    third = next((m for m in matches if m.get("ThirdPlace")), None)
+    champion = next((entry.get("DiscordId") for entry in record.get("Standings") or []
+                     if entry.get("Rank") == 1 and entry.get("DiscordId")), None)
+    if champion is None and not double and rounds and rounds[-1][0]["winner"]:
+        champion = rounds[-1][0]["winner"]
+
+    def tier(number):
+        return total - number + (1 if double else 0)
+
+    def finals_columns(first):
+        columns = [bracket_column(record, rounds[n - 1], round_label(len(rounds[n - 1]), double),
+                                  tier(n)) for n in range(first, total + 1)]
+        for index, match in enumerate(grand):
+            columns.append({"label": "Grand final" + (" reset" if index else ""), "tier": 0,
+                            "matches": [bracket_match_fields(
+                                record, [match["High"], match["Low"]], match)]})
+        return columns
+
+    third_place = None
+    if not double and total >= 2:
+        if third:
+            players = [third["High"], third["Low"]]
+        else:
+            semis = rounds[-2]
+            players = [next((p for p in node["players"] if p and node["winner"]
+                             and p != node["winner"]), None) for node in semis[:2]]
+        third_place = {"label": "3rd place", "tier": 1,
+                       "match": bracket_match_fields(record, players, third)}
+
+    first = 1 if total <= BRACKET_SECTION_ROUNDS else BRACKET_SECTION_ROUNDS
+    pages = [{"key": "main", "label": "Bracket", "fields": dict(
+        title=record["Name"], date=date,
+        subtitle=base if first == 1 else f"{base} · last {total - first + 1} rounds",
+        columns=finals_columns(first), champion=champion, third_place=third_place)}]
+
+    if first > 1:
+        sections = len(rounds[first - 1])
+        for index in range(sections):
+            columns = []
+            for number in range(1, first + 1):
+                per = len(rounds[number - 1]) // sections
+                columns.append(bracket_column(
+                    record, rounds[number - 1][index * per:(index + 1) * per],
+                    round_label(len(rounds[number - 1]), double), tier(number)))
+            pages.append({"key": f"s{index + 1}", "label": f"Section {index + 1}",
+                          "fields": dict(title=record["Name"], date=date,
+                                         subtitle=f"{base} · section {index + 1} of {sections}",
+                                         columns=columns, champion=False)})
+
+    if double:
+        losers = {}
+        for match in matches:
+            if isinstance(match.get("Round"), int) and match["Round"] < 0:
+                losers.setdefault(-match["Round"], []).append(match)
+        columns = []
+        for number in sorted(losers):
+            found = sort_by_code(losers[number])
+            chunks = [found[i:i + BRACKET_COLUMN_MATCHES]
+                      for i in range(0, len(found), BRACKET_COLUMN_MATCHES)]
+            for part, chunk in enumerate(chunks):
+                columns.append({
+                    "label": f"Losers round {number}"
+                             + (f" ({part + 1}/{len(chunks)})" if len(chunks) > 1 else ""),
+                    "tier": 3,
+                    "matches": [bracket_match_fields(record, [m["High"], m["Low"]], m)
+                                for m in chunk]})
+        groups = [columns[i:i + BRACKET_PAGE_COLUMNS]
+                  for i in range(0, len(columns), BRACKET_PAGE_COLUMNS)]
+        for index, group in enumerate(groups):
+            label = "Losers" + (f" {index + 1}" if len(groups) > 1 else "")
+            pages.append({"key": f"l{index + 1}", "label": label, "fields": dict(
+                title=record["Name"], date=date, connected=False, champion=False,
+                subtitle=("Losers bracket · matches as they open"
+                          + (f" · {index + 1} of {len(groups)}" if len(groups) > 1 else "")),
+                columns=group)})
+    return pages
+
+async def render_bracket_page(record, page, *, effect_name=None):
+    """A page's picture as (image bytes, filename). Once there's a
+    champion, their avatar is fetched and their name plays their equipped
+    username effect -- a WebP then, else a PNG; effect_name forces one (or
+    "none" none), for previews."""
+    fields = dict(page["fields"])
+    champion = fields.get("champion")
+    if champion not in (None, False):
+        player = player_by_discord(record, champion) or {}
+        roblox_id = normalize_user_id(player.get("RobloxId"))
+        avatar_png, equipped = (await asyncio.gather(
+            fetch_avatar_png(roblox_id), fetch_equipped_username_effect(roblox_id))
+            if roblox_id else (None, None))
+        fields["champion"] = {
+            "name": player_name(record, champion), "avatar_png": avatar_png,
+            "effect": username_effects.resolve_effect(effect_name or equipped),
+        }
+    image, extension = await asyncio.to_thread(card_render.render_bracket_card, **fields)
+    return image, f"{BRACKET_FILENAME}.{extension}"
+
+def bracket_card_view(record, pages, filename, *, on_section=None):
+    """The posted bracket: the first page's picture, a button per other
+    page and the Challonge link. The buttons carry `tbk:` IDs the
+    bracket_card_buttons listener answers, unless `on_section` (a
+    coroutine taking the interaction and the page) answers them, as the
+    preview's do."""
+    view = discord.ui.LayoutView(timeout=None) if on_section is None else CardView()
+    container = discord.ui.Container(accent_colour=TOURNAMENT_COLOR)
+    gallery = discord.ui.MediaGallery()
+    gallery.add_item(media=f"attachment://{filename}",
+                     description=f"{record['Name']} bracket")
+    container.add_item(gallery)
+    buttons = []
+    for page in pages[1:]:
+        button = discord.ui.Button(
+            label=page["label"], style=discord.ButtonStyle.secondary,
+            custom_id=(f"{BRACKET_BUTTON_PREFIX}{record['Id']}:{page['key']}"
+                       if on_section is None else
+                       f"testbracket:{secrets.token_hex(4)}:{page['key']}"))
+        if on_section is not None:
+            button.callback = functools.partial(on_section, page=page)
+        buttons.append(button)
+    url = (record.get("Challonge") or {}).get("Url")
+    if url:
+        buttons.append(discord.ui.Button(label="Challonge", style=discord.ButtonStyle.link,
+                                         url=url, emoji="🔗"))
+    for start in range(0, len(buttons), 5):
+        row = discord.ui.ActionRow()
+        for button in buttons[start:start + 5]:
+            row.add_item(button)
+        container.add_item(row)
+    view.add_item(container)
+    return view
+
+def bracket_page_view(record, page, filename):
+    """One page on its own, for a section button's private answer."""
+    view = discord.ui.LayoutView(timeout=None)
+    gallery = discord.ui.MediaGallery()
+    gallery.add_item(media=f"attachment://{filename}",
+                     description=f"{record['Name']} — {page['label']}")
+    view.add_item(gallery)
+    return view
+
+async def update_bracket_card(record):
+    """Post the bracket card, or redraw the one already posted. Called each
+    time the bot has read the bracket, so it follows every result."""
+    if not BRACKET_CARD_LIVE or card_render is None or not record.get("Seeded"):
+        return
+    if record.get("Phase") not in ("live", "done"):
+        return
+    async with _bracket_card_lock:
+        record = await read_tournament(record["Id"]) or record
+        try:
+            pages = bracket_pages(record)
+            image, filename = await render_bracket_page(record, pages[0])
+        except Exception:
+            print(f"tournament {record['Id']}: bracket card render failed:")
+            traceback.print_exc()
+            return
+        view = bracket_card_view(record, pages, filename)
+        file = discord.File(io.BytesIO(image), filename=filename)
+        posted = record.get("BracketCard") or {}
+        channel = (bot.get_channel(int(posted["ChannelId"])) if posted.get("ChannelId")
+                   else None)
+        if channel is not None and posted.get("MessageId"):
+            try:
+                await channel.get_partial_message(int(posted["MessageId"])).edit(
+                    view=view, attachments=[file])
+                return
+            except discord.NotFound:
+                pass  # Deleted: post a new one.
+            except discord.HTTPException as error:
+                print(f"tournament {record['Id']}: couldn't redraw the bracket card "
+                      f"({error})")
+                return
+        channel = tournament_destination(record, "info")
+        if channel is None:
+            return
+        try:
+            message = await channel.send(view=view, files=[file], allowed_mentions=SILENT)
+        except discord.HTTPException as error:
+            print(f"tournament {record['Id']}: couldn't post the bracket card ({error})")
+            return
+
+        def transform(stored):
+            stored["BracketCard"] = {"ChannelId": str(channel.id),
+                                     "MessageId": str(message.id)}
+            return stored
+
+        await update_tournament(record["Id"], transform)
+
+@bot.listen("on_interaction")
+async def bracket_card_buttons(interaction):
+    """A section button on the posted bracket: that page, just for them."""
+    if interaction.type is not discord.InteractionType.component:
+        return
+    custom_id = (interaction.data or {}).get("custom_id") or ""
+    if not custom_id.startswith(BRACKET_BUTTON_PREFIX):
+        return
+    parts = custom_id[len(BRACKET_BUTTON_PREFIX):].split(":")
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    record = await read_tournament(parts[0]) if len(parts) == 2 else None
+    page = None
+    if record is not None and card_render is not None:
+        page = next((p for p in bracket_pages(record) if p["key"] == parts[1]), None)
+    if page is None:
+        await interaction.followup.send("That part of the bracket is gone.", ephemeral=True)
+        return
+    image, filename = await render_bracket_page(record, page)
+    await interaction.followup.send(
+        view=bracket_page_view(record, page, filename), ephemeral=True,
+        files=[discord.File(io.BytesIO(image), filename=filename)])
+
+def fake_bracket_tournament(size, form, progress):
+    """A made-up live bracket for !testbracket: `size` players seeded in
+    order, every round before `progress` played (Bo3, the better seed
+    usually winning), and in double elimination a few losers rounds."""
+    rng = random.Random(size * 31 + progress)
+    names = ["RazzMaster", "SpeedyPanda", "xXLavaJumperXx", "CloudHopper", "Pixelated_Pete",
+             "Noob123", "TurboTom", "Zigzag", "bliind_hunter", "Agent_Noob0o1",
+             "genericplayer89", "rockbennettw", "ZoGung", "kangbyungjin", "tfdugef", "p_droXD"]
+    players = [{"DiscordId": str(i), "RobloxId": None,
+                "Name": names[(i - 1) % len(names)] + ("" if i <= len(names) else str(i))}
+               for i in range(1, size + 1)]
+    record = {"Id": 0, "Name": "Sample Cup", "Format": form, "BestOf": 3, "Phase": "live",
+              "MatchesStart": now_epoch(), "Players": players,
+              "Seeded": [{"DiscordId": p["DiscordId"]} for p in players],
+              "Matches": {}, "Challonge": {"Url": "https://challonge.com/"}}
+    codes = iter(f"{a}{b}".strip() for a in " ABCDEFGHIJ" for b in "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+    def play(high, low, number):
+        better, worse = sorted((high, low), key=int)
+        winner = better if rng.random() < 0.7 else worse
+        loser = low if winner == high else high
+        code = next(codes)
+        record["Matches"][code] = {
+            "Id": code, "Code": code, "Round": number, "High": high, "Low": low,
+            "State": "done", "Winner": winner, "How": "game",
+            "Score": f"2-{rng.randint(0, 1)}"}
+        return loser
+
+    dropped = []
+    for number in range(1, progress + 1):
+        rounds = winners_bracket(record)
+        if number > len(rounds):
+            break
+        losers = [play(*node["players"], number) for node in rounds[number - 1]
+                  if not node["bye"] and all(node["players"])]
+        dropped.append(losers)
+    if form == "double" and dropped:
+        # Losers round 1 pairs the first round's losers; later ones meet
+        # whoever drops from the round after.
+        alive, number = dropped[0], 1
+        for later in dropped[1:] + [[]]:
+            pairs = [alive[i:i + 2] for i in range(0, len(alive) - 1, 2)]
+            alive = [w for w in (alive[-1:] if len(alive) % 2 else [])]
+            for high, low in pairs:
+                loser = play(high, low, -number)
+                alive.append(high if loser == low else low)
+            alive += later
+            number += 1
+            if len(alive) < 2:
+                break
+    return record
+
+@bot.command(name="testbracket", hidden=True)
+@commands.is_owner()
+async def test_bracket_card(ctx, reference: str = None, form: str = "single",
+                            progress: int = 1, effect: str = None):
+    """Owner-only preview of the bracket card, here, pinging nobody.
+    `!testbracket [tournament id]` draws that tournament's bracket from its
+    record (no Challonge request); `!testbracket <players 4-64> [single|double]
+    [rounds played] [effect|none]` a made-up one, the effect played on the
+    champion's name once there is one. Its section buttons answer here."""
+    if card_render is None:
+        await ctx.send("Image cards need Pillow — run `!restart` to install it.")
+        return
+    if effect and effect.lower() != "none" and username_effects.resolve_effect(effect) is None:
+        await ctx.send(f"No preset called `{effect}` — `!testprofile me list` shows them.")
+        return
+    async with ctx.typing():
+        if reference is None or reference.isdigit() and 2 <= int(reference) <= 64:
+            size = int(reference or 8)
+            if form not in CHALLONGE_FORMATS:
+                await ctx.send("The format is `single` or `double`.")
+                return
+            record = fake_bracket_tournament(size, form, max(0, progress))
+        else:
+            record = await read_tournament(reference)
+            if record is None:
+                await ctx.send(f"No tournament `{reference}`.")
+                return
+            if not record.get("Seeded"):
+                await ctx.send(f"**{record['Name']}** has no bracket yet.")
+                return
+        pages = bracket_pages(record)
+        image, filename = await render_bracket_page(record, pages[0], effect_name=effect)
+
+    async def show_section(interaction, page):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        section, section_file = await render_bracket_page(record, page, effect_name=effect)
+        await interaction.followup.send(
+            view=bracket_page_view(record, page, section_file), ephemeral=True,
+            files=[discord.File(io.BytesIO(section), filename=section_file)])
+
+    view = bracket_card_view(record, pages, filename, on_section=show_section)
+    view.message = await ctx.send(
+        view=view, files=[discord.File(io.BytesIO(image), filename=filename)],
+        allowed_mentions=SILENT)
+
 async def refresh_bracket(record):
     """Read the bracket once and act on it. Returns (ok, reason).
 
@@ -14393,6 +15060,9 @@ async def refresh_bracket(record):
     if (found and not any(m["State"] == "open" for m in found)
             and any(m["State"] == "complete" for m in found)):
         await finalize_bracket(record)
+    # Every read of the bracket redraws the posted card, so it follows each
+    # result without a request of its own.
+    await update_bracket_card(record)
     return True, None
 
 async def follow_bracket_edits(record, found):

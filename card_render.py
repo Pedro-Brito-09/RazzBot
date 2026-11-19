@@ -2724,6 +2724,67 @@ def versus_paper(side, player, values, wins, score, name):
     return strip(PAPER_WIDTH, PAPER_HEIGHT, rgba(fill), CLIP_PAPER, content), name_at
 
 
+# A match result's paper, in place of the stat rows: the score big in the
+# middle, the winner's crown over it, and a pill at the bottom saying how
+# that side's match ended.
+MATCH_SCORE_SIZE, MATCH_SCORE_MIN = 210, 96
+MATCH_CROWN = 72
+MATCH_PILL = 52
+
+
+def match_paper(side, player, outcome, name):
+    """One player's paper on a match result: avatar, name (unless it
+    animates), the seed line, the score and the outcome pill. `outcome` is
+    a dict: won, score (text: "2", "FF", ...), note (the pill) and
+    subtitle. Returns the paper and the name box's top-left on it."""
+    fill, outline_hex = VERSUS_SIDES[side]
+    outline = rgba(outline_hex)
+    won = bool(outcome.get("won"))
+    avatar = framed_avatar(open_image(player.get("avatar_png")), VERSUS_AVATAR, 6, 20,
+                           "#2A2F4A", "#454D73")
+    subtitle = Text(outcome.get("subtitle") or "", HAND, 20, stroke=4, stroke_color=outline)
+    column_top = PAPER_PAD_TOP + (VERSUS_AVATAR - VERSUS_NAME_SIZE - subtitle.height) / 2
+    text_left = PAPER_PAD_X + VERSUS_AVATAR + 14
+    name_at = (text_left, column_top + (VERSUS_NAME_SIZE - name.height) / 2)
+
+    score_text = str(outcome.get("score") or "")
+    style = dict(line_height=1, stroke=16, stroke_color=outline, shadow=8)
+    score = (fit_text(score_text, DISPLAY, MATCH_SCORE_SIZE, PAPER_INNER - 20,
+                      min_size=MATCH_SCORE_MIN, **style)
+             or ellipsize(score_text, DISPLAY, MATCH_SCORE_MIN, PAPER_INNER - 20, **style))
+    pill_top = PAPER_HEIGHT - PAPER_PAD_BOTTOM - MATCH_PILL
+    note = ellipsize(outcome.get("note") or "", DISPLAY, 26, PAPER_INNER - 40,
+                     stroke=7, stroke_color=outline)
+    crown = versus_icon("crown", outline_hex, MATCH_CROWN) if won else None
+    # The crown and the score as one column, centred between the avatar row
+    # and the pill; the crown tucks 10px into the score's line box.
+    room_top, room_bottom = VERSUS_ROWS_TOP, pill_top - 8
+    stack = score.height + (MATCH_CROWN - 10 if won else 0)
+    stack_top = room_top + (room_bottom - room_top - stack) / 2
+
+    def content(image, draw):
+        place(image, with_drop_shadow(avatar, 5, color=LIGHT_SHADOW),
+              PAPER_PAD_X, PAPER_PAD_TOP, VERSUS_AVATAR, VERSUS_AVATAR)
+        if not player.get("effect"):
+            name.draw(draw, *name_at)
+        subtitle.draw(draw, text_left, column_top + VERSUS_NAME_SIZE)
+        score_top = stack_top
+        if crown is not None:
+            place(image, crown, (PAPER_WIDTH - MATCH_CROWN) / 2, stack_top,
+                  MATCH_CROWN, MATCH_CROWN, rotate=-8 if side == 0 else 8)
+            score_top += MATCH_CROWN - 10
+        # The score's own drop shadow sits under it, so the box is centred
+        # on the glyphs without it.
+        score.draw(draw, (PAPER_WIDTH - score.width) / 2, score_top + 10)
+        pill = clip_to(solid(PAPER_INNER, MATCH_PILL, (255, 255, 255, 82 if won else 20)),
+                       rounded_mask(PAPER_INNER, MATCH_PILL, 12))
+        image.alpha_composite(pill, (px(PAPER_PAD_X), px(pill_top)))
+        note.draw(draw, (PAPER_WIDTH - note.width) / 2,
+                  pill_top + (MATCH_PILL - note.height - 3) / 2 + 3)
+
+    return strip(PAPER_WIDTH, PAPER_HEIGHT, rgba(fill), CLIP_PAPER, content), name_at
+
+
 def draw_versus_backdrop(canvas, players):
     """Each player's profile background on their half, split along the
     ragged line."""
@@ -2794,14 +2855,16 @@ def _versus_to_canvas(left_edge, tilt, x, y):
     return turn_point(x, y, left_edge, PAPER_TOP, PAPER_WIDTH, PAPER_HEIGHT, tilt)
 
 
-def compose_versus_card(*, left, right):
+def compose_versus_card(*, left, right, match=None):
     """The card, and an AnimatedName spec for each player with an effect
-    (whose name is left off the card)."""
+    (whose name is left off the card). With `match` (see
+    render_versus_card) the papers show a match result, not stats."""
     players = (left, right)
-    count = len(VERSUS_STATS)
-    values = [(tuple(p.get("stats") or ()) + (None,) * count)[:count] for p in players]
-    results = versus_results(*values)
-    scores = [sum(r[side] for r in results) for side in (0, 1)]
+    if match is None:
+        count = len(VERSUS_STATS)
+        values = [(tuple(p.get("stats") or ()) + (None,) * count)[:count] for p in players]
+        results = versus_results(*values)
+        scores = [sum(r[side] for r in results) for side in (0, 1)]
 
     canvas = Image.new("RGBA", (px(VERSUS_WIDTH), px(VERSUS_HEIGHT)), (0, 0, 0, 0))
     draw_versus_backdrop(canvas, players)
@@ -2810,8 +2873,11 @@ def compose_versus_card(*, left, right):
         outline = rgba(VERSUS_SIDES[side][1])
         effect = player.get("effect")
         name = versus_name(player.get("username"), outline, effect)
-        paper, name_at = versus_paper(side, player, values[side],
-                                      [r[side] for r in results], scores[side], name)
+        if match is None:
+            paper, name_at = versus_paper(side, player, values[side],
+                                          [r[side] for r in results], scores[side], name)
+        else:
+            paper, name_at = match_paper(side, player, match["sides"][side], name)
         left_edge = versus_paper_left(side)
         tilt = -PAPER_TILT if side == 0 else PAPER_TILT
         place(canvas, with_drop_shadow(paper, 7), left_edge, PAPER_TOP,
@@ -2821,11 +2887,12 @@ def compose_versus_card(*, left, right):
                 name=name, at=name_at, effect=effect, outline=outline, rotate=tilt,
                 to_canvas=functools.partial(_versus_to_canvas, left_edge, tilt)))
     draw_vs_sticker(canvas)
-    draw_versus_footer(canvas, versus_summary(players, scores))
+    draw_versus_footer(canvas, versus_summary(players, scores) if match is None
+                       else match.get("summary") or "")
     return clip_to(canvas, rounded_mask(VERSUS_WIDTH, VERSUS_HEIGHT, 24)), specs
 
 
-def render_versus_card(*, left, right):
+def render_versus_card(*, left, right, match=None):
     """Two players' stats side by side, as (image bytes, extension).
 
     `left` and `right` are dicts: username, avatar_png, background_png (the
@@ -2835,11 +2902,16 @@ def render_versus_card(*, left, right):
     effect, or None). Rows are won on the raw numbers. With an effect on
     either name the card is a half-size animated WebP, as the leaderboard's
     is; otherwise a PNG.
+
+    `match` makes it a tournament match's result: a dict with `sides`, one
+    dict per player (won, score -- the text shown big, "2" or "FF" --,
+    note for the pill under it, subtitle under the name), and `summary`,
+    the strip at the bottom. Its players need no stats.
     """
     if not (left.get("effect") or right.get("effect")):
-        return png_bytes(compose_versus_card(left=left, right=right)[0]), "png"
+        return png_bytes(compose_versus_card(left=left, right=right, match=match)[0]), "png"
     with ANIMATION_LOCK:
-        card, specs = compose_versus_card(left=left, right=right)
+        card, specs = compose_versus_card(left=left, right=right, match=match)
         frames_count, delay, cycles = plan_shared_loop([spec["effect"] for spec in specs])
         names = [
             AnimatedName(card, spec["name"], spec["at"], spec["effect"], spec_cycles,
@@ -3296,3 +3368,689 @@ def render_tournament_pool_card(**fields):
     replaces "Map pool · 5 maps".
     """
     return png_bytes(compose_tournament_pool_card(**fields))
+
+
+# ---------------------------------------------------------------- sync card
+
+# 960px wide, 460px tall with one row of achievements and taller with more:
+# the profile card's background (player_backdrop), the purple "Profile synced" banner, the
+# Discord and Roblox accounts joined by a link badge, then what the sync
+# unlocked (and took away) in the badges card's grid, or a teal "Already up
+# to date" strip.
+SYNC_WIDTH, SYNC_MIN_HEIGHT = 960, 460
+SYNC_LINK_TOP, SYNC_SECTION_TOP = 132, 252
+SYNC_AVATAR = 92
+SYNC_NAME_SIZE, SYNC_NAME_MIN, SYNC_NAME_ROOM = 26, 20, 250
+# Two rows a section; past that the last cell says how many more.
+SYNC_MAX_ROWS = 2
+SYNC_SIDES = {
+    # label, strip fill, strip outline, avatar corner radius, empty fill
+    "discord": ("Discord", "#7C86F7", "#3B44B0", SYNC_AVATAR / 2, "#2A2F4A"),
+    "roblox": ("Roblox", "#FFA851", "#C4610F", 22, "#CFE8FF"),
+}
+
+
+def draw_sync_title(canvas):
+    """The purple banner, centred 24px down at -1.5deg: the sync icon and
+    "Profile synced" at 42px."""
+    title = Text("Profile synced", DISPLAY, 42, line_height=1, stroke=8,
+                 stroke_color=rgba("#5E37B8"), shadow=4)
+    width, height = 18 + 48 + 12 + title.width + 36, 10 + 48 + 6
+
+    def content(image, draw):
+        paste_icon(image, load_icon("sync", "sync", 48), 18, 10)
+        title.draw(draw, 18 + 48 + 12, 10 + (48 - title.height - 6) / 2 + 6)
+
+    body = strip(width, height, rgba("#A57CF7"), CLIP_BANNER, content)
+    place(canvas, with_drop_shadow(body, 5), (SYNC_WIDTH - width) / 2, 24, width, height,
+          rotate=-1.5)
+
+
+def sync_name_label(side, name, effect=None):
+    """The account's name for its strip: 26px, shrunk to 20px and then cut
+    with "…" to stay within SYNC_NAME_ROOM; in the username effect's font
+    when it has one, as the versus card's names are."""
+    outline = SYNC_SIDES[side][2]
+    style = dict(stroke=6, stroke_color=rgba(outline))
+    text = drawable_text(name or "", DISPLAY) or "Unknown"
+    if side == "discord":
+        text = "@" + text
+    face = (effect or {}).get("font") or DISPLAY
+    if face != DISPLAY:
+        label = fit_name_in_face(text, face, SYNC_NAME_ROOM, style, size=SYNC_NAME_SIZE,
+                                 min_size=SYNC_NAME_MIN - 4)
+        if label is not None:
+            return label
+    return (fit_text(text, DISPLAY, SYNC_NAME_SIZE, SYNC_NAME_ROOM, min_size=SYNC_NAME_MIN,
+                     **style)
+            or ellipsize(text, DISPLAY, SYNC_NAME_MIN, SYNC_NAME_ROOM, **style))
+
+
+def sync_name_strip(side, label, with_text=True):
+    """The name on its coloured strip, padded 6px 20px 3px. Without the
+    text (it animates on top), the strip alone at its size."""
+    fill = SYNC_SIDES[side][1]
+    width, height = 20 + label.width + 20, 6 + label.height + 3
+    body = strip(width, height, rgba(fill), CLIP_STAT,
+                 (lambda image, draw: label.draw(draw, 20, 6)) if with_text else None)
+    return body, width, height
+
+
+def sync_account(side, name, avatar_png, text_outline, effect=None):
+    """One account as a layer padded 12px all round: the avatar, and on its
+    inner side the "Discord"/"Roblox" label over the name strip. Returns
+    the layer, the unpadded width and height, and with an `effect` the
+    name left off the strip, as (name, its top-left on the strip, the
+    strip's box on the layer as (left, top, width, height, tilt))."""
+    label_text, _, _, radius, empty = SYNC_SIDES[side]
+    label = Text(label_text, HAND, 19, line_height=1)
+    name_label = sync_name_label(side, name, effect)
+    body, strip_width, strip_height = sync_name_strip(side, name_label, with_text=not effect)
+    column_width = max(label.width, strip_width + 6)
+    column_height = label.height + 4 + strip_height
+    width = SYNC_AVATAR + 12 + column_width
+    height = max(SYNC_AVATAR, column_height)
+    pad = 12
+    layer = Image.new("RGBA", (px(width + 2 * pad), px(height + 2 * pad)), (0, 0, 0, 0))
+    avatar = framed_avatar(open_image(avatar_png), SYNC_AVATAR, 6, radius, empty, "#4F78B0")
+    avatar_left = pad if side == "discord" else pad + width - SYNC_AVATAR
+    place(layer, with_drop_shadow(avatar, 6), avatar_left, pad + (height - SYNC_AVATAR) / 2,
+          SYNC_AVATAR, SYNC_AVATAR, rotate=-4 if side == "discord" else 4)
+    # Discord's column follows its avatar, left-aligned; Roblox's comes
+    # before its own, right-aligned.
+    column_left = pad + SYNC_AVATAR + 12 if side == "discord" else pad
+    column_top = pad + (height - column_height) / 2
+
+    def align(item_width):
+        return column_left if side == "discord" else column_left + column_width - item_width
+
+    draw = ImageDraw.Draw(layer)
+    # text-shadow: 0 2px 0, in the backdrop's outline colour.
+    draw.text((px(align(label.width)), px(column_top + label.baseline + 2)), label.text,
+              font=label.font, fill=text_outline, anchor="ls")
+    label.draw(draw, align(label.width), column_top)
+    strip_box = (align(strip_width), column_top + label.height + 4, strip_width, strip_height,
+                 -1.5 if side == "discord" else 1.5)
+    place(layer, with_drop_shadow(body, 4), *strip_box[:4], rotate=strip_box[4])
+    spec = (name_label, (20, 6), strip_box) if effect else None
+    return layer, width, height, spec
+
+
+def draw_link_badge(canvas, left, top):
+    """The 64px white disc in a 4px purple ring with the chain link, -10deg."""
+    pad = 12
+    size = 64 + 2 * pad
+    layer = Image.new("RGBA", (px(size), px(size)), (0, 0, 0, 0))
+
+    def disc(diameter, color, dy=0):
+        def paint(draw, k):
+            draw.ellipse((0, 0, diameter * k - 1, diameter * k - 1), fill=255)
+        offset = (size - diameter) / 2
+        body = clip_to(solid(diameter, diameter, color), shape_mask(diameter, diameter, paint))
+        layer.alpha_composite(body, (px(offset), px(offset + dy)))
+
+    disc(72, rgba("#5E37B8"))
+    disc(64, SHADOW, dy=5)
+    disc(64, WHITE)
+    paste_icon(layer, load_icon("sync", "link", 40), (size - 40) / 2, (size - 40) / 2)
+    place(canvas, layer, left - pad, top - pad, size, size, rotate=-10)
+
+
+def draw_sync_accounts(canvas, discord, roblox, text_outline, effect=None):
+    """Both accounts and the link badge between them, centred 132px down,
+    22px apart. With the Roblox name's `effect`, returns an AnimatedName
+    spec for it (the name is left off the card); else None."""
+    left_layer, left_width, left_height, _ = sync_account("discord", *discord, text_outline)
+    right_layer, right_width, right_height, spec = sync_account("roblox", *roblox,
+                                                                text_outline, effect)
+    total = left_width + 22 + 64 + 22 + right_width
+    row_height = max(left_height, right_height, 64)
+    x = (SYNC_WIDTH - total) / 2
+    pad = 12
+    canvas.alpha_composite(left_layer, (px(x - pad), px(
+        SYNC_LINK_TOP + (row_height - left_height) / 2 - pad)))
+    draw_link_badge(canvas, x + left_width + 22, SYNC_LINK_TOP + (row_height - 64) / 2)
+    # Snapped to output pixels, so the name's patch lines up with the strip.
+    right_at = (px(x + left_width + 22 + 64 + 22 - pad),
+                px(SYNC_LINK_TOP + (row_height - right_height) / 2 - pad))
+    canvas.alpha_composite(right_layer, right_at)
+    if spec is None:
+        return None
+    name, at, (left, top, width, height, tilt) = spec
+    left += right_at[0] / SCALE
+    top += right_at[1] / SCALE
+    return dict(name=name, at=at, effect=effect, outline=rgba(SYNC_SIDES["roblox"][2]),
+                rotate=tilt, to_canvas=functools.partial(
+                    _sync_strip_to_canvas, left, top, width, height, tilt))
+
+
+def _sync_strip_to_canvas(left, top, width, height, tilt, x, y):
+    return turn_point(x, y, left, top, width, height, tilt)
+
+
+def draw_more_item(canvas, count, left, top, earned):
+    """The cell standing in for the items past the last row: a round tile
+    saying +N, "more" under it."""
+    tile_left = left + (BADGE_CELL - BADGE_TILE) / 2
+    canvas.alpha_composite(badge_outline("circle", not earned, WHITE),
+                           (px(tile_left), px(top)))
+    size = 72
+    style = dict(line_height=1, stroke=6, stroke_color=rgba("#5E37B8"))
+    tile = solid(size, size, rgba("#A57CF7") if earned else (200, 214, 232, 128))
+    mark = (fit_text(f"+{count}", DISPLAY, 30, size - 12, min_size=16, **style)
+            or Text(f"+{count}", DISPLAY, 16, **style))
+    mark.draw(ImageDraw.Draw(tile), (size - mark.width) / 2, (size - mark.height) / 2 + 2)
+    canvas.alpha_composite(clip_to(tile, rounded_mask(size, size, size / 2)),
+                           (px(tile_left + 8), px(top + 8)))
+    name = Text("more", HAND, BADGE_NAME_SIZE, line_height=BADGE_NAME_LINE, stroke=4,
+                stroke_color=rgba("#3D2490"))
+    name.draw(ImageDraw.Draw(canvas), left + (BADGE_CELL - name.width) / 2,
+              top + BADGE_TILE + 4)
+
+
+def sync_rows(items):
+    """The section's cells in rows of the badges grid's 8: at most
+    SYNC_MAX_ROWS, the last cell turning into ("more", N) when they don't
+    all fit."""
+    room = BADGE_COLUMNS * SYNC_MAX_ROWS
+    cells = list(items)
+    if len(cells) > room:
+        cells = cells[:room - 1] + [("more", len(cells) - (room - 1))]
+    return [cells[start:start + BADGE_COLUMNS] for start in range(0, len(cells), BADGE_COLUMNS)]
+
+
+def sync_row_height(row):
+    return badge_row_height([cell for cell in row if isinstance(cell, dict)] or [{}])
+
+
+def sync_section_height(items):
+    rows = sync_rows(items)
+    return 24 + 10 + sum(map(sync_row_height, rows)) + BADGE_GAP_Y * (len(rows) - 1)
+
+
+def draw_sync_section(canvas, label, items, top, earned, text_outline):
+    """A label and its items in the badges card's grid, each row centred.
+    Returns the bottom."""
+    text = Text(label, HAND, 24, line_height=1)
+    draw_glowing_text(canvas, [(text, (SYNC_WIDTH - text.width) / 2, top)], text_outline)
+    top += 24 + 10
+    for row in sync_rows(items):
+        width = len(row) * BADGE_CELL + (len(row) - 1) * BADGE_GAP_X
+        left = (SYNC_WIDTH - width) / 2
+        for column, cell in enumerate(row):
+            x = left + column * (BADGE_CELL + BADGE_GAP_X)
+            if isinstance(cell, tuple):
+                draw_more_item(canvas, cell[1], x, top, earned)
+            else:
+                draw_badge_item(canvas, dict(cell, earned=earned), x, top)
+        top += sync_row_height(row) + BADGE_GAP_Y
+    return top - BADGE_GAP_Y
+
+
+def draw_up_to_date(canvas):
+    """The teal strip 300px down: check, "Already up to date", "· nothing
+    changed"."""
+    outline = rgba("#239372")
+    title = Text("Already up to date", DISPLAY, 26, stroke=6, stroke_color=outline)
+    note = Text("· nothing changed", HAND, 20, stroke=4, stroke_color=outline)
+    width = 16 + 40 + 12 + title.width + 12 + note.width + 26
+    height = 8 + 40 + 6
+
+    def content(image, draw):
+        paste_icon(image, load_icon("sync", "check", 40), 16, 8)
+        title.draw(draw, 16 + 40 + 12, 8 + (40 - title.height - 4) / 2 + 4)
+        note.draw(draw, 16 + 40 + 12 + title.width + 12, 8 + (40 - note.height) / 2 + 2)
+
+    body = strip(width, height, rgba("#7FE8C2"), CLIP_STAT, content)
+    place(canvas, with_drop_shadow(body, 4), (SYNC_WIDTH - width) / 2, 300, width, height,
+          rotate=-1)
+
+
+def achievements_label(count, verb):
+    return f"{count} achievement{'' if count == 1 else 's'} {verb}"
+
+
+def compose_sync_card(*, discord_name, discord_avatar_png=None, roblox_name,
+                      roblox_avatar_png=None, background_png=None, unlocked=(), removed=(),
+                      effect=None):
+    """The card, and the Roblox name's AnimatedName spec when it has an
+    effect (else None)."""
+    sections = [(achievements_label(len(items), verb), items, earned)
+                for items, verb, earned in ((unlocked, "unlocked", True),
+                                            (removed, "removed", False)) if items]
+    bottom = (SYNC_SECTION_TOP + sum(sync_section_height(items) for _, items, _ in sections)
+              + 16 * max(0, len(sections) - 1))
+    # Past one row the card grows to fit the grid.
+    height = max(SYNC_MIN_HEIGHT, round(bottom + 32))
+    # The Roblox player's profile background, as their profile card has it.
+    canvas, text_outline = player_backdrop(roblox_name, open_image(roblox_avatar_png),
+                                           open_image(background_png), SYNC_WIDTH, height)
+    draw_sync_title(canvas)
+    spec = draw_sync_accounts(canvas, (discord_name, discord_avatar_png),
+                              (roblox_name, roblox_avatar_png), text_outline, effect)
+    if not sections:
+        draw_up_to_date(canvas)
+    top = SYNC_SECTION_TOP
+    for label, items, earned in sections:
+        top = draw_sync_section(canvas, label, items, top, earned, text_outline) + 16
+    return clip_to(canvas, rounded_mask(SYNC_WIDTH, height, 24)), spec
+
+
+def render_sync_card(**fields):
+    """/sync's outcome as (image bytes, extension): a PNG, or with an
+    `effect` (the Roblox player's username effect, a username_effects
+    effect) playing on their name, a half-size animated WebP as the other
+    cards' are.
+
+    `discord_name` / `discord_avatar_png` and `roblox_name` /
+    `roblox_avatar_png` are the linked accounts (avatars as bytes, or None
+    for a question mark). `background_png` is the Roblox player's profile
+    background (their chosen map's thumbnail); without it the backdrop is
+    their avatar's colours, as on the profile card. `unlocked` and `removed` are the achievements the
+    sync granted and took away, as the badges card's items: name, icon_png,
+    circle (a round badge, or a square map) and color (the placeholder's
+    when there's no icon). With neither, it says it's already up to date.
+    """
+    if not fields.get("effect"):
+        return png_bytes(compose_sync_card(**fields)[0]), "png"
+    with ANIMATION_LOCK:
+        card, spec = compose_sync_card(**fields)
+        frames_count, delay, cycles = plan_loop(spec["effect"])
+        name = AnimatedName(card, spec["name"], spec["at"], spec["effect"], cycles,
+                            outline=spec["outline"], stroke_scale=SYNC_NAME_SIZE / NAME_SIZE,
+                            to_canvas=spec["to_canvas"], rotate=spec["rotate"],
+                            keep_outline=True)
+        still = card.resize((card.width // 2, card.height // 2), Image.LANCZOS)
+        del card
+
+        def draw_frame(index, image):
+            image.paste(name.patch(index / frames_count), name.at)
+
+        return encode_lazy_animation(still, frames_count, draw_frame, delay), "webp"
+
+
+# ---------------------------------------------------------------- bracket card
+
+# The 8-player template, generalised: the pool card's sky and hill, the
+# purple banner with the tournament's name, "Bracket · N players" under it,
+# the date on a yellow tag, then one column per round, each match two strips
+# 36px tall, 4px apart, joined to the next round by purple lines. The
+# card grows to fit up to four rounds of eight matches; bigger brackets are
+# drawn a section at a time (see render_bracket_card).
+BRACKET_MIN_WIDTH, BRACKET_MIN_HEIGHT = 960, 640
+BRACKET_LEFT, BRACKET_LABEL_TOP, BRACKET_TOP = 28, 160, 198
+BRACKET_STRIP, BRACKET_STRIP_GAP = 36, 4
+BRACKET_MATCH = 2 * BRACKET_STRIP + BRACKET_STRIP_GAP
+# First-column matches 110px apart (34px between them).
+BRACKET_PITCH = 110
+BRACKET_FIRST_WIDTH, BRACKET_WIDTH = 214, 206
+# Between columns: 48px after the first, 52px after the others, 36px to the
+# champion.
+BRACKET_GAP_FIRST, BRACKET_GAP, BRACKET_GAP_CHAMPION = 48, 52, 36
+BRACKET_CHAMPION_WIDTH = 150
+BRACKET_INK = "#3D2490"
+# A decided match's winner strip, by how far its round is from the final:
+# (fill, outline). The final is gold, the semifinals orange, the
+# quarterfinals blue, as the template; earlier rounds purple, then green.
+BRACKET_TIERS = (("#FFD64F", "#A87A00"), ("#FFA851", "#C4610F"), ("#6CC4F4", "#2A78B8"),
+                 ("#A57CF7", "#5E37B8"), ("#8BE04E", "#3E8A1E"))
+BRACKET_FADED_FILL = (255, 255, 255, 71)
+BRACKET_FADED_TEXT, BRACKET_FADED_OUTLINE = "#E4EEFF", "#4F78B0"
+CLIP_BRACKET_STRIP = ((3, 0), (97, 0), (100, 22), (97, 50), (100, 78), (97, 100),
+                      (3, 100), (0, 78), (3, 50), (0, 22))
+
+
+def bracket_backdrop(width, height):
+    """The sky gradient under the profile card's staggered dots, in the
+    text's deep blue."""
+    canvas = vertical_gradient(px(width), px(height), POOL_SKY)
+    canvas.alpha_composite(dot_pattern(px(width), px(height), rgba("#2160B8", 56)))
+    return canvas
+
+
+def draw_bracket_header(canvas, width, title, subtitle, date):
+    """The banner (trophy and name, 42px shrunk to 30px), the subtitle
+    under it and the date tag top-right."""
+    date_left = width - 30
+    if date:
+        label = Text(date, DISPLAY, 22, stroke=6, stroke_color=rgba("#A87A00"))
+        tag_width, tag_height = 20 + label.width + 20, 6 + label.height + 3
+        date_left = width - 30 - tag_width
+        body = strip(tag_width, tag_height, rgba("#FFD64F"), CLIP_MEDAL,
+                     lambda image, draw: label.draw(draw, 20, 6))
+        place(canvas, with_drop_shadow(body, 4), date_left, 38, tag_width, tag_height,
+              rotate=2)
+
+    outline = rgba("#5E37B8")
+    style = dict(line_height=1, stroke=8, stroke_color=outline, shadow=4)
+    room = date_left - 30 - 26 - (18 + 54 + 12 + 36)
+    text = drawable_text(title or "", DISPLAY) or "Tournament"
+    name = (fit_text(text, DISPLAY, 42, room, min_size=30, **style)
+            or ellipsize(text, DISPLAY, 30, room, **style))
+    banner_width, banner_height = 18 + 54 + 12 + name.width + 36, 10 + 54 + 6
+
+    def content(image, draw):
+        paste_icon(image, profile_icon("trophy", 54), 18, 10)
+        name.draw(draw, 18 + 54 + 12, 10 + (54 - name.height - 6) / 2 + 6)
+
+    body = strip(banner_width, banner_height, rgba("#A57CF7"), CLIP_BANNER, content)
+    place(canvas, with_drop_shadow(body, 5), 26, 24, banner_width, banner_height,
+          rotate=-1.5)
+    if subtitle:
+        line = shrink_to_fit(subtitle, HAND, 24, width - 2 * 44, min_size=16)
+        draw_glowing_text(canvas, [(line, 44, 106)], rgba("#2160B8"))
+
+
+def draw_column_label(canvas, text, left, width):
+    label = shrink_to_fit(text, HAND, 24, width + 20, min_size=16)
+    draw_glowing_text(canvas, [(label, left + (width - label.width) / 2, BRACKET_LABEL_TOP)],
+                      rgba("#2160B8"))
+
+
+@functools.lru_cache(maxsize=256)
+def bracket_name(name, room, outline, faded):
+    style = dict(stroke=5, stroke_color=rgba(outline),
+                 fill=rgba(BRACKET_FADED_TEXT) if faded else WHITE)
+    text = drawable_text(name or "", DISPLAY) or "?"
+    return ellipsize(text, DISPLAY, 16, room, **style)
+
+
+def bracket_strip(slot, width, tier):
+    """One player's strip, as (layer padded 12px for its shadow, or the
+    bare strip when faded). A winner is bright in the round's colours with
+    the score on a dark box and a crown; anyone else (a loser, or both
+    while the match is unplayed) is faded."""
+    slot = slot or {}
+    won = bool(slot.get("win"))
+    fill, outline = BRACKET_TIERS[min(tier, len(BRACKET_TIERS) - 1)]
+    score = str(slot.get("score") or "")
+    crown = 24 if won else 0
+    # padding 0 8px 0 12px (0 6px faded), 6px gaps, the 30px score box.
+    right = 8 if won else 6
+    room = width - 12 - right - 30 - 6 - (crown + 6 if crown else 0)
+    name = bracket_name(slot.get("name") or "TBD", room,
+                        outline if won else BRACKET_FADED_OUTLINE, not won)
+
+    def content(image, draw):
+        name.draw(draw, 12, (BRACKET_STRIP - name.height - 3) / 2 + 3)
+        box_left = width - right - (crown + 6 if crown else 0) - 30
+        box_top = (BRACKET_STRIP - 26) / 2
+        box_fill = rgba(outline) if won else (79, 120, 176, 89)
+        box = clip_to(solid(30, 26, box_fill), rounded_mask(30, 26, 6))
+        image.alpha_composite(box, (px(box_left), px(box_top)))
+        if score:
+            style = (dict(fill=WHITE) if won else
+                     dict(fill=rgba(BRACKET_FADED_TEXT), stroke=5,
+                          stroke_color=rgba(BRACKET_FADED_OUTLINE)))
+            number = (fit_text(score, DISPLAY, 17, 28, min_size=11, line_height=1, **style)
+                      or Text(score[:2], DISPLAY, 11, line_height=1, **style))
+            number.draw(draw, box_left + (30 - number.width) / 2,
+                        box_top + (26 - number.height - 3) / 2 + 3)
+        if crown:
+            paste_icon(image, profile_icon("crown", crown), width - right - crown,
+                       (BRACKET_STRIP - crown) / 2)
+
+    body = strip(width, BRACKET_STRIP, rgba(fill) if won else BRACKET_FADED_FILL,
+                 CLIP_BRACKET_STRIP, content)
+    return with_drop_shadow(body, 3) if won else body
+
+
+def draw_bracket_match(canvas, match, left, top, width, tier):
+    """A match's two strips, the top player's at `top`."""
+    for index, key in enumerate(("a", "b")):
+        layer = bracket_strip(match.get(key), width, tier)
+        y = top + index * (BRACKET_STRIP + BRACKET_STRIP_GAP)
+        if layer.width > px(width):
+            place(canvas, layer, left, y, width, BRACKET_STRIP)
+        else:
+            canvas.alpha_composite(layer, (px(left), px(y)))
+
+
+def bracket_line(canvas, left, top, width, height):
+    """A connector: a 4px purple bar, rounded, in a 2px white ring at 60%."""
+    ring = clip_to(solid(width + 4, height + 4, (255, 255, 255, 153)),
+                   rounded_mask(width + 4, height + 4, 5))
+    canvas.alpha_composite(ring, (px(left - 2), px(top - 2)))
+    bar = clip_to(solid(width, height, rgba(BRACKET_INK)), rounded_mask(width, height, 3))
+    canvas.alpha_composite(bar, (px(left), px(top)))
+
+
+def draw_connectors(canvas, child_x, child_centres, parent_x, parent_centres):
+    """Lines from one column's matches to the next one's: two children
+    meet at an elbow 4px before halfway, one goes straight across. A
+    missing (bye) child, whose centre is None, gets no line."""
+    gap = parent_x - child_x
+    elbow = child_x + gap / 2 - 2
+    pairs = len(child_centres) // len(parent_centres)
+    for index, parent in enumerate(parent_centres):
+        children = child_centres[index * pairs:(index + 1) * pairs]
+        drawn = [c for c in children if c is not None]
+        if parent is None or not drawn:
+            continue
+        if pairs == 1:
+            bracket_line(canvas, child_x, drawn[0] - 2, gap, 4)
+            continue
+        for centre in drawn:
+            bracket_line(canvas, child_x, centre - 2, elbow + 4 - child_x, 4)
+        low, high = min(drawn + [parent]), max(drawn + [parent])
+        bracket_line(canvas, elbow, low - 2, 4, high - low + 4)
+        bracket_line(canvas, elbow + 2, parent - 2, parent_x - elbow - 2, 4)
+
+
+def column_centres(columns, connected):
+    """Each column's match centres: the first spaced BRACKET_PITCH apart; in
+    a connected bracket each later match centred on the ones feeding it
+    (one feeding straight across, two meeting halfway), else stacked from
+    the top like the first. A hidden (None) match keeps its place."""
+    centres = []
+    for index, column in enumerate(columns):
+        count = len(column["matches"])
+        stacked = [BRACKET_TOP + BRACKET_MATCH / 2 + i * BRACKET_PITCH for i in range(count)]
+        if index == 0 or not connected:
+            centres.append(stacked)
+            continue
+        previous = centres[-1]
+        pairs = max(1, len(previous) // max(1, count))
+        centres.append([sum(previous[i * pairs:(i + 1) * pairs]) / pairs
+                        if len(previous) >= count * pairs else stacked[i]
+                        for i in range(count)])
+    return centres
+
+
+def dashed_rounded_box(size, radius, border, color, fill, dash=12, gap=8):
+    """The champion's empty spot: a rounded square with a dashed border."""
+    box = clip_to(solid(size, size, fill), rounded_mask(size, size, radius))
+    ring = Image.new("L", (px(size), px(size)), 0)
+    outer = rounded_mask(size, size, radius)
+    inner = rounded_mask(size - 2 * border, size - 2 * border, radius - border)
+    ring.paste(outer)
+    hole = Image.new("L", ring.size, 0)
+    hole.paste(inner, (px(border), px(border)))
+    ring = ImageChops.subtract(ring, hole)
+    # Dashes along the straight edges; the corners stay whole.
+    dashes = Image.new("L", ring.size, 0)
+    draw = ImageDraw.Draw(dashes)
+    straight = size - 2 * radius
+    count = max(1, round((straight + gap) / (dash + gap)))
+    step = (straight + gap) / count
+    for i in range(count):
+        a = radius + i * step
+        b = a + step - gap
+        draw.rectangle((px(a), 0, px(b), px(size)), fill=255)
+        draw.rectangle((0, px(a), px(size), px(b)), fill=255)
+    corners = Image.new("L", ring.size, 0)
+    corner_draw = ImageDraw.Draw(corners)
+    for x, y in ((0, 0), (size - radius, 0), (0, size - radius), (size - radius, size - radius)):
+        corner_draw.rectangle((px(x), px(y), px(x + radius), px(y + radius)), fill=255)
+    pattern = ImageChops.lighter(dashes, corners)
+    # A dash along one edge also crosses the opposite one: both are wanted.
+    ring = ImageChops.multiply(ring, pattern)
+    layer = solid(size, size, color)
+    layer.putalpha(ring.point(lambda a: a * color[3] // 255))
+    box.alpha_composite(layer)
+    return box
+
+
+def draw_champion(canvas, champion, left, centre):
+    """The champion column centred on the final: their avatar in a white
+    frame with a crown and a trophy, their name on a gold strip; or, before
+    the final's decided, a dashed spot with a faded trophy and "TBD".
+    Returns the name's AnimatedName spec when it plays an effect (it's
+    left off the strip), else None."""
+    top = centre - 58
+    if champion is None:
+        box = dashed_rounded_box(116, 24, 5, (255, 255, 255, 217), (255, 255, 255, 46))
+        trophy = profile_icon("trophy", 64).copy()
+        grey = trophy.convert("L").point(lambda v: min(255, round(v * 1.3)))
+        trophy = Image.merge("RGBA", (grey, grey, grey,
+                                      trophy.getchannel("A").point(lambda a: a * 6 // 10)))
+        box.alpha_composite(trophy, (px(26), px(26)))
+        canvas.alpha_composite(box, (px(left + (BRACKET_CHAMPION_WIDTH - 116) / 2), px(top)))
+        tbd = Text("TBD", DISPLAY, 20, stroke=5, stroke_color=rgba(BRACKET_FADED_OUTLINE),
+                   fill=rgba(BRACKET_FADED_TEXT))
+        tbd.draw(ImageDraw.Draw(canvas), left + (BRACKET_CHAMPION_WIDTH - tbd.width) / 2,
+                 top + 116 + 10)
+        return None
+
+    pad = 40
+    size = 116 + 2 * pad
+    layer = Image.new("RGBA", (px(size), px(size)), (0, 0, 0, 0))
+    avatar = framed_avatar(open_image(champion.get("avatar_png")), 116, 6, 24, "#9ED3FF",
+                           "#4F78B0")
+    place(layer, with_drop_shadow(avatar, 6), pad, pad, 116, 116)
+    place(layer, profile_icon("crown", 56), pad - 20, pad - 28, 56, 56, rotate=-22)
+    place(layer, profile_icon("trophy", 56), pad + 116 + 22 - 56, pad + 116 + 18 - 56,
+          56, 56, rotate=10)
+    place(canvas, layer, left + (BRACKET_CHAMPION_WIDTH - 116) / 2 - pad, top - pad,
+          size, size, rotate=4)
+
+    effect = champion.get("effect")
+    style = dict(stroke=5, stroke_color=rgba("#A87A00"))
+    text = drawable_text(champion.get("name") or "", DISPLAY) or "?"
+    name = None
+    face = (effect or {}).get("font") or DISPLAY
+    if face != DISPLAY:
+        name = fit_name_in_face(text, face, 170 - 28, style, size=18, min_size=14)
+    if name is None:
+        name = ellipsize(text, DISPLAY, 18, 170 - 28, **style)
+    width, height = 14 + name.width + 14, 6 + name.height + 3
+    # With an effect the name animates on top, so the strip goes on bare.
+    body = strip(width, height, rgba("#FFD64F"), CLIP_MEDAL,
+                 None if effect else (lambda image, draw: name.draw(draw, 14, 6)))
+    name_top = top + 116 + 10
+    box = (left + (BRACKET_CHAMPION_WIDTH - width) / 2, name_top, width, height, -2)
+    place(canvas, with_drop_shadow(body, 4), *box[:4], rotate=box[4])
+    if not effect:
+        return None
+    return dict(name=name, at=(14, 6), effect=effect, outline=rgba("#A87A00"), rotate=-2,
+                to_canvas=functools.partial(_sync_strip_to_canvas, *box))
+
+
+def compose_bracket_card(*, title, subtitle="", date="", columns=(), champion=False,
+                         third_place=None, connected=True):
+    columns = [column for column in columns if column.get("matches")]
+    widths = [BRACKET_FIRST_WIDTH if index == 0 else BRACKET_WIDTH
+              for index in range(len(columns))]
+    gaps = [BRACKET_GAP_FIRST if index == 0 else BRACKET_GAP
+            for index in range(max(0, len(columns) - 1))]
+    content = sum(widths) + sum(gaps)
+    if champion is not False:
+        content += BRACKET_GAP_CHAMPION + BRACKET_CHAMPION_WIDTH
+    # 28px in from the left, 20px from the right; a narrower bracket is
+    # centred on the 960px card.
+    width = max(BRACKET_MIN_WIDTH, round(content + BRACKET_LEFT + 20))
+    left = (BRACKET_LEFT if content + BRACKET_LEFT + 20 >= BRACKET_MIN_WIDTH
+            else (width - content) / 2)
+    centres = column_centres(columns, connected)
+    xs, x = [], left
+    for index, column_width in enumerate(widths):
+        xs.append(x)
+        x += column_width + (gaps[index] if index < len(gaps) else 0)
+    bottom = max((max(c) + BRACKET_MATCH / 2 for c in centres if c), default=BRACKET_TOP)
+
+    third_top = None
+    if third_place and columns:
+        # Under the final: its label 50px below, the match 30px under that.
+        third_top = centres[-1][0] + BRACKET_MATCH / 2 + 50
+        bottom = max(bottom, third_top + 30 + BRACKET_MATCH)
+    if champion is not False and centres:
+        bottom = max(bottom, centres[-1][0] + 58 + 10 + 40 + 20)
+    # 36px under the last strip, as the template's 640px leaves.
+    height = max(BRACKET_MIN_HEIGHT, round(bottom + 36))
+
+    canvas = bracket_backdrop(width, height)
+    spec = None
+    draw_bracket_header(canvas, width, title, subtitle, date)
+    # Each match's centre, None for a hidden one, for the connectors.
+    drawn = []
+    for index, column in enumerate(columns):
+        draw_column_label(canvas, column.get("label") or "", xs[index], widths[index])
+        tier = column.get("tier", 0)
+        row = []
+        for match, centre in zip(column["matches"], centres[index]):
+            if match is None:
+                row.append(None)
+                continue
+            draw_bracket_match(canvas, match, xs[index], centre - BRACKET_MATCH / 2,
+                               widths[index], tier)
+            row.append(centre)
+        drawn.append(row)
+    if connected:
+        for index in range(len(columns) - 1):
+            draw_connectors(canvas, xs[index] + widths[index], drawn[index], xs[index + 1],
+                            drawn[index + 1])
+    if champion is not False and columns:
+        champion_left = xs[-1] + widths[-1] + BRACKET_GAP_CHAMPION
+        draw_column_label(canvas, "Champion", champion_left, BRACKET_CHAMPION_WIDTH)
+        final = drawn[-1][0] if drawn[-1] else centres[-1][0]
+        if final is not None:
+            bracket_line(canvas, xs[-1] + widths[-1], final - 2, BRACKET_GAP_CHAMPION, 4)
+        spec = draw_champion(canvas, champion or None, champion_left, centres[-1][0])
+    if third_top is not None:
+        label = Text(third_place.get("label") or "3rd place", HAND, 20, line_height=1)
+        draw_glowing_text(canvas, [(label, xs[-1] + (widths[-1] - label.width) / 2,
+                                    third_top)], rgba("#2160B8"))
+        draw_bracket_match(canvas, third_place["match"], xs[-1], third_top + 30, widths[-1],
+                           third_place.get("tier", 1))
+    return clip_to(canvas, rounded_mask(width, height, 24)), spec
+
+
+def render_bracket_card(**fields):
+    """One page of a tournament bracket as (image bytes, extension): a
+    PNG, or a half-size animated WebP when the champion's name plays their
+    username effect.
+
+    `title` goes on the banner, `subtitle` under it ("Bracket · 8 players"),
+    `date` on the tag top-right (left off when empty). `columns` are the
+    rounds left to right, each a dict: label, tier (how far the round is
+    from the final: 0 gold, 1 orange, 2 blue, 3 purple, 4+ green, for its
+    winners' strips) and matches, top to bottom. A match is a dict with
+    `a` (top) and `b`, each a dict name ("TBD" when unknown), score (text;
+    "" leaves the box empty) and win; or None for one not drawn (a bye),
+    which keeps its place.
+
+    With `connected` (a bracket), each column has half the matches of the
+    one before it (or as many) and lines join each to the next; without
+    (the losers bracket), every column is just stacked from the top.
+    `champion` adds the champion column after the last: a dict (name,
+    avatar_png, effect -- a username_effects effect, or None), or None for
+    the dashed "TBD" spot; False (the default) leaves it off.
+    `third_place` is a dict (label, match, tier) drawn under the last
+    column.
+    """
+    if not (fields.get("champion") or {}).get("effect"):
+        return png_bytes(compose_bracket_card(**fields)[0]), "png"
+    with ANIMATION_LOCK:
+        card, spec = compose_bracket_card(**fields)
+        frames_count, delay, cycles = plan_loop(spec["effect"])
+        name = AnimatedName(card, spec["name"], spec["at"], spec["effect"], cycles,
+                            outline=spec["outline"], stroke_scale=18 / NAME_SIZE,
+                            to_canvas=spec["to_canvas"], rotate=spec["rotate"],
+                            keep_outline=True)
+        still = card.resize((card.width // 2, card.height // 2), Image.LANCZOS)
+        del card
+
+        def draw_frame(index, image):
+            image.paste(name.patch(index / frames_count), name.at)
+
+        return encode_lazy_animation(still, frames_count, draw_frame, delay), "webp"
