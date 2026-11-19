@@ -274,10 +274,10 @@ PROFILE_STATS = (
 
 # (icon, strip colour, outline colour), in the card's left-to-right order.
 PROFILE_MEDALS = (
+    ("medal-diamond", "#A988D9", "#5E3C93"),
     ("medal-gold", "#FFD64F", "#A87A00"),
     ("medal-silver", "#B3B8C2", "#5E6573"),
     ("medal-bronze", "#D98A5B", "#8F4A1F"),
-    ("medal-diamond", "#A988D9", "#5E3C93"),
 )
 
 
@@ -708,7 +708,7 @@ def compose_profile_card(*, username, avatar_png=None, tag=None, stars=0,
 def render_profile_card(**fields):
     """The /profile card as PNG bytes.
 
-    `medals` is (gold, silver, bronze, diamond). `joined` and `last_seen`
+    `medals` is (diamond, gold, silver, bronze). `joined` and `last_seen`
     are Unix timestamps or None. `wins` is None when the board was down.
     `background_png` (a map thumbnail) replaces the backdrop, which is
     otherwise the username's Roblox chat colour.

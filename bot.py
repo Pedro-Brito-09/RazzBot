@@ -2917,7 +2917,7 @@ def profile_card_fields(entry, *, user_id, username, wins=None, avatar_png=None,
         return value if isinstance(value, (int, float)) and value > 0 else None
 
     # Medals are stored as the cup indexes they were won in, so the count is
-    # the length. The card orders them gold, silver, bronze, diamond.
+    # the length. The card orders them diamond, gold, silver, bronze.
     medal_count = {
         tier: len(dig(data, "Medals", tier, default=[]) or [])
         for tier in MEDAL_TIERS
@@ -2928,7 +2928,7 @@ def profile_card_fields(entry, *, user_id, username, wins=None, avatar_png=None,
         tag=dig(data, "Tags", "Equipped"),
         stars=number(data.get("Stars")),
         stars_all_time=number(stats.get("AllTimeStars")),
-        medals=tuple(medal_count[t] for t in ("Gold", "Silver", "Bronze", "Diamond")),
+        medals=tuple(medal_count[t] for t in ("Diamond", "Gold", "Silver", "Bronze")),
         games_played=number(stats.get("GamesPlayed")),
         # Wins come from an ordered datastore, so they may be unavailable
         # even when the rest of the profile loaded.
