@@ -6780,64 +6780,6 @@ async def stats_command(ctx):
     view = GameStatsView(stats)
     view.message = await ctx.send(view=view)
 
-@bot.hybrid_command(description="Get the link to the Roblox group")
-async def group(ctx):
-    await ctx.send(GROUP_URL)
-
-async def admin_only_predicate(ctx):
-    return ctx.author.id == ADMIN_USER_ID
-
-def is_admin():
-    """Prefix-command gate. Stays silent for everyone else."""
-    return commands.check(admin_only_predicate)
-
-BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-# Written just before !restart exits, read by on_ready to say we're back.
-RESTART_NOTICE_PATH = os.path.join(BOT_DIR, ".restart_notice.json")
-
-async def run_git(*args):
-    """Run git in the bot's checkout -> (exit code, combined output)."""
-    process = await asyncio.create_subprocess_exec(
-        "git", "-C", BOT_DIR, *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-    )
-    try:
-        output, _ = await asyncio.wait_for(process.communicate(), timeout=60)
-    except asyncio.TimeoutError:
-        process.kill()
-        return 1, "git timed out after 60s"
-    return process.returncode, output.decode(errors="replace").strip()
-
-# The bot's own venv, so `pip` and `python` in !sh mean the bot's.
-VENV_BIN = os.path.dirname(sys.executable)
-SHELL_TIMEOUT = 120
-PIP_TIMEOUT = 600
-# Room for the code block and header inside Discord's 2000 characters.
-SHELL_REPLY_LIMIT = 1800
-
-async def run_process(*args, shell=False, timeout=60):
-    """Run a command in the bot's folder -> (exit code, combined output).
-
-    It gets its own process group, so a timeout kills whatever it spawned
-    too, not just the outer shell.
-    """
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-           "PATH": VENV_BIN + os.pathsep + os.environ.get("PATH", "")}
-    options = dict(
-        cwd=BOT_DIR, env=env,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    if os.name == "posix":
-        options["start_new_session"] = True
-    if shell:
-        process = await asyncio.create_subprocess_shell(args[0], **options)
-    else:
-        process = await asyncio.create_subprocess_exec(*args, **options)
-    try:
 # The stats card's banner picture; its colours also make the backdrop.
 STATS_THUMBNAIL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "assets", "stats", "thumbnail.webp")
@@ -6951,6 +6893,64 @@ async def test_stats_card(ctx):
         view = GameStatsCardView(stats, image, thumbnail_path)
     view.message = await ctx.send(view=view, files=view.card_files())
 
+@bot.hybrid_command(description="Get the link to the Roblox group")
+async def group(ctx):
+    await ctx.send(GROUP_URL)
+
+async def admin_only_predicate(ctx):
+    return ctx.author.id == ADMIN_USER_ID
+
+def is_admin():
+    """Prefix-command gate. Stays silent for everyone else."""
+    return commands.check(admin_only_predicate)
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Written just before !restart exits, read by on_ready to say we're back.
+RESTART_NOTICE_PATH = os.path.join(BOT_DIR, ".restart_notice.json")
+
+async def run_git(*args):
+    """Run git in the bot's checkout -> (exit code, combined output)."""
+    process = await asyncio.create_subprocess_exec(
+        "git", "-C", BOT_DIR, *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        process.kill()
+        return 1, "git timed out after 60s"
+    return process.returncode, output.decode(errors="replace").strip()
+
+# The bot's own venv, so `pip` and `python` in !sh mean the bot's.
+VENV_BIN = os.path.dirname(sys.executable)
+SHELL_TIMEOUT = 120
+PIP_TIMEOUT = 600
+# Room for the code block and header inside Discord's 2000 characters.
+SHELL_REPLY_LIMIT = 1800
+
+async def run_process(*args, shell=False, timeout=60):
+    """Run a command in the bot's folder -> (exit code, combined output).
+
+    It gets its own process group, so a timeout kills whatever it spawned
+    too, not just the outer shell.
+    """
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+           "PATH": VENV_BIN + os.pathsep + os.environ.get("PATH", "")}
+    options = dict(
+        cwd=BOT_DIR, env=env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    if os.name == "posix":
+        options["start_new_session"] = True
+    if shell:
+        process = await asyncio.create_subprocess_shell(args[0], **options)
+    else:
+        process = await asyncio.create_subprocess_exec(*args, **options)
+    try:
         output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         try:
