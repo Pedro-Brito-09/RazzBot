@@ -19,7 +19,7 @@ import re
 import secrets
 import string
 import time
-from typing import Literal, Optional
+from typing import Optional
 from urllib.parse import quote, unquote
 from datetime import datetime, time as datetime_time, timedelta, timezone
 
@@ -120,21 +120,6 @@ SYNC_ALL_CONCURRENCY = 3
 BADGE_ICON_SIZE = "150x150"
 # 16:9, so a map thumbnail keeps its shape in the card.
 MAP_THUMBNAIL_SIZE = "768x432"
-# Discord decides gallery layout from the item count. Nine images make a
-# balanced grid; a final group of six or fewer uses six slots instead so it
-# keeps the same proportions without spending three unnecessary components.
-BADGES_PER_LARGE_GALLERY = 9
-BADGES_PER_SMALL_GALLERY = 6
-# Short galleries get padded with this so every row keeps the same layout;
-# Discord sizes images by how many are in the gallery. Swap it for any
-# transparent PNG Discord's proxy can reach.
-EMPTY_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
-# A message caps at 40 components and every gallery plus each of its images
-# counts. Three nine-image galleries leave room for the surrounding content
-# and the summary shown when more badges were earned.
-MAX_BADGE_GALLERIES = 3
-# Badges per page of the name-only checklist behind the badge card's toggle.
-BADGES_PER_CHECKLIST_PAGE = 15
 # Accounts per page of !linked.
 LINKED_PER_PAGE = 15
 
@@ -255,7 +240,7 @@ VERIFICATION_GAME_URL = os.getenv(
     "VERIFICATION_GAME_URL",
     "https://www.roblox.com/games/start?placeId=120140749641241",
 )
-# The home server: the only place /achievements and /sync are published.
+# The home server: the only place /sync is published.
 # Nothing else is registered per-guild -- a guild copy of a global command
 # shows up next to the original, which reads as every command duplicated.
 # Everything else stays global, which is also all user installs support.
@@ -2033,25 +2018,8 @@ async def fetch_linked_user_id(account_id):
     _, user_id = await fetch_linked_account(account_id)
     return user_id
 
-async def fetch_linked_discord_id(roblox_id):
-    """The Discord account linked to a Roblox user, or None.
-
-    The table is keyed by Discord ID, so going the other way is a scan --
-    fine for a single lookup behind a button press.
-    """
-    linked = await fetch_entry("Linked", datastore=ACCOUNT_LINK_DATASTORE)
-    if not isinstance(linked, dict):
-        return None
-    for account_id, linked_roblox in linked.items():
-        try:
-            if int(linked_roblox) == int(roblox_id):
-                return int(account_id)
-        except (TypeError, ValueError):
-            continue
-    return None
-
 def in_home_guild(guild):
-    """True in the one server /achievements is published to."""
+    """True in the home server, the one place achievement roles exist."""
     return (
         guild is not None
         and HOME_GUILD is not None
@@ -2919,163 +2887,6 @@ async def get_community_maps():
 def badge_display_name(badge):
     return badge.get("displayName") or badge.get("name") or "Unnamed"
 
-class BadgesCardView(CardView):
-    """A player's badges, as icon galleries or as a name-only checklist.
-
-    The galleries only fit the first few dozen earned badges, so the
-    checklist is also the way to see the rest -- and the only place the
-    missing ones are listed at all.
-    """
-
-    def __init__(self, badges, owned_ids, icons, *, username, parent=None):
-        super().__init__(parent=parent)
-        self.badges = badges
-        self.owned_ids = owned_ids
-        self.icons = icons
-        self.username = username
-        # Opens as the checklist: it covers every badge, earned and missing,
-        # while the galleries stop at the first MAX_BADGE_GALLERIES rows.
-        self.checklist = True
-        self.page = 0
-        self.render()
-
-    @property
-    def owned(self):
-        return [badge for badge in self.badges if badge["id"] in self.owned_ids]
-
-    @property
-    def page_count(self):
-        return max(1, -(-len(self.badges) // BADGES_PER_CHECKLIST_PAGE))
-
-    def render(self):
-        self.clear_items()
-        container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-
-        heading = (
-            f"## 🎖️ Badges — {self.username}\n"
-            f"-# {len(self.owned)} of {len(self.badges)} earned"
-        )
-        if self.checklist and self.page_count > 1:
-            heading += f" · page {self.page + 1}/{self.page_count}"
-        container.add_item(discord.ui.TextDisplay(heading))
-
-        if self.checklist:
-            self.render_checklist(container)
-        else:
-            self.render_galleries(container)
-
-        note = dev_universe_note()
-        if note:
-            container.add_item(discord.ui.TextDisplay(note))
-
-        self.attach_controls(container)
-        self.add_item(container)
-
-    def render_checklist(self, container):
-        """Names only, earned and missing, paged so it can't overflow."""
-        container.add_item(discord.ui.Separator())
-        start = self.page * BADGES_PER_CHECKLIST_PAGE
-        container.add_item(discord.ui.TextDisplay("\n".join(
-            f"✅ **{badge_display_name(badge)}**"
-            if badge["id"] in self.owned_ids
-            else f"⬜ {badge_display_name(badge)}"
-            for badge in self.badges[start:start + BADGES_PER_CHECKLIST_PAGE]
-        )))
-
-    def render_galleries(self, container):
-        owned = self.owned
-        if not owned:
-            container.add_item(discord.ui.TextDisplay("-# No badges earned yet."))
-            return
-
-        container.add_item(discord.ui.Separator())
-        shown = owned[:MAX_BADGE_GALLERIES * BADGES_PER_LARGE_GALLERY]
-        galleries = 0
-        start = 0
-        while start < len(shown):
-            remaining = len(shown) - start
-            gallery_size = (
-                BADGES_PER_SMALL_GALLERY
-                if remaining <= BADGES_PER_SMALL_GALLERY
-                else BADGES_PER_LARGE_GALLERY
-            )
-            batch = shown[start:start + gallery_size]
-            start += len(batch)
-
-            gallery = discord.ui.MediaGallery()
-            for badge in batch:
-                icon = self.icons.get(badge["id"])
-                if icon:
-                    gallery.add_item(media=icon, description=badge_display_name(badge))
-            if gallery.items:
-                # Pad to the selected grid size so partial galleries keep their
-                # proportions even when a badge icon could not be resolved.
-                while len(gallery.items) < gallery_size:
-                    gallery.add_item(media=EMPTY_IMAGE_URL, description="")
-                container.add_item(gallery)
-                galleries += 1
-
-        if len(owned) > len(shown):
-            container.add_item(discord.ui.TextDisplay(
-                f"-# and {len(owned) - len(shown)} more — see the checklist"
-            ))
-
-        # No icon resolved for anything: fall back to naming them.
-        if not galleries:
-            container.add_item(discord.ui.TextDisplay(
-                "\n".join(f"✅ **{badge_display_name(b)}**" for b in owned)
-            ))
-
-    def attach_controls(self, container):
-        row = discord.ui.ActionRow()
-        toggle = discord.ui.Button(
-            label="Gallery" if self.checklist else "Checklist",
-            style=discord.ButtonStyle.secondary,
-            emoji="🖼️" if self.checklist else "📋",
-        )
-        toggle.callback = self.toggle_checklist
-        row.add_item(toggle)
-
-        if self.checklist and self.page_count > 1:
-            previous = discord.ui.Button(
-                label="Previous", style=discord.ButtonStyle.secondary, emoji="◀️",
-                disabled=self.page == 0,
-            )
-            previous.callback = self.previous_page
-            row.add_item(previous)
-
-            following = discord.ui.Button(
-                label="Next", style=discord.ButtonStyle.secondary, emoji="▶️",
-                disabled=self.page >= self.page_count - 1,
-            )
-            following.callback = self.next_page
-            row.add_item(following)
-
-        back = self.make_back_button()
-        if back is not None:
-            row.add_item(back)
-        container.add_item(row)
-
-    @keeps_context
-    async def toggle_checklist(self, interaction):
-        self.checklist = not self.checklist
-        self.page = 0
-        self.render()
-        await interaction.response.edit_message(view=self)
-
-    async def show_page(self, interaction, page):
-        self.page = max(0, min(page, self.page_count - 1))
-        self.render()
-        await interaction.response.edit_message(view=self)
-
-    @keeps_context
-    async def previous_page(self, interaction):
-        await self.show_page(interaction, self.page - 1)
-
-    @keeps_context
-    async def next_page(self, interaction):
-        await self.show_page(interaction, self.page + 1)
-
 class MapsCardView(CardView):
     pass
 
@@ -3135,8 +2946,7 @@ class ProfileView(CardView):
         super().__init__(parent=parent, timeout=timeout)
         self.user_id = user_id
         self.username = username
-        # Achievement roles are per-guild and only configured in the home
-        # server, so the button only appears where it can do something.
+        # The server the card was opened in.
         self.guild = guild
 
         data = entry.get("Data") if isinstance(entry, dict) else None
@@ -3239,7 +3049,7 @@ class ProfileView(CardView):
         self.add_item(container)
 
     def profile_buttons(self):
-        """Maps / Badges / Medals / Achievements, plus Back when nested."""
+        """Maps / Achievements / Medals, plus Back when nested."""
         row = discord.ui.ActionRow()
         maps_button = discord.ui.Button(
             label="Maps",
@@ -3249,13 +3059,14 @@ class ProfileView(CardView):
         maps_button.callback = self.show_created_maps
         row.add_item(maps_button)
 
-        badges_button = discord.ui.Button(
-            label="Badges",
+        # Badges and map achievements share one card, so one button.
+        achievements_button = discord.ui.Button(
+            label="Achievements",
             style=discord.ButtonStyle.secondary,
-            emoji="🎖️",
+            emoji="💎",
         )
-        badges_button.callback = self.show_badges
-        row.add_item(badges_button)
+        achievements_button.callback = self.show_achievements
+        row.add_item(achievements_button)
 
         medals_button = discord.ui.Button(
             label="Medals",
@@ -3265,15 +3076,6 @@ class ProfileView(CardView):
         medals_button.callback = self.show_medals
         row.add_item(medals_button)
 
-        if in_home_guild(self.guild):
-            achievements_button = discord.ui.Button(
-                label="Achievements",
-                style=discord.ButtonStyle.secondary,
-                emoji="💎",
-            )
-            achievements_button.callback = self.show_achievements
-            row.add_item(achievements_button)
-
         # When this profile was opened from another card, offer the way back
         # alongside its own actions rather than on a separate row.
         back = self.make_back_button()
@@ -3282,42 +3084,16 @@ class ProfileView(CardView):
         return row
 
     @keeps_context
-    async def show_badges(self, interaction):
-        # thinking=True would post a new message and
-        # edit_original_response would then edit that, not the card.
-        await interaction.response.defer()
-
-        view = await build_badges_view(self.user_id, self.username, parent=self)
-        if view is None:
-            await interaction.followup.send(
-                "Couldn't fetch the game's badge list.", ephemeral=True
-            )
-            return
-
-        view.message = interaction.message
-        await show_card(interaction, view)
-
-    @keeps_context
     async def show_achievements(self, interaction):
         # thinking=True would post a new message and
         # edit_original_response would then edit that, not the card.
         await interaction.response.defer()
 
-        guild = interaction.guild
-        account_id = await fetch_linked_discord_id(self.user_id)
-        member = guild.get_member(account_id) if account_id and guild else None
-        if member is None:
-            await interaction.followup.send(
-                f"**{self.username}** isn't linked to anyone in this server, "
-                f"so there are no achievement roles to check.",
-                ephemeral=True,
-            )
+        view, error = await build_achievements_card(self.user_id, self.username, parent=self)
+        if view is None:
+            await interaction.followup.send(error, ephemeral=True)
             return
 
-        rules = visible_achievement_rules(await fetch_role_rules(guild.id))
-        view = PlayerAchievementsView(
-            rules, guild, member, owner_id=self.owner_id, parent=self,
-        )
         view.message = interaction.message
         await show_card(interaction, view)
 
@@ -3376,8 +3152,7 @@ class ProfileCardView(ProfileView):
         self.card_image = card_image
         # png, or webp when the username effect plays.
         self.filename = f"{PROFILE_CARD_FILENAME}.{extension}"
-        # Achievement roles are per-guild and only configured in the home
-        # server, so the button only appears where it can do something.
+        # The server the card was opened in.
         self.guild = guild
 
         # A ban isn't part of the design, so it rides above the picture.
@@ -3398,22 +3173,6 @@ class ProfileCardView(ProfileView):
 
     def card_files(self):
         return [discord.File(io.BytesIO(self.card_image), filename=self.filename)]
-
-async def build_badges_view(user_id, username, parent=None):
-    """Every game badge, marked owned or not for this player."""
-    badges = await fetch_universe_badges()
-    if not badges:
-        return None
-
-    owned_ids = await fetch_owned_badge_ids(user_id, [b["id"] for b in badges])
-    owned = [b for b in badges if b["id"] in owned_ids]
-    # Only the badges a gallery can show need an icon; the checklist is names.
-    shown = owned[:MAX_BADGE_GALLERIES * BADGES_PER_LARGE_GALLERY]
-    icons = await fetch_badge_icons([b["id"] for b in shown])
-
-    return BadgesCardView(
-        badges, owned_ids, icons, username=username, parent=parent
-    )
 
 async def map_achievement_items(user_id):
     """The home server's map achievements as badge card items: one per
@@ -3501,7 +3260,7 @@ async def load_badge_card_icons(items):
 class BadgesImageCardView(CardView):
     """Badges and map achievements as one rendered grid, a page at a time.
 
-    On trial behind !testbadges before it replaces BadgesCardView. Earned
+    What /achievements and the profile's Achievements button open. Earned
     items come first, so the locked ones fill the last pages.
     """
 
@@ -3597,7 +3356,7 @@ class BadgesImageCardView(CardView):
         await self.show(interaction)
 
 async def build_badges_image_view(user_id, username, parent=None, *, effect_name=None):
-    """The image version of build_badges_view, first page drawn, or None
+    """The badges and achievements card, first page drawn, or None
     without the game's badge list. Their equipped username effect plays on
     the name; effect_name forces one, for previews."""
     items, avatar_png, background_png, equipped = await asyncio.gather(
@@ -3612,6 +3371,16 @@ async def build_badges_image_view(user_id, username, parent=None, *, effect_name
                                parent=parent)
     await view.refresh()
     return view
+
+async def build_achievements_card(user_id, username, parent=None):
+    """build_badges_image_view for a command or button: (view, None), or
+    (None, what to tell the user)."""
+    if card_render is None:
+        return None, "Image cards need Pillow — run `!restart` to install it."
+    view = await build_badges_image_view(user_id, username, parent=parent)
+    if view is None:
+        return None, "Couldn't fetch the game's badge list."
+    return view, None
 
 def search_public_maps(maps_by_id, query, limit=50):
     """Public maps whose name matches, best match first.
@@ -5842,22 +5611,6 @@ async def medals_command(ctx, username: str = None):
 
     await ctx.send(view=view)
 
-@bot.hybrid_command(name="badges", description="Show which game badges a player has earned")
-@app_commands.describe(username="Roblox username. Uses your linked account if omitted.")
-async def badges_command(ctx, username: str = None):
-    await ctx.defer()
-
-    user_id, canonical = await resolve_command_user(ctx, username)
-    if user_id is None:
-        return
-
-    view = await build_badges_view(user_id, canonical)
-    if view is None:
-        await ctx.send("Couldn't fetch the game's badge list.")
-        return
-
-    await ctx.send(view=view)
-
 def achievement_leaderboard_rows(guild, rules):
     """Members ranked by how many configured achievement roles they hold.
 
@@ -6110,7 +5863,8 @@ async def test_profile_card(ctx, username: str = None, effect: str = None):
 @bot.command(name="testbadges", hidden=True)
 @commands.is_owner()
 async def test_badges_card(ctx, username: str = None, effect: str = None):
-    """Owner-only preview of the image badges card, before /badges uses it.
+    """Owner-only preview of the badges and achievements card, as
+    /achievements shows it, with an effect to try.
 
     `!testbadges [username|me] [effect|none]`: the game's badges and the
     home server's map achievements in one grid, 24 a page. The name plays
@@ -6408,12 +6162,6 @@ async def background_map_autocomplete(interaction, current: str):
         for entry in matches
     ]
 
-# How many rows /topmaps and /topcreators list.
-TOP_LIST_LIMIT = 50
-# The prefix form takes either spelling; the slash form offers these two.
-RANKING_STATS = {"plays": "Plays", "favourites": "Favorites"}
-RankingStat = Literal["plays", "favourites"]
-
 def public_maps(maps_by_id):
     return [m for m in maps_by_id.values() if m.get("Privacy") == "Public"]
 
@@ -6467,85 +6215,6 @@ async def randommap_command(ctx):
     if view is None:
         await ctx.send("Failed to fetch the community map list.")
         return
-    view.message = await ctx.send(view=view)
-
-@bot.hybrid_command(name="topmaps", description="The most played or most favourited public maps")
-@app_commands.describe(by="Rank by plays or favourites (default plays)")
-async def topmaps_command(ctx, by: RankingStat = "plays"):
-    await ctx.defer()
-    maps_by_id = await get_community_maps()
-    if not maps_by_id:
-        await ctx.send("Failed to fetch the community map list.")
-        return
-
-    key = RANKING_STATS[by]
-    ranked = sorted(public_maps(maps_by_id),
-                    key=lambda m: m.get(key) or 0, reverse=True)
-    ranked = ranked[:TOP_LIST_LIMIT]
-    if not ranked:
-        await ctx.send("There are no public maps yet.")
-        return
-
-    creators = await fetch_usernames([m.get("Creator") for m in ranked])
-    view = MapListView(
-        ranked,
-        title="🔥 Top Maps",
-        subtitle=f"Top {len(ranked)} public maps by {by}",
-        creators=creators,
-    )
-    view.message = await ctx.send(view=view)
-
-class CreatorListView(MapListView):
-    """MapListView's paging, with one creator per row instead of a map."""
-
-    def describe(self, entry):
-        creator_id = entry["Creator"]
-        name = self.creators.get(creator_id) or f"User {creator_id}"
-        maps = entry["Maps"]
-        return (
-            f"`#{entry['Rank']}` **{name}**\n"
-            f"-# ▶️ {format_number(entry['Plays'])} plays"
-            f"  ·  ⭐ {format_number(entry['Favorites'])}"
-            f"  ·  🗺️ {maps} map{'s' if maps != 1 else ''}"
-        )
-
-@bot.hybrid_command(name="topcreators", description="Creators ranked by the plays or favourites of their public maps")
-@app_commands.describe(by="Rank by plays or favourites (default plays)")
-async def topcreators_command(ctx, by: RankingStat = "plays"):
-    await ctx.defer()
-    maps_by_id = await get_community_maps()
-    if not maps_by_id:
-        await ctx.send("Failed to fetch the community map list.")
-        return
-
-    totals = {}
-    for entry in public_maps(maps_by_id):
-        creator_id = entry.get("Creator")
-        if creator_id is None:
-            continue
-        row = totals.setdefault(creator_id, {
-            "Creator": creator_id, "Plays": 0, "Favorites": 0, "Maps": 0,
-        })
-        row["Plays"] += entry.get("Plays") or 0
-        row["Favorites"] += entry.get("Favorites") or 0
-        row["Maps"] += 1
-
-    key = RANKING_STATS[by]
-    ranked = sorted(totals.values(), key=lambda r: r[key], reverse=True)
-    ranked = ranked[:TOP_LIST_LIMIT]
-    if not ranked:
-        await ctx.send("Nobody has published a map yet.")
-        return
-    for rank, row in enumerate(ranked, start=1):
-        row["Rank"] = rank
-
-    creators = await fetch_usernames([r["Creator"] for r in ranked])
-    view = CreatorListView(
-        ranked,
-        title="🛠️ Top Creators",
-        subtitle=f"Top {len(ranked)} creators by {by} across their public maps",
-        creators=creators,
-    )
     view.message = await ctx.send(view=view)
 
 async def fetch_compare_stats(user_id):
@@ -8038,8 +7707,8 @@ async def reward_catalog_reply(ctx, kind, *, refresh=False, footer=None,
     view.message = await ctx.send(view=view)
 
 # The public half of the same catalogs. Badges are left out: they are Roblox
-# badges rather than a collection in the profile, and /badges already shows
-# them per player.
+# badges rather than a collection in the profile, and /achievements already
+# shows them per player.
 CATALOG_KINDS = tuple(kind for kind in REWARD_TYPES if kind != "badge")
 CATALOG_CHOICES = [
     app_commands.Choice(name=f"{reward_type_label(kind)}s", value=f"{kind}s")
@@ -8058,8 +7727,8 @@ async def catalog_command(ctx, category: str):
     kind = resolve_reward_type(category)
     if kind == "badge":
         await ctx.send(view=simple_card(
-            "Badges aren't a collection in your profile — `/badges` shows "
-            "which of the game's badges a player has earned.",
+            "Badges aren't a collection in your profile — `/achievements` "
+            "shows which of the game's badges a player has earned.",
             colour=discord.Color.greyple(),
         ))
         return
@@ -10050,167 +9719,8 @@ def describe_rule(rule, guild, *, admin=False, badge_names=None):
     lines.extend((f"**Role:** {role_text}", f"**Requirement:** {condition}"))
     return "\n".join(lines)
 
-class PlayerAchievementsView(CardView):
-    """Toggle between a member's earned and missing achievement roles."""
-
-    def __init__(self, rules, guild, player, *, owner_id=None, parent=None):
-        super().__init__(parent=parent)
-        self.owner_id = owner_id
-        self.player_name = discord.utils.escape_markdown(player.display_name)
-
-        held_role_ids = {role.id for role in player.roles}
-        configured_roles = []
-        seen_role_ids = set()
-        for rule in rules:
-            role_id = rule_role_id(rule)
-            role = guild.get_role(role_id) if role_id is not None else None
-            if role is None or role_id in seen_role_ids:
-                continue
-            seen_role_ids.add(role_id)
-            configured_roles.append(role)
-
-        self.achieved_roles = [
-            role for role in configured_roles if role.id in held_role_ids
-        ]
-        self.missing_roles = [
-            role for role in configured_roles if role.id not in held_role_ids
-        ]
-        self.showing_missing = False
-        self.render()
-
-    def render(self):
-        self.clear_items()
-        container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-
-        if self.showing_missing:
-            title = f"## ❌ {self.player_name}'s Missing Achievements"
-            roles = self.missing_roles
-            body = "\n".join(f"❌ {role.mention}" for role in roles)
-            body = body or "✅ This player is not missing any achievements."
-        else:
-            title = f"## 💎 {self.player_name}'s Achievements"
-            roles = self.achieved_roles
-            body = "\n".join(f"✅ {role.mention}" for role in roles)
-            body = body or "This player has no achievements yet."
-
-        container.add_item(discord.ui.TextDisplay(
-            f"{title}\n-# {len(roles)} achievement{'s' if len(roles) != 1 else ''}"
-        ))
-        container.add_item(discord.ui.Separator())
-        container.add_item(discord.ui.TextDisplay(body))
-
-        row = discord.ui.ActionRow()
-        if self.showing_missing:
-            button = discord.ui.Button(
-                label="Achievements",
-                style=discord.ButtonStyle.success,
-                emoji="✔️",
-            )
-            button.callback = self.show_achievements
-        else:
-            button = discord.ui.Button(
-                label="Missing",
-                style=discord.ButtonStyle.danger,
-                emoji="✖️",
-            )
-            button.callback = self.show_missing
-        row.add_item(button)
-
-        back = self.make_back_button()
-        if back is not None:
-            row.add_item(back)
-        container.add_item(row)
-        self.add_item(container)
-
-    async def show_missing(self, interaction):
-        self.showing_missing = True
-        self.render()
-        await interaction.response.edit_message(view=self)
-
-    async def show_achievements(self, interaction):
-        self.showing_missing = False
-        self.render()
-        await interaction.response.edit_message(view=self)
-
-
-async def build_condition_achievements_view(roblox_id, display_name):
-    """Achievements judged by Roblox progress rather than by Discord roles.
-
-    For use outside the home server, where those roles don't exist. The rules
-    describe real accomplishments either way, so this reports which of them
-    the account has actually met -- the same check /sync grants roles from.
-    """
-    home = bot.get_guild(HOME_GUILD.id) if HOME_GUILD is not None else None
-    if home is None:
-        return simple_card(
-            "Achievements aren't set up yet.",
-            heading="💎 Achievements",
-            colour=discord.Color.greyple(),
-        )
-
-    rules = visible_achievement_rules(await fetch_role_rules(home.id))
-    if not rules:
-        return simple_card(
-            "No achievements are configured yet.",
-            heading="💎 Achievements",
-            colour=discord.Color.greyple(),
-        )
-
-    earned, _ = await qualifying_roles(rules, roblox_id, map_cache={})
-
-    seen = set()
-    lines = []
-    achieved = 0
-    for rule in rules:
-        role_id = rule_role_id(rule)
-        role = home.get_role(role_id) if role_id is not None else None
-        if role is None or role_id in seen:
-            continue
-        seen.add(role_id)
-        # Plain names, not mentions: the role belongs to another server and
-        # would render as a broken pill anywhere else.
-        name = discord.utils.escape_markdown(role.name)
-        if role_id in earned:
-            achieved += 1
-            lines.append(f"✅ **{name}**")
-        else:
-            lines.append(f"⬜ {name}")
-
-    if not lines:
-        return simple_card(
-            "No achievements are configured yet.",
-            heading="💎 Achievements",
-            colour=discord.Color.greyple(),
-        )
-
-    container = discord.ui.Container(accent_colour=PROFILE_COLOR)
-    container.add_item(discord.ui.TextDisplay(
-        f"## 💎 {discord.utils.escape_markdown(display_name)}'s Achievements\n"
-        f"-# {achieved} of {len(lines)} earned"
-    ))
-    container.add_item(discord.ui.Separator())
-    container.add_item(discord.ui.TextDisplay("\n".join(lines)))
-    container.add_item(discord.ui.TextDisplay(
-        f"-# Earned in the game. Join {home.name} to get the roles."
-    ))
-
-    note = dev_universe_note()
-    if note:
-        container.add_item(discord.ui.TextDisplay(note))
-
-    view = discord.ui.LayoutView(timeout=None)
-    view.add_item(container)
-    return view
-
-def build_role_rules_view(
-    rules, guild, *, admin=False, badge_names=None, player=None, owner_id=None
-):
-    """Render achievement roles or a member's compact achievement checklist."""
-    if player is not None:
-        return PlayerAchievementsView(
-            rules, guild, player, owner_id=owner_id
-        )
-
+def build_role_rules_view(rules, guild, *, admin=False, badge_names=None):
+    """The server's achievement roles and what earns each."""
     if not rules:
         text = "No achievement roles are configured yet."
         if admin:
@@ -10256,83 +9766,71 @@ def build_role_rules_view(
     view.add_item(container)
     return view
 
+async def achievements_card_for(caller, player):
+    """The badges and achievements card for a Discord user's linked Roblox
+    account (the caller's when `player` is None): (view, None), or (None, a
+    card saying why not)."""
+    target = player or caller
+    roblox_id = await fetch_linked_user_id(target.id)
+    if roblox_id is None:
+        who = "You haven't" if target.id == caller.id else f"**{target}** hasn't"
+        return None, simple_card(
+            f"{who} linked a Roblox account. Use `/link` first.",
+            colour=discord.Color.greyple(),
+        )
+    name = await fetch_username(roblox_id) or str(roblox_id)
+    view, error = await build_achievements_card(roblox_id, name)
+    if view is None:
+        return None, simple_card(error, colour=discord.Color.red())
+    return view, None
+
 @bot.tree.command(
-    name="achievements", description="See which achievements a player has earned"
+    name="achievements", description="See which badges and achievements a player has earned"
 )
 @app_commands.describe(player="Whose achievements to show. Defaults to you.")
 async def achievements_slash_command(
     interaction: discord.Interaction, player: discord.User = None
 ):
-    """Roles in the home server, earned conditions everywhere else.
-
-    The roles only exist in one server, so anywhere else the same rules are
-    judged against the player's actual Roblox progress instead.
-    """
+    """The game's badges and the map achievements in one image card."""
     await interaction.response.defer()
-
-    if in_home_guild(interaction.guild):
-        member = (
-            interaction.guild.get_member(player.id) if player is not None
-            else None
-        )
-        if player is None or member is not None:
-            rules = visible_achievement_rules(
-                await fetch_role_rules(interaction.guild.id)
-            )
-            badge_names = (
-                await role_rule_badge_names(rules) if member is None else {}
-            )
-            view = build_role_rules_view(
-                rules,
-                interaction.guild,
-                admin=interaction.user.id == ADMIN_USER_ID,
-                badge_names=badge_names,
-                player=member,
-                owner_id=interaction.user.id,
-            )
-            await interaction.followup.send(view=view, allowed_mentions=SILENT)
-            return
-        # Named someone who isn't in this server: fall through and judge them
-        # by what they've actually done instead.
-
-    target = player or interaction.user
-    roblox_id = await fetch_linked_user_id(target.id)
-    if roblox_id is None:
-        who = (
-            "You haven't" if target.id == interaction.user.id
-            else f"**{target}** hasn't"
-        )
-        await interaction.followup.send(view=simple_card(
-            f"{who} linked a Roblox account. Use `/link` first.",
-            colour=discord.Color.greyple(),
-        ))
+    # Tree commands skip before_invoke, which tags the card's buttons with
+    # who may press them.
+    _active_invoker.set(interaction.user.id)
+    view, error = await achievements_card_for(interaction.user, player)
+    if view is None:
+        await interaction.followup.send(view=error)
         return
-
-    name = await fetch_username(roblox_id)
-    view = await build_condition_achievements_view(
-        roblox_id, name or str(roblox_id)
+    view.message = await interaction.followup.send(
+        view=view, files=view.card_files(), wait=True
     )
-    await interaction.followup.send(view=view, allowed_mentions=SILENT)
 
-@bot.group(name="achievements", hidden=True, invoke_without_command=True)
-async def admin_achievements(ctx, player: discord.Member = None):
-    """View achievement roles, optionally filtered to a server member."""
+# Listed in /help (the slash command is tree-only, so this is its entry);
+# add and remove are admin-only.
+@bot.group(name="achievements", invoke_without_command=True,
+           description="See which badges and achievements a player has earned")
+async def admin_achievements(ctx, player: discord.User = None):
+    """!achievements [player]: the badges and achievements card, as
+    /achievements. `rules`, `add` and `remove` manage the roles."""
+    async with ctx.typing():
+        view, error = await achievements_card_for(ctx.author, player)
+    if view is None:
+        await ctx.send(view=error)
+        return
+    view.message = await ctx.send(view=view, files=view.card_files())
+
+@admin_achievements.command(name="rules")
+async def admin_achievements_rules(ctx):
+    """!achievements rules: the server's achievement roles and what earns each."""
     if ctx.guild is None:
         await ctx.send("This command only works inside a server.")
         return
     async with ctx.typing():
-        rules = await fetch_role_rules(ctx.guild.id)
-        rules = visible_achievement_rules(rules)
-        badge_names = await role_rule_badge_names(rules) if player is None else {}
-    admin = ctx.author.id == ADMIN_USER_ID
+        rules = visible_achievement_rules(await fetch_role_rules(ctx.guild.id))
+        badge_names = await role_rule_badge_names(rules)
     await ctx.send(
         view=build_role_rules_view(
-            rules,
-            ctx.guild,
-            admin=admin,
+            rules, ctx.guild, admin=ctx.author.id == ADMIN_USER_ID,
             badge_names=badge_names,
-            player=player,
-            owner_id=ctx.author.id,
         ),
         allowed_mentions=SILENT,
     )
@@ -15246,8 +14744,7 @@ def register_dev_variants():
 register_dev_variants()
 
 # Published to the home server alone: /sync grants roles, which only exist
-# there. /achievements is global -- outside the home server it reports earned
-# conditions instead of roles, which works anywhere.
+# there. /achievements is global: it reads Roblox progress, not roles.
 HOME_GUILD_COMMANDS = (sync_slash_command,)
 
 def restrict_to_home_guild():
@@ -15287,7 +14784,7 @@ def restrict_to_home_guild():
         print(
             "GUILD_ID is not set; /sync stays global, but is no longer "
             "user-installable. Set GUILD_ID to scope it to the home server. "
-            "/achievements also needs it to find the configured roles."
+            "/achievements also needs it to find the map achievements."
         )
         return
 
