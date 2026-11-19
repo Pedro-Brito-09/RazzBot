@@ -4309,8 +4309,8 @@ class MapCardView(MapView):
     """
 
     def __init__(self, card_image, entry, *, creator_id=None, creator_name=None,
-                 extension="png", parent=None, note=None, timeout=MAP_VIEW_TIMEOUT,
-                 **button_options):
+                 extension="png", parent=None, note=None, header=None,
+                 timeout=MAP_VIEW_TIMEOUT, **button_options):
         # Skip MapView's text layout; only its buttons and callbacks are wanted.
         CardView.__init__(self, parent=parent, timeout=timeout)
         self.entry = entry
@@ -4319,6 +4319,10 @@ class MapCardView(MapView):
         self.card_image = card_image
         self.filename = f"{MAP_CARD_FILENAME}.{extension}"
 
+        # Text above the picture, such as the Daily Cup's role ping: a
+        # Components V2 message has no content of its own to carry it.
+        if header:
+            self.add_item(discord.ui.TextDisplay(header))
         gallery = discord.ui.MediaGallery()
         gallery.add_item(
             media=f"attachment://{self.filename}",
@@ -4895,12 +4899,67 @@ async def crosspost_message(message):
         return False
     return True
 
-async def publish_daily_cup_announcement(destination=None, *, crosspost=True):
+# The scheduled post's format. On trial behind !testcup, which always uses
+# the image cards; flip this once they're approved.
+DAILY_CUP_IMAGE_CARDS = False
+
+async def build_daily_cup_image_messages(previous_leaderboard, previous_index,
+                                         previous_map_id, entry, current_index,
+                                         current_date, maps_by_id, role_mention):
+    """The image-card version of the cup announcement: (leaderboard view,
+    map view), or (None, None) when the leaderboard has no rows.
+
+    Reuses the leaderboard and map image cards. The map card carries the
+    role ping and the "is live" line above its picture, and only a Play
+    button for the cup experience, like DailyCupMapView.
+    """
+    previous_date = current_date - timedelta(days=1)
+    date_text = f"{previous_date:%d/%m/%Y}"
+    thumbnail_png = await fetch_map_thumbnail_png(maps_by_id.get(previous_map_id))
+    leaderboard_view = await build_leaderboard_card_view(
+        previous_leaderboard,
+        title=f"Daily Cup #{previous_index}",
+        subtitle=f"Yesterday's Results · {date_text}",
+        footer=f"Map ID {previous_map_id}" if previous_map_id is not None else "",
+        shown_title=f"Daily Cup #{previous_index} results · {date_text}",
+        medals=True,
+        thumbnail_png=thumbnail_png,
+    )
+    if leaderboard_view is None:
+        return None, None
+
+    header = "\n".join(filter(None, (
+        role_mention,
+        f"### 🏆 Daily Cup #{current_index} is live!",
+        "Compete now and set your best time before the next Daily Cup.",
+    )))
+    map_view = await build_map_card_view(entry, view_class=functools.partial(
+        MapCardView,
+        header=header,
+        timeout=None,   # only a link button, which never expires
+        play_label="Play",
+        play_url_template=DAILY_CUP_PLAY_URL_TEMPLATE,
+        show_leaderboard=False,
+        show_creator=False,
+    ))
+    # Posted by the scheduler; anyone may use it.
+    leaderboard_view.owner_id = map_view.owner_id = None
+    return leaderboard_view, map_view
+
+async def publish_daily_cup_announcement(destination=None, *, crosspost=True,
+                                         cards=None):
     """Post yesterday's cup leaderboard, followed by today's map card.
 
     crosspost=False keeps a preview from reaching every following server if
-    it happens to be run in the announcement channel itself.
+    it happens to be run in the announcement channel itself. cards=True
+    posts the image cards instead of the embeds; None follows
+    DAILY_CUP_IMAGE_CARDS.
     """
+    if cards is None:
+        cards = DAILY_CUP_IMAGE_CARDS
+    if cards and card_render is None:
+        print("Daily Cup announcement: Pillow is missing, using the embeds")
+        cards = False
     if destination is None:
         try:
             channel_id = int(DAILY_CUP_CHANNEL_ID)
@@ -4930,21 +4989,22 @@ async def publish_daily_cup_announcement(destination=None, *, crosspost=True):
         get_community_maps(),
     )
 
-    leaderboard_embed = await build_leaderboard_embed(
+    # The image cards build their own leaderboard once the map is found.
+    leaderboard_embed = None if cards else await build_leaderboard_embed(
         previous_leaderboard,
         title="🏆 Yesterday's Results",
         subtitle=f"Daily Cup #{previous_index}",
         show_medals=True,
         show_country=True,
     )
-    if leaderboard_embed is None:
+    if not previous_leaderboard or (not cards and leaderboard_embed is None):
         print(
             "Daily Cup announcement skipped: no leaderboard for "
             f"DailyCup_{previous_index}"
         )
         return False
 
-    if previous_map_id is not None:
+    if leaderboard_embed is not None and previous_map_id is not None:
         entry_count = leaderboard_embed.footer.text
         map_footer = f"Map ID: {previous_map_id}"
         leaderboard_embed.set_footer(
@@ -4963,27 +5023,45 @@ async def publish_daily_cup_announcement(destination=None, *, crosspost=True):
         print(f"Daily Cup announcement skipped: map {map_id} was not found")
         return False
 
-    map_embed, map_view = await build_daily_cup_map_card(
-        entry, current_index, current_date
-    )
     role_mention = daily_cup_role_mention(destination)
-
-    # Preserve the requested order: completed cup first, new cup second.
-    leaderboard_message = await destination.send(embed=leaderboard_embed)
-    map_view.message = await destination.send(
-        content=(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{role_mention or ''}"
-        ).rstrip(),
-        embed=map_embed,
-        view=map_view,
-        allowed_mentions=discord.AllowedMentions(
-            everyone=False,
-            users=False,
-            roles=True,
-            replied_user=False,
-        ),
+    ping_role = discord.AllowedMentions(
+        everyone=False,
+        users=False,
+        roles=True,
+        replied_user=False,
     )
+
+    if cards:
+        leaderboard_view, map_view = await build_daily_cup_image_messages(
+            previous_leaderboard, previous_index, previous_map_id, entry,
+            current_index, current_date, maps_by_id, role_mention,
+        )
+        if leaderboard_view is None:
+            print("Daily Cup announcement skipped: the leaderboard card had no rows")
+            return False
+        # Same order as the embeds: completed cup first, new cup second.
+        leaderboard_message = await destination.send(
+            view=leaderboard_view, files=leaderboard_view.card_files(),
+        )
+        map_view.message = await destination.send(
+            view=map_view, files=map_view.card_files(),
+            allowed_mentions=ping_role,
+        )
+    else:
+        map_embed, map_view = await build_daily_cup_map_card(
+            entry, current_index, current_date
+        )
+        # Preserve the requested order: completed cup first, new cup second.
+        leaderboard_message = await destination.send(embed=leaderboard_embed)
+        map_view.message = await destination.send(
+            content=(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{role_mention or ''}"
+            ).rstrip(),
+            embed=map_embed,
+            view=map_view,
+            allowed_mentions=ping_role,
+        )
     if crosspost:
         published = 0
         for message in (leaderboard_message, map_view.message):
@@ -10119,9 +10197,13 @@ async def test_cup_announcement(
     Name a channel to post somewhere else: `!testcup #scratch`.
     Pass true to crosspost as well: `!testcup true` -- that reaches every
     server following an announcement channel for real, so it defaults to off.
+    Posts the image cards, on trial before the scheduled post switches to
+    them (DAILY_CUP_IMAGE_CARDS).
     """
     async with ctx.typing():
-        posted = await publish_daily_cup_announcement(channel, crosspost=publish)
+        posted = await publish_daily_cup_announcement(
+            channel, crosspost=publish, cards=True
+        )
     if not posted:
         await ctx.send(
             "Couldn't build the Daily Cup announcement. Check the bot logs "
